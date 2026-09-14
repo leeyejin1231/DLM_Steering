@@ -49,6 +49,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 
+from common import EOT_ID, load_prompts
 from llada import MODEL_NAME, MASK_ID, add_gumbel_noise, get_num_transfer_tokens
 
 
@@ -394,23 +395,6 @@ def generate_defended(model, prompt, policy, *, steps=128, gen_length=128, block
 
 
 MASK_TOKEN = "<|mdm_mask|>"
-EOT_ID = 126348  # <|eot_id|>, closes the user turn in LLaDA's chat template
-JBB_HARMFUL_GLOB = ("/mnt/shared/huggingface-cache/hub/datasets--JailbreakBench--JBB-Behaviors"
-                    "/snapshots/*/data/harmful-behaviors.csv")
-
-
-def load_prompts(source, csv_path):
-    """Return a list of {"index", "prompt", "target"} rows."""
-    import glob
-    if source == "csv":
-        df = pd.read_csv(csv_path)
-        return [{"index": int(i), "prompt": str(r["prompt"]), "target": None}
-                for i, r in df.iterrows()]
-    if source == "jbb_harmful":
-        df = pd.read_csv(glob.glob(JBB_HARMFUL_GLOB)[0])
-        return [{"index": int(r["Index"]), "prompt": str(r["Goal"]), "target": str(r["Target"])}
-                for _, r in df.iterrows()]
-    raise ValueError(source)
 
 
 def build_user_message(row, attack, dija_steps, dija_span):
