@@ -63,14 +63,14 @@ def main():
     tokenizer, model = load_llada()
     device = next(model.parameters()).device
 
-    det_vec, threshold = load_detector(args.detector, args.detector_layer, device,
-                                       args.gate_threshold)
-    gate = {"layer": args.detector_layer, "vector": det_vec,
+    det_vec, det_layer, threshold = load_detector(
+        args.detector, args.detector_layer, device, args.gate_threshold)
+    gate = {"layer": det_layer, "vector": det_vec,
             "center": torch.zeros_like(det_vec), "scale": 1.0, "threshold": threshold}
     csd = {"layers": csd["layers"], "vector": csd["vector"].to(device)}
     layers = tuple(int(s) for s in args.layers.split(","))
     print(f"proposed.py: layers {layers}, strength {args.strength}, mode {args.mode}, "
-          f"gate layer {args.detector_layer} threshold {threshold:.3f}, "
+          f"gate layer {det_layer} threshold {threshold:.3f}, "
           f"initial_only {not args.no_initial_only}")
 
     rows = load_prompts(args.source, args.csv)[args.start: args.start + args.n]

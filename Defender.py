@@ -210,9 +210,9 @@ class Ours(Defender):
         for layer in (int(s) for s in args.layer.split(",")):
             li = bundle["layers"].index(layer)
             sites.append((layer, bundle["vector"][li].to(device), bundle["mean_act_norm"][li]))
-        det_vec, threshold = load_detector(args.detector, args.detector_layer, device,
-                                           args.gate_threshold)
-        return cls(model, gate_layer=args.detector_layer, gate_vector=det_vec,
+        det_vec, det_layer, threshold = load_detector(
+            args.detector, args.detector_layer, device, args.gate_threshold)
+        return cls(model, gate_layer=det_layer, gate_vector=det_vec,
                    threshold=threshold, width=args.gate_width, sites=sites,
                    strength=args.alpha, transform=args.transform, mode=args.mode,
                    max_remask_tokens=args.max_remask_tokens,
@@ -446,9 +446,9 @@ class ProposedDefense(Defender):
     def from_args(cls, args, model):
         device = next(model.parameters()).device
         csd = torch.load(args.vector, map_location="cpu")
-        det_vec, threshold = load_detector(args.detector, args.detector_layer, device,
-                                           args.gate_threshold)
-        gate = {"layer": args.detector_layer, "vector": det_vec,
+        det_vec, det_layer, threshold = load_detector(
+            args.detector, args.detector_layer, device, args.gate_threshold)
+        gate = {"layer": det_layer, "vector": det_vec,
                 "center": torch.zeros_like(det_vec), "scale": 1.0, "threshold": threshold}
         csd = {"layers": csd["layers"], "vector": csd["vector"].to(device)}
         layers = tuple(int(s) for s in args.layers.split(","))
