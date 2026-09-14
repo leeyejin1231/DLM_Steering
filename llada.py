@@ -123,7 +123,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     model = (
         AutoModel.from_pretrained(
-            MODEL_NAME, trust_remote_code=True, dtype=torch.bfloat16
+            MODEL_NAME, trust_remote_code=True, torch_dtype=torch.bfloat16
         )
         .to(DEVICE)
         .eval()

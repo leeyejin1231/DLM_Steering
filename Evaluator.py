@@ -454,7 +454,7 @@ class LlamaGuard4(ASR):
             config.text_config.attention_chunk_size = 8192
 
         model = Llama4ForConditionalGeneration.from_pretrained(
-            model_id, config=config, device_map=device, dtype=torch.bfloat16
+            model_id, config=config, device_map=device, torch_dtype=torch.bfloat16
         ).eval()
         # The shipped generation_config asks for a static cache, but the config
         # has no sliding_window and max_position_embeddings=10M, so StaticCache

@@ -180,7 +180,8 @@ hijri-converter==2.2.3
 holidays==0.12
 httplib2==0.17.4
 httpstan==4.6.1
-huggingface-hub==0.23.0
+hf-xet==1.6.0
+huggingface-hub==0.36.2
 hyperopt==0.1.2
 hypothesis==5.35.1
 idna==3.6
@@ -532,7 +533,7 @@ threadpoolctl @ file:///rapids/threadpoolctl-3.3.0-py3-none-any.whl#sha256=6155b
 thriftpy2 @ file:///rapids/thriftpy2-0.4.17-cp310-cp310-linux_x86_64.whl#sha256=7b38f469b5f4617dadc6b29b6cd01cea063dc6a4ffddd72802c6b94ab47b1cc5
 tifffile==2022.5.4
 tinycss2==1.2.1
-tokenizers==0.13.3
+tokenizers==0.20.3
 toml==0.10.2
 tomli==2.0.1
 tomlkit==0.10.2
@@ -554,7 +555,7 @@ tornado==6.4
 tqdm==4.66.2
 traitlets==5.9.0
 transformer-engine @ git+https://github.com/NVIDIA/TransformerEngine.git@6a9edc38bf9b941b7d369af5103fa8fe0b121d61
-transformers==4.33.1
+transformers==4.46.3
 treelite @ file:///rapids/treelite-4.0.0-py3-none-linux_x86_64.whl#sha256=a06cd2db4224eeca0bbbde80b47ea6d6bfd9b6831e549fecbb547e40abce4b89
 ttystatus==0.38
 tweepy==3.8.0

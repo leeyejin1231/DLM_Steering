@@ -36,7 +36,7 @@ def load_llada(device=None):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     model = AutoModel.from_pretrained(MODEL_NAME, trust_remote_code=True,
-                                      dtype=torch.bfloat16).to(device).eval()
+                                      torch_dtype=torch.bfloat16).to(device).eval()
     return tokenizer, model
 
 
