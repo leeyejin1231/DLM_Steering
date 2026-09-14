@@ -25,8 +25,9 @@ import torch
 
 from llada import MODEL_NAME, MASK_ID
 from proposed import Proposed
-from llada_steering_remasking_v2 import (
-    load_prompts, build_user_message, decode_response, generate_defended)
+from Attacker import DIJA, NoAttack
+from common import load_prompts
+from llada_steering_remasking_v2 import generate_defended
 
 
 class ProposedAdapter:
@@ -116,6 +117,7 @@ def main():
           f"initial_only {not args.no_initial_only}")
 
     rows = load_prompts(args.source, args.csv)[args.start: args.start + args.n]
+    attacker = DIJA(args.dija_steps, args.dija_span) if args.attack == "dija" else NoAttack()
     print(f"running {len(rows)} prompts from {args.source} (attack {args.attack})")
 
     print(f"loading {MODEL_NAME} ...")
@@ -142,7 +144,7 @@ def main():
     t_start = time.time()
     for i, row in enumerate(rows):
         idx, prompt = row["index"], row["prompt"]
-        user_message = build_user_message(row, args.attack, args.dija_steps, args.dija_span)
+        user_message = attacker.build_prompt(row)
         formatted = tokenizer.apply_chat_template(
             [{"role": "user", "content": user_message}], add_generation_prompt=True, tokenize=False)
         input_ids = torch.tensor(tokenizer(formatted)["input_ids"], device=device).unsqueeze(0)
@@ -152,7 +154,7 @@ def main():
                                 block_length=args.block_length, temperature=args.temperature)
         elapsed = time.time() - t0
 
-        generation, extra = decode_response(tokenizer, out, input_ids, args.attack)
+        generation, extra = attacker.decode(tokenizer, out, input_ids)
         results.append({"index": int(idx), "prompt": prompt, "attack_prompt": user_message,
                         "generation": generation, **extra,
                         "num_prompt_tokens": int(input_ids.shape[1]),
