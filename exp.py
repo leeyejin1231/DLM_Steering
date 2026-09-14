@@ -26,8 +26,8 @@ def parse_args():
     known, _ = pre.parse_known_args()
 
     p = argparse.ArgumentParser(parents=[pre])
-    p.add_argument("--source", choices=["csv", "jbb_harmful"], default="csv")
-    p.add_argument("--csv", default="data/llada8b_wild_unsafe_only.csv")
+    p.add_argument("--source", choices=["jbb_harmful", "advbench", "harmbench"],
+                   default="jbb_harmful")
     p.add_argument("--out", default="outputs/exp.json")
     p.add_argument("--n", type=int, default=20)
     p.add_argument("--start", type=int, default=0)
@@ -51,7 +51,7 @@ def main():
     device = next(model.parameters()).device
 
     defender = DEFENDERS[args.defense].from_args(args, model)
-    rows = load_prompts(args.source, args.csv)[args.start: args.start + args.n]
+    rows = load_prompts(args.source)[args.start: args.start + args.n]
     print(f"{len(rows)} prompts from {args.source}, attack={args.attack}, "
           f"defense={args.defense}")
 

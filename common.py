@@ -86,17 +86,19 @@ def auroc(pos, neg):
     return (ranks[:n_p].sum() - n_p * (n_p + 1) / 2) / (n_p * n_n)
 
 
-def load_prompts(source, csv_path):
-    """Return a list of {"index", "prompt", "target"} rows."""
+def load_prompts(source):
+    """Harmful prompt sets as {"index", "prompt", "target"} rows.
+
+    Sources: jbb_harmful (with Target), advbench, harmbench.
+    """
     import pandas as pd
-    if source == "csv":
-        df = pd.read_csv(csv_path)
-        return [{"index": int(i), "prompt": str(r["prompt"]), "target": None}
-                for i, r in df.iterrows()]
     if source == "jbb_harmful":
         df = pd.read_csv(glob.glob(JBB_HARMFUL_GLOB)[0])
         return [{"index": int(r["Index"]), "prompt": str(r["Goal"]), "target": str(r["Target"])}
                 for _, r in df.iterrows()]
+    if source in ("advbench", "harmbench"):
+        return [{"index": i, "prompt": p, "target": None}
+                for i, p in enumerate(load_eval_prompts(source, None))]
     raise ValueError(source)
 
 

@@ -51,8 +51,8 @@ from sampler import generate
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--source", choices=["csv", "jbb_harmful"], default="csv")
-    p.add_argument("--csv", default="data/llada8b_wild_unsafe_only.csv")
+    p.add_argument("--source", choices=["jbb_harmful", "advbench", "harmbench"],
+                   default="jbb_harmful")
     p.add_argument("--attack", choices=["none", "dija"], default="none")
     p.add_argument("--dija-steps", type=int, default=4)
     p.add_argument("--dija-span", type=int, default=16)
@@ -113,7 +113,7 @@ def main():
     print(f"gate: layer {args.detector_layer}, threshold {threshold:.3f}, width {args.gate_width}, "
           f"steer {args.steer}, remask {args.remask}, transform {args.transform}")
 
-    rows = load_prompts(args.source, args.csv)[args.start: args.start + args.n]
+    rows = load_prompts(args.source)[args.start: args.start + args.n]
     attacker = DIJA(args.dija_steps, args.dija_span) if args.attack == "dija" else NoAttack()
     print(f"running {len(rows)} prompts from {args.source} (attack {args.attack})")
 
