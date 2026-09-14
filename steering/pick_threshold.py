@@ -21,13 +21,11 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from transformers import AutoModel, AutoTokenizer
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from common import MODEL_NAME, load_detector_bundle, load_llada  # noqa: E402
 from steering.fit_detector import collect  # noqa: E402
-
-MODEL_NAME = "GSAI-ML/LLaDA-8B-Instruct"
 
 
 def main():
@@ -41,7 +39,7 @@ def main():
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    b = torch.load(args.detector, map_location="cpu")
+    b = load_detector_bundle(args.detector)
     layers, gen_length = b["layers"], b["gen_length"]
     li = layers.index(args.layer)
     v = b["vector"][li]
@@ -50,10 +48,7 @@ def main():
              if p["split"] == "fit"]
     print(f"fit pairs: {len(pairs)}")
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    model = AutoModel.from_pretrained(
-        MODEL_NAME, trust_remote_code=True, dtype=torch.bfloat16
-    ).to(device).eval()
+    tokenizer, model = load_llada(device)
 
     H = collect(model, tokenizer, [p["adv_harmful"] for p in pairs],
                 gen_length, layers, device, "harm")
