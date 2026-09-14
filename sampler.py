@@ -6,7 +6,8 @@ the sampler commits the top-confidence masked tokens. After a repair the
 transfer schedule for the rest of the block is recomputed as an even split of
 everything masked before block_end; the last step of every block fills
 whatever is still masked there, so reopened slots from earlier blocks can
-never be left open.
+never be left open. Between blocks the defender gets a boundary hook
+(after_block) that may audit the finished block or remask and regenerate it.
 
 CFG is not supported. Answer slots are every mask in the sequence, so masks
 planted inside the prompt (DIJA) are filled, steered, and eligible for repair
@@ -14,10 +15,36 @@ like the rest.
 """
 
 import torch
-import torch.nn.functional as F
 
 from common import MASK_ID, step_scale
 from llada import add_gumbel_noise, get_num_transfer_tokens
+
+
+def commit_sample(x, logits, eligible, count, temperature, remasking, final=False):
+    """Commit the `count` highest-confidence eligible positions in place.
+
+    eligible: index tensor of still-masked candidate positions. Returns the
+    eligible indices left unfilled.
+    """
+    n = eligible.numel()
+    k = n if final else min(int(count), n)
+    if k <= 0:
+        return eligible
+    sub = logits[0, eligible]
+    predicted = add_gumbel_noise(sub, temperature).argmax(-1)
+    if remasking == "low_confidence":
+        sub64 = sub.to(torch.float64)
+        confidence = (sub64 - sub64.logsumexp(dim=-1, keepdim=True)).exp()
+        confidence = confidence.gather(1, predicted[:, None]).squeeze(-1)
+    elif remasking == "random":
+        confidence = torch.rand(n, dtype=torch.float64, device=x.device)
+    else:
+        raise NotImplementedError(remasking)
+    selected = confidence.topk(k).indices
+    x[0, eligible[selected]] = predicted[selected]
+    keep = torch.ones(n, dtype=torch.bool, device=x.device)
+    keep[selected] = False
+    return eligible[keep]
 
 
 @torch.no_grad()
@@ -45,6 +72,8 @@ def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
         block_end = prompt_length + (num_block + 1) * block_length
         scope = region.clone()
         scope[:, block_end:] = False
+        block_positions = scope.clone()
+        block_positions[:, :prompt_length + num_block * block_length] = False
         schedule_counts = get_num_transfer_tokens((x == MASK_ID) & scope, steps_per_block)
 
         for i in range(steps_per_block):
@@ -59,7 +88,8 @@ def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
                     [schedule_counts[:, :i],
                      get_num_transfer_tokens((x == MASK_ID) & scope, steps_per_block - i)], dim=1)
             mask_index = x == MASK_ID
-            if not (mask_index & scope).any():
+            eligible = (mask_index & scope)[0].nonzero().flatten()
+            if eligible.numel() == 0:
                 break
 
             if defender is None:
@@ -68,26 +98,12 @@ def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
                 logits = defender.forward(
                     x, region, schedule_scale=step_scale(schedule, i, steps_per_block)).logits
 
-            logits_with_noise = add_gumbel_noise(logits, temperature)
-            x0 = torch.argmax(logits_with_noise, dim=-1)
-            if remasking == "low_confidence":
-                p = F.softmax(logits.to(torch.float64), dim=-1)
-                x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
-            elif remasking == "random":
-                x0_p = torch.rand_like(x0, dtype=torch.float64)
-            else:
-                raise NotImplementedError(remasking)
+            commit_sample(x, logits, eligible, int(schedule_counts[0, i]),
+                          temperature, remasking, final=(i == steps_per_block - 1))
 
-            eligible = mask_index & scope
-            x0 = torch.where(mask_index, x0, x)
-            confidence = torch.where(eligible, x0_p, torch.tensor(-float("inf"), device=x0.device))
-            n_eligible = int(eligible.sum())
-            k = int(schedule_counts[0, i])
-            if i == steps_per_block - 1:
-                k = n_eligible
-            k = min(k, n_eligible)
-            if k > 0:
-                _, select_index = torch.topk(confidence[0], k=k)
-                x[0, select_index] = x0[0, select_index]
+        if defender is not None:
+            defender.after_block(
+                x, region, block_index=num_block, block_positions=block_positions,
+                temperature=temperature, remasking=remasking)
 
     return x

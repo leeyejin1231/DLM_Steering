@@ -7,6 +7,7 @@ protocol once per denoising step:
     reset()          per response
     before_step()    may reopen committed answer tokens back to MASK_ID
     forward()        detection + steering inside a single model call
+    after_block()    block-boundary hook: audit, remask, or budget extra steps
     result_fields()  per-response record fields
 
 transform_prompt() is a separate prompt-side hook for defenses that only
@@ -69,6 +70,14 @@ class Defender(ABC):
         """One model forward, optionally with in-forward detection + steering.
         Must return the model output (with .logits)."""
 
+    def after_block(self, x, region, *, block_index, block_positions,
+                    temperature, remasking):
+        """Called once after each block's denoising loop completes.
+
+        block_positions: answer slots of the just-finished block. May audit the
+        block or rewrite committed tokens back to MASK_ID.
+        """
+
     @abstractmethod
     def result_fields(self):
         """Fields merged into this response's result record."""
@@ -111,57 +120,43 @@ class NullDefender(Defender):
     def result_fields(self):
         return {}
 
-
 class Ours(Defender):
-    """Per-response state for gated steering and one-shot remasking.
+    """Shared gated-steering machinery for the v2/v3 remask policies.
 
     A detector hook on blocks[gate-1] reads the current answer and sets a
     continuous gate strength g = clamp((projection - threshold) / width, 0, 1);
     steering hooks on later blocks read g in the same forward and push the
-    currently masked answer slots toward refusal. Once committed answer tokens
-    exist and g >= remask_trigger, a single remasking attempt probes candidate
-    windows of committed tokens with detector-only forwards and reopens the
-    window whose removal lowers the projection the most.
+    currently masked answer slots toward refusal.
 
-    Call reset() before each response. before_step may rewrite committed
-    answer tokens back to MASK_ID in place.
-
-    Steering and remasking are independent axes: --steer {none,fixed,
-    adaptive} picks no steering, a step-0 binary gate, or a continuous
-    per-step gate; --remask {none,fixed} disables or allows the one-shot
-    repair. fixed steering reproduces the steer-only measurements of the
+    --defense ours selects this family and --remask picks the concrete
+    policy, built by from_args: V2 (one-shot committed-window repair, the
+    llada_steering_remasking_v2 method) or V3 (response-detector boundary
+    audit + block recovery). --steer {none,fixed,adaptive} is a separate
+    axis: no steering, a step-0 binary gate, or the continuous per-step
+    gate. fixed steering reproduces the steer-only measurements of the
     old llada_steering_v2 scripts.
     """
 
     name = "ours"
 
     def __init__(self, model, *, gate_layer, gate_vector, threshold, width=1.0,
-                 sites, strength=1.0, transform="additive",
-                 steer="adaptive", remask="fixed",
-                 max_remask_tokens=16, max_parallel_commit=2, remask_trigger=1.0,
-                 initial_only=False, mask_id=MASK_ID):
+                 sites, strength=1.0, transform="additive", steer="adaptive",
+                 remask_enabled=False, initial_only=False, mask_id=MASK_ID):
         """sites: sequence of (layer 1-based, refusal vector [hidden], ref_norm)."""
         if model.training:
             raise ValueError("call model.eval() before constructing the policy")
         if steer not in ("none", "fixed", "adaptive"):
             raise ValueError("steer must be none, fixed or adaptive")
-        if remask not in ("none", "fixed"):
-            raise ValueError("remask must be none or fixed")
         if transform not in ("additive", "project"):
             raise ValueError("transform must be additive or project")
         if not math.isfinite(threshold) or not math.isfinite(width) or width <= 0:
             raise ValueError("threshold must be finite and width positive")
         if not math.isfinite(strength) or strength < 0:
             raise ValueError("strength must be finite and nonnegative")
-        if max_remask_tokens <= 0 or max_parallel_commit <= 0:
-            raise ValueError("token budgets must be positive")
-        if not 0 < remask_trigger <= 1:
-            raise ValueError("remask_trigger must be in (0, 1]")
         self.steer_enabled = steer != "none"
-        self.remask_enabled = remask == "fixed"
         # step-0 binary gate only when steering is fixed and no later
         # remask decision needs fresh gate readings
-        self.gate_once = steer == "fixed" and remask == "none"
+        self.gate_once = steer == "fixed" and not remask_enabled
         self.steer_mode = steer
         blocks = model.model.transformer.blocks
         if not 1 <= gate_layer <= len(blocks):
@@ -183,12 +178,12 @@ class Ours(Defender):
         if self.steer_enabled and not self.sites:
             raise ValueError("at least one steering site is required when steering is on")
         self.model = model
+        self.gate_layer = gate_layer
         self.gate_block = blocks[gate_layer - 1]
         self.gate_vector = gate_vector.float()
         self.threshold, self.width = float(threshold), float(width)
         self.strength, self.transform = float(strength), transform
-        self.max_remask_tokens, self.max_parallel_commit = max_remask_tokens, max_parallel_commit
-        self.remask_trigger, self.initial_only = float(remask_trigger), initial_only
+        self.initial_only = initial_only
         self.mask_id = mask_id
         self.reset()
 
@@ -211,12 +206,21 @@ class Ours(Defender):
         parser.add_argument("--steer", choices=["none", "fixed", "adaptive"], default="adaptive",
                             help="none: no steering; fixed: step-0 binary gate; "
                                  "adaptive: continuous gate every step.")
-        parser.add_argument("--remask", choices=["none", "fixed"], default="fixed",
-                            help="none: never remask; fixed: one-shot committed-token repair.")
+        parser.add_argument("--remask",
+                            choices=["none", "v2", "v3"],
+                            default="v2",
+                            help="none: never remask; v2: one-shot committed-token window "
+                                 "repair; v3: response-detector trigger reopens the first "
+                                 "block and regenerates it over --recovery-steps steps.")
+        parser.add_argument("--response-detector", default="outputs/response_detector.pt",
+                            help="Logistic-regression response checkpoint; required by "
+                                 "--remask v3*. Its layer must match --detector-layer.")
+        parser.add_argument("--recovery-steps", type=int, default=32,
+                            help="Steps spent regenerating a triggered block (v3).")
         parser.add_argument("--max-remask-tokens", type=int, default=16)
         parser.add_argument("--max-parallel-commit", type=int, default=2)
         parser.add_argument("--remask-trigger", type=float, default=1.0,
-                            help="Gate strength needed to attempt the one-shot repair.")
+                            help="Gate strength needed to attempt the v2 one-shot repair.")
         parser.add_argument("--initial-only", action="store_true",
                             help="Stop monitoring for the whole response if the step-0 gate is closed.")
 
@@ -231,24 +235,29 @@ class Ours(Defender):
                 sites.append((layer, bundle["vector"][li].to(device), bundle["mean_act_norm"][li]))
         det_vec, det_layer, threshold = load_detector(
             args.detector, args.detector_layer, device, args.gate_threshold)
-        return cls(model, gate_layer=det_layer, gate_vector=det_vec,
-                   threshold=threshold, width=args.gate_width, sites=sites,
-                   strength=args.alpha, transform=args.transform,
-                   steer=args.steer, remask=args.remask,
-                   max_remask_tokens=args.max_remask_tokens,
-                   max_parallel_commit=args.max_parallel_commit,
-                   remask_trigger=args.remask_trigger, initial_only=args.initial_only)
+        shared = dict(model=model, gate_layer=det_layer, gate_vector=det_vec,
+                      threshold=threshold, width=args.gate_width, sites=sites,
+                      strength=args.alpha, transform=args.transform,
+                      steer=args.steer, initial_only=args.initial_only)
+        if args.remask in ("none", "v2"):
+            return V2(**shared, remask=args.remask == "v2",
+                      max_remask_tokens=args.max_remask_tokens,
+                      max_parallel_commit=args.max_parallel_commit,
+                      remask_trigger=args.remask_trigger)
+        response_detector = torch.load(args.response_detector, map_location="cpu",
+                                       weights_only=False)
+        return V3(**shared, response_detector=response_detector,
+                  recovery_steps=args.recovery_steps)
 
     def reset(self):
         self.gate_strength = 0.0
         self.last_projection = None
         self.monitoring = True
-        self.remasked = False
         self.step = 0
         self.trace = []
-        self.remask_event = None
         self._pending = None
         self._schedule_scale = 1.0
+        self.in_recovery = False
 
     # ----------------------------------------------------------------- checks
     def _validate(self, x, region):
@@ -263,6 +272,136 @@ class Ours(Defender):
         if not math.isfinite(value):
             raise ValueError("detector returned a non-finite projection")
         return value
+
+    def before_step(self, x, region, *, scope, steps_remaining):
+        return None
+
+    # ------------------------------------------------------------------ hooks
+    def _gate_hook(self, module, inputs, output):
+        pending = self._pending
+        if pending is None or pending.get("fired"):
+            return output
+        projection = self._projection(_hidden(output), pending["pool"])
+        if self.gate_once:
+            g = float(projection >= self.threshold) if self.step == 0 else self.gate_strength
+        else:
+            g = min(1.0, max(0.0, (projection - self.threshold) / self.width))
+        self.gate_strength, self.last_projection = g, projection
+        pending["projection"], pending["fired"] = projection, True
+        return output
+
+    def _steer_hook(self, unit, ref_norm, positions):
+        def steer(module, inputs, output):
+            g = self.gate_strength * self._schedule_scale
+            if g <= 0.0 or (self.strength == 0.0 and self.transform == "additive"):
+                return output
+            hidden = _hidden(output)
+            values = hidden[0, positions].to(torch.float32)
+            u = unit.to(values.device)
+            if self.transform == "additive":
+                updated = values + (g * self.strength * ref_norm) * u
+            else:
+                harmful = -u
+                projection = (values * harmful).sum(dim=-1, keepdim=True).clamp(min=0)
+                updated = values - g * (projection + self.strength * ref_norm) * harmful
+            out = hidden.clone()
+            out[0, positions] = updated.to(hidden.dtype)
+            self._pending["effective_alpha"] = g * self.strength
+            return _replace(output, out)
+        return steer
+
+    # ---------------------------------------------------------------- forward
+    @torch.no_grad()
+    def forward(self, x, region, *, schedule_scale=1.0):
+        """One model forward with in-forward detection and steering."""
+        self._validate(x, region)
+        masks = (x == self.mask_id) & region
+        committed = region & ~masks
+        source = "generated" if committed.any() else "masked"
+        pool = committed[0] if committed.any() else masks[0]
+        self._schedule_scale = float(schedule_scale)
+        read_gate = self.monitoring and (not self.gate_once or self.step == 0)
+        steer = (self.steer_enabled and self.monitoring and masks.any()
+                 and (read_gate or self.gate_strength > 0.0))
+        self._pending = {"pool": pool, "fired": False, "projection": None, "effective_alpha": 0.0}
+        handles = []
+        try:
+            if read_gate:
+                handles.append(self.gate_block.register_forward_hook(self._gate_hook))
+            if steer:
+                for block, unit, ref_norm in self.sites:
+                    handles.append(block.register_forward_hook(self._steer_hook(unit, ref_norm, masks[0])))
+            output = self.model(x)
+        finally:
+            for handle in handles:
+                handle.remove()
+        if read_gate and not self._pending["fired"]:
+            raise RuntimeError("model forward did not execute the gate hook")
+        self.trace.append({
+            "step": self.step, "projection": self._pending["projection"],
+            "strength": self.gate_strength, "schedule_scale": self._schedule_scale,
+            "effective_alpha": self._pending["effective_alpha"], "source": source,
+            "num_generated_tokens": int(committed.sum()),
+            "phase": "block_recovery" if self.in_recovery else "base",
+        })
+        if self.step == 0 and self.initial_only and self.gate_strength == 0.0:
+            self.monitoring = False
+        self._pending = None
+        self.step += 1
+        return output
+
+    def _remasked(self):
+        return False
+
+    def result_fields(self):
+        if not self.trace:
+            return {}
+        return {"gate_projection": self.trace[0]["projection"],
+                "gate_open": any(t["strength"] > 0 for t in self.trace),
+                "gate_max_strength": max(t["strength"] for t in self.trace),
+                "remasked": self._remasked(),
+                "gate_trace": self.trace}
+
+    def summarize(self, results):
+        n_open = sum(r["gate_open"] for r in results)
+        n_remask = sum(r["remasked"] for r in results)
+        return f"gate opened on {n_open}/{len(results)} prompts, remasked {n_remask}"
+
+    def describe(self):
+        return {"defense": self.name, "steer": self.steer_mode,
+                "transform": self.transform, "strength": self.strength,
+                "threshold": self.threshold, "width": self.width,
+                "layers": self.steer_layers, "initial_only": self.initial_only}
+
+
+class V2(Ours):
+    """--remask v2: one-shot committed-window repair.
+
+    Once committed answer tokens exist and the gate strength reaches
+    --remask-trigger, a single remasking attempt probes candidate windows
+    of committed tokens with detector-only forwards and reopens the window
+    whose removal lowers the projection the most. This is the
+    llada_steering_remasking_v2 method.
+    """
+
+    name = "v2"
+
+    def __init__(self, model, *, remask=False, max_remask_tokens=16,
+                 max_parallel_commit=2, remask_trigger=1.0, **kw):
+        if max_remask_tokens <= 0 or max_parallel_commit <= 0:
+            raise ValueError("token budgets must be positive")
+        if not 0 < remask_trigger <= 1:
+            raise ValueError("remask_trigger must be in (0, 1]")
+        self.remask_enabled = bool(remask)
+        self.max_remask_tokens = max_remask_tokens
+        self.max_parallel_commit = max_parallel_commit
+        self.remask_trigger = float(remask_trigger)
+        super().__init__(model, remask_enabled=self.remask_enabled, **kw)
+
+    def reset(self):
+        super().reset()
+        self.remasked = False
+        self.remask_event = None
 
     # ---------------------------------------------------------------- probes
     @torch.no_grad()
@@ -338,101 +477,164 @@ class Ours(Defender):
                 self.remask_event = event
         return commit_count
 
-    # ------------------------------------------------------------------ hooks
-    def _gate_hook(self, module, inputs, output):
-        pending = self._pending
-        if pending is None or pending.get("fired"):
-            return output
-        projection = self._projection(_hidden(output), pending["pool"])
-        if self.gate_once:
-            g = float(projection >= self.threshold) if self.step == 0 else self.gate_strength
-        else:
-            g = min(1.0, max(0.0, (projection - self.threshold) / self.width))
-        self.gate_strength, self.last_projection = g, projection
-        pending["projection"], pending["fired"] = projection, True
-        return output
-
-    def _steer_hook(self, unit, ref_norm, positions):
-        def steer(module, inputs, output):
-            g = self.gate_strength * self._schedule_scale
-            if g <= 0.0 or (self.strength == 0.0 and self.transform == "additive"):
-                return output
-            hidden = _hidden(output)
-            values = hidden[0, positions].to(torch.float32)
-            u = unit.to(values.device)
-            if self.transform == "additive":
-                updated = values + (g * self.strength * ref_norm) * u
-            else:
-                harmful = -u
-                projection = (values * harmful).sum(dim=-1, keepdim=True).clamp(min=0)
-                updated = values - g * (projection + self.strength * ref_norm) * harmful
-            out = hidden.clone()
-            out[0, positions] = updated.to(hidden.dtype)
-            self._pending["effective_alpha"] = g * self.strength
-            return _replace(output, out)
-        return steer
-
-    # ---------------------------------------------------------------- forward
-    @torch.no_grad()
-    def forward(self, x, region, *, schedule_scale=1.0):
-        """One model forward with in-forward detection and steering."""
-        self._validate(x, region)
-        masks = (x == self.mask_id) & region
-        committed = region & ~masks
-        source = "generated" if committed.any() else "masked"
-        pool = committed[0] if committed.any() else masks[0]
-        self._schedule_scale = float(schedule_scale)
-        read_gate = self.monitoring and (not self.gate_once or self.step == 0)
-        steer = (self.steer_enabled and self.monitoring and masks.any()
-                 and (read_gate or self.gate_strength > 0.0))
-        self._pending = {"pool": pool, "fired": False, "projection": None, "effective_alpha": 0.0}
-        handles = []
-        try:
-            if read_gate:
-                handles.append(self.gate_block.register_forward_hook(self._gate_hook))
-            if steer:
-                for block, unit, ref_norm in self.sites:
-                    handles.append(block.register_forward_hook(self._steer_hook(unit, ref_norm, masks[0])))
-            output = self.model(x)
-        finally:
-            for handle in handles:
-                handle.remove()
-        if read_gate and not self._pending["fired"]:
-            raise RuntimeError("model forward did not execute the gate hook")
-        self.trace.append({
-            "step": self.step, "projection": self._pending["projection"],
-            "strength": self.gate_strength, "schedule_scale": self._schedule_scale,
-            "effective_alpha": self._pending["effective_alpha"], "source": source,
-            "num_generated_tokens": int(committed.sum()),
-        })
-        if self.step == 0 and self.initial_only and self.gate_strength == 0.0:
-            self.monitoring = False
-        self._pending = None
-        self.step += 1
-        return output
+    def _remasked(self):
+        return bool(self.remask_event and self.remask_event["applied"])
 
     def result_fields(self):
-        if not self.trace:
-            return {}
-        return {"gate_projection": self.trace[0]["projection"],
-                "gate_open": any(t["strength"] > 0 for t in self.trace),
-                "gate_max_strength": max(t["strength"] for t in self.trace),
-                "remasked": bool(self.remask_event and self.remask_event["applied"]),
-                "remask_event": self.remask_event,
-                "gate_trace": self.trace}
-
-    def summarize(self, results):
-        n_open = sum(r["gate_open"] for r in results)
-        n_remask = sum(r["remasked"] for r in results)
-        return f"gate opened on {n_open}/{len(results)} prompts, remasked {n_remask}"
+        fields = super().result_fields()
+        if fields:
+            fields["remask_event"] = self.remask_event
+        return fields
 
     def describe(self):
-        return {"defense": self.name, "steer": self.steer_mode,
-                "remask": self.remask_enabled, "transform": self.transform,
-                "strength": self.strength, "threshold": self.threshold, "width": self.width,
-                "layers": self.steer_layers, "max_remask_tokens": self.max_remask_tokens,
-                "max_parallel_commit": self.max_parallel_commit,
-                "remask_trigger": self.remask_trigger, "initial_only": self.initial_only}
+        d = super().describe()
+        d.update(remask="v2" if self.remask_enabled else "none",
+                 max_remask_tokens=self.max_remask_tokens,
+                 max_parallel_commit=self.max_parallel_commit,
+                 remask_trigger=self.remask_trigger)
+        return d
+
+
+class V3(Ours):
+    """--remask v3: response-detector boundary audit and block recovery.
+
+    At each block boundary an unsteered audit forward pools gate-layer
+    features over the committed tokens and scores them with a
+    logistic-regression response detector (--response-detector; its layer
+    must match --detector-layer). A trigger on the first block reopens the
+    whole block and regenerates it over --recovery-steps dedicated
+    forwards.
+    """
+
+    name = "v3"
+
+    def __init__(self, model, *, response_detector, recovery_steps=32, **kw):
+        if recovery_steps <= 0:
+            raise ValueError("recovery_steps must be positive")
+        if response_detector is None:
+            raise ValueError("--remask v3 requires a response detector "
+                             "checkpoint (--response-detector)")
+        missing = {"weight", "bias", "threshold", "layer"} - response_detector.keys()
+        if missing:
+            raise ValueError(f"response detector missing keys: {sorted(missing)}")
+        self.recovery_steps = int(recovery_steps)
+        super().__init__(model, remask_enabled=True, **kw)
+        if int(response_detector["layer"]) != self.gate_layer:
+            raise ValueError("response detector layer must match the gate layer")
+        device = self.gate_vector.device
+        self._det_weight = torch.as_tensor(
+            response_detector["weight"], dtype=torch.float32, device=device)
+        self._det_bias = float(response_detector["bias"])
+        self._det_threshold = float(response_detector["threshold"])
+        self.response_detector = response_detector
+
+    def reset(self):
+        super().reset()
+        self.boundary_audits = []
+        self.recovery_events = []
+        self.audit_forwards = 0
+
+    # --------------------------------------------------- boundary audit/remask
+    @staticmethod
+    def _chunk_positions(positions, size=32):
+        return [positions[i:i + size] for i in range(0, positions.numel(), size)]
+
+    @torch.no_grad()
+    def _audit(self, x, region, chunks):
+        """One unsteered forward capturing gate-layer features pooled over the
+        committed tokens and each chunk of the finished block."""
+        pools = [(region[0] & (x[0] != self.mask_id)).nonzero().flatten(), *chunks]
+        feats_out = []
+
+        def capture(module, inputs, output):
+            hidden = _hidden(output)
+            feats_out.append(torch.stack(
+                [hidden[0, p].to(torch.float32).mean(dim=0) for p in pools]))
+
+        handle = self.gate_block.register_forward_hook(capture)
+        try:
+            self.model(x)
+        finally:
+            handle.remove()
+        self.audit_forwards += 1
+        if len(feats_out) != 1:
+            raise RuntimeError("audit hook must execute exactly once per forward")
+        feats = feats_out[0]
+        logit = feats[0] @ self._det_weight + self._det_bias
+        values = torch.cat(
+            [feats @ self.gate_vector, logit.reshape(1), torch.sigmoid(logit.reshape(1))]
+        ).tolist()
+        projection = values[0]
+        return {
+            "projection": projection,
+            "block_projections": values[1:1 + len(chunks)],
+            "response_logit": values[-2],
+            "response_probability": values[-1],
+            "strength": min(1.0, max(0.0, (projection - self.threshold) / self.width)),
+        }
+
+    @torch.no_grad()
+    def after_block(self, x, region, *, block_index, block_positions,
+                    temperature, remasking):
+        positions = block_positions[0].nonzero().flatten()
+        reading = self._audit(x, region, self._chunk_positions(positions))
+        trigger = (block_index == 0
+                   and reading["response_probability"] >= self._det_threshold)
+        self.boundary_audits.append({
+            "boundary": block_index, **reading, "trigger": trigger,
+            "trigger_rule": "response_probability_cutoff_first_boundary"})
+        if not trigger:
+            return
+
+        from llada import get_num_transfer_tokens
+        from sampler import commit_sample
+
+        event = {"boundary": block_index,
+                 "pre_audit": reading, "pre_recovery_token_ids": x[0].tolist(),
+                 "rounds": [], "applied": True,
+                 "extra_sampling_steps": self.recovery_steps}
+        self.recovery_events.append(event)
+
+        old_tokens = x[0, positions].clone()
+        x[0, positions] = self.mask_id
+        counts = get_num_transfer_tokens(
+            (x == self.mask_id) & block_positions, self.recovery_steps)[0].tolist()
+        eligible = positions[x[0, positions] == self.mask_id]
+        self.in_recovery = True
+        try:
+            for i in range(self.recovery_steps):
+                final = i == self.recovery_steps - 1
+                if eligible.numel() == 0:
+                    break
+                if counts[i] == 0 and not final:
+                    continue
+                logits = self.forward(x, region, schedule_scale=1.0).logits
+                eligible = commit_sample(x, logits, eligible, counts[i],
+                                         temperature, remasking, final=final)
+        finally:
+            self.in_recovery = False
+        event["rounds"].append({
+            "selected": positions.tolist(),
+            "old_token_ids": old_tokens.tolist(),
+            "new_token_ids": x[0, positions].tolist(),
+            "round_sampling_forwards": self.recovery_steps,
+            "post_trial_token_ids": x[0].tolist()})
+
+    def _remasked(self):
+        return any(e["applied"] for e in self.recovery_events)
+
+    def result_fields(self):
+        fields = super().result_fields()
+        if fields and self.boundary_audits:
+            fields.update(boundary_audits=self.boundary_audits,
+                          recovery_events=self.recovery_events,
+                          audit_forwards=self.audit_forwards)
+        return fields
+
+    def describe(self):
+        d = super().describe()
+        d.update(remask="v3", recovery_steps=self.recovery_steps)
+        return d
 
 
 class ProposedDefense(Defender):

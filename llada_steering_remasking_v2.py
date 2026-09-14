@@ -45,7 +45,7 @@ import torch
 
 from Attacker import DIJA, NoAttack
 from common import MODEL_NAME, MASK_ID, load_llada, load_prompts, encode_prompt, write_json
-from Defender import Ours
+from Defender import V2
 from sampler import generate
 
 
@@ -121,12 +121,12 @@ def main():
     tokenizer, model = load_llada()
     device = next(model.parameters()).device
 
-    policy = None if args.steer == "none" and args.remask == "none" else Ours(
+    policy = None if args.steer == "none" and args.remask == "none" else V2(
         model, gate_layer=args.detector_layer, gate_vector=det_vec.to(device),
         threshold=threshold, width=args.gate_width,
         sites=[(layer, v.to(device), ref) for layer, v, ref in site_specs],
         strength=args.alpha, transform=args.transform,
-        steer=args.steer, remask=args.remask,
+        steer=args.steer, remask=args.remask == "fixed",
         max_remask_tokens=args.max_remask_tokens, max_parallel_commit=args.max_parallel_commit,
         remask_trigger=args.remask_trigger, initial_only=args.initial_only,
     )
