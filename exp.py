@@ -13,7 +13,9 @@ import argparse
 import time
 
 from Attacker import ATTACKERS
-from common import MODEL_NAME, MASK_ID, encode_prompt, load_llada, load_prompts, write_json
+from common import (MODEL_NAME, MASK_ID, encode_prompt, enable_reproducibility,
+                    force_math_attention, load_llada, load_prompts, seed_all,
+                    write_json)
 from Defender import DEFENDERS
 
 
@@ -37,6 +39,10 @@ def parse_args():
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--remasking", default="low_confidence")
     p.add_argument("--schedule", default="const", choices=["const", "linear", "cosine"])
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--reproduct", action="store_true",
+                   help="Bitwise-deterministic generation: fixed seeds, deterministic "
+                        "kernels, math SDPA backend. Slower but identical across GPUs.")
     ATTACKERS[known.attack].add_args(p)
     DEFENDERS[known.defense].add_args(p)
     return p.parse_args()
@@ -45,9 +51,15 @@ def parse_args():
 def main():
     args = parse_args()
     attacker = ATTACKERS[args.attack].from_args(args)
+    if args.reproduct:
+        enable_reproducibility(args.seed)
+    else:
+        seed_all(args.seed)
 
     print(f"loading {MODEL_NAME} ...")
     tokenizer, model = load_llada()
+    if args.reproduct:
+        force_math_attention()
     device = next(model.parameters()).device
 
     defender = DEFENDERS[args.defense].from_args(args, model)

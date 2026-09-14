@@ -42,6 +42,37 @@ def load_llada(device=None):
     return tokenizer, model
 
 
+def seed_all(seed):
+    """Seed python/np/torch RNGs. Applied always so runs are repeatable."""
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def enable_reproducibility(seed=42):
+    """Bitwise-deterministic generation: fixed seeds + deterministic kernels.
+
+    Must run before the first CUDA op so CUBLAS_WORKSPACE_CONFIG is already
+    set when the cublas handle is created."""
+    import os
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    seed_all(seed)
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def force_math_attention():
+    """Restrict SDPA to the math backend -- the only backend whose numerics are
+    stable across GPU architectures. Call AFTER load_llada: the remote model
+    code re-enables flash_sdp in __init__."""
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(True)
+
+
 def prompt_token_ids(tokenizer, user_message):
     """Chat-template a user message; return the token id list."""
     formatted = tokenizer.apply_chat_template(
