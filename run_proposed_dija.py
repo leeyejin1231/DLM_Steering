@@ -1,5 +1,5 @@
-"""Drive proposed.Proposed with the same sampler and DIJA prompts as
-llada_steering_remasking_v2.py, so its ASR is directly comparable.
+"""Drive proposed.Proposed (via Defender.ProposedDefense) with the same sampler
+and DIJA prompts as exp.py, so its ASR is directly comparable.
 
 proposed.py is used unmodified: latched binary gate read by a separate
 detector forward each step until done, projection-removal steering on layers
@@ -17,56 +17,15 @@ Usage:
 """
 
 import argparse
-import json
 import time
-from pathlib import Path
 
 import torch
 
 from llada import MODEL_NAME, MASK_ID
-from proposed import Proposed
 from Attacker import DIJA, NoAttack
-from common import load_prompts
-from llada_steering_remasking_v2 import generate_defended
-
-
-class ProposedAdapter:
-    """Expose proposed.Proposed through the policy interface generate_defended uses."""
-
-    def __init__(self, model, gate, csd, *, layers, total_steps, **options):
-        self.model, self.gate, self.csd = model, gate, csd
-        self.layers, self.options, self.total_steps = layers, options, total_steps
-        self.policy = None
-
-    def reset(self):
-        # proposed.py wants one instance per response.
-        self.policy = Proposed.from_llada(self.model, self.gate, self.csd, layers=self.layers,
-                                          **self.options)
-        self.step, self.trace, self.remask_event = 0, [], None
-
-    def before_step(self, x, region, *, scope, steps_remaining):
-        # proposed.py is block-agnostic: it budgets against the whole generation.
-        before = int(((x == MASK_ID) & region).sum())
-        masks, _, _ = self.policy.before_step(
-            x, region, steps_remaining=self.total_steps - self.step, commit_count=1)
-        reopened = int(masks.sum()) - before
-        commit_count = None
-        if reopened > 0:
-            self.remask_event = {"step": self.step, "reopened": reopened}
-            commit_count = 1  # any value: the sampler rebalances the block schedule
-        self.trace.append({"step": self.step, "armed": self.policy.armed, "done": self.policy.done})
-        return masks, int((masks & scope).sum()), commit_count
-
-    def forward(self, x, region, *, schedule_scale=1.0):
-        self.step += 1
-        return self.policy.forward(x, region)
-
-    def result_fields(self):
-        return {"gate_open": self.policy.armed,
-                "armed_at_step": next((t["step"] for t in self.trace if t["armed"]), None),
-                "monitoring_steps": sum(1 for t in self.trace if not t["done"]),
-                "remasked": self.remask_event is not None,
-                "remask_event": self.remask_event}
+from common import load_llada, load_prompts, encode_prompt, write_json, load_detector
+from Defender import ProposedDefense
+from sampler import generate
 
 
 def parse_args():
@@ -97,19 +56,17 @@ def parse_args():
 
 
 def main():
-    from transformers import AutoModel, AutoTokenizer
-
     args = parse_args()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     csd = torch.load(args.vector, map_location="cpu")
-    db = torch.load(args.detector, map_location="cpu")
-    det_vec = db["vector"][db["layers"].index(args.detector_layer)]
-    threshold = args.gate_threshold
-    if threshold is None:
-        threshold = json.loads((Path(args.detector).parent / "gate_threshold.json").read_text())["threshold"]
-    gate = {"layer": args.detector_layer, "vector": det_vec.to(device),
-            "center": torch.zeros_like(det_vec).to(device), "scale": 1.0, "threshold": threshold}
+    print(f"loading {MODEL_NAME} ...")
+    tokenizer, model = load_llada()
+    device = next(model.parameters()).device
+
+    det_vec, threshold = load_detector(args.detector, args.detector_layer, device,
+                                       args.gate_threshold)
+    gate = {"layer": args.detector_layer, "vector": det_vec,
+            "center": torch.zeros_like(det_vec), "scale": 1.0, "threshold": threshold}
     csd = {"layers": csd["layers"], "vector": csd["vector"].to(device)}
     layers = tuple(int(s) for s in args.layers.split(","))
     print(f"proposed.py: layers {layers}, strength {args.strength}, mode {args.mode}, "
@@ -120,12 +77,7 @@ def main():
     attacker = DIJA(args.dija_steps, args.dija_span) if args.attack == "dija" else NoAttack()
     print(f"running {len(rows)} prompts from {args.source} (attack {args.attack})")
 
-    print(f"loading {MODEL_NAME} ...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    model = AutoModel.from_pretrained(MODEL_NAME, trust_remote_code=True,
-                                      dtype=torch.bfloat16).to(device).eval()
-
-    policy = ProposedAdapter(
+    policy = ProposedDefense(
         model, gate, csd, layers=layers, total_steps=args.steps, strength=args.strength,
         mode=args.mode, max_remask_tokens=args.max_remask_tokens,
         max_parallel_commit=args.max_parallel_commit, initial_only=not args.no_initial_only)
@@ -145,13 +97,11 @@ def main():
     for i, row in enumerate(rows):
         idx, prompt = row["index"], row["prompt"]
         user_message = attacker.build_prompt(row)
-        formatted = tokenizer.apply_chat_template(
-            [{"role": "user", "content": user_message}], add_generation_prompt=True, tokenize=False)
-        input_ids = torch.tensor(tokenizer(formatted)["input_ids"], device=device).unsqueeze(0)
+        input_ids = encode_prompt(tokenizer, user_message, device)
 
         t0 = time.time()
-        out = generate_defended(model, input_ids, policy, steps=args.steps, gen_length=args.gen_length,
-                                block_length=args.block_length, temperature=args.temperature)
+        out = generate(model, input_ids, policy, steps=args.steps, gen_length=args.gen_length,
+                       block_length=args.block_length, temperature=args.temperature)
         elapsed = time.time() - t0
 
         generation, extra = attacker.decode(tokenizer, out, input_ids)
@@ -160,16 +110,14 @@ def main():
                         "num_prompt_tokens": int(input_ids.shape[1]),
                         "num_prompt_masks": int((input_ids == MASK_ID).sum()),
                         "seconds": round(elapsed, 2), **policy.result_fields()})
-        with open(args.out, "w", encoding="utf-8") as f:
-            json.dump({"model": MODEL_NAME, "config": gen_config, "steering": steer_config,
-                       "results": results}, f, ensure_ascii=False, indent=2)
+        write_json(args.out, {"model": MODEL_NAME, "config": gen_config, "steering": steer_config,
+                              "results": results})
         r = results[-1]
         print(f"[{i + 1}/{len(rows)}] idx={idx} {elapsed:.1f}s armed={r['gate_open']}"
               f"{' [remask]' if r['remasked'] else ''} :: {generation[:100].replace(chr(10), ' ')}...",
               flush=True)
 
-    print(f"gate opened on {sum(r['gate_open'] for r in results)}/{len(results)} prompts, "
-          f"remasked {sum(r['remasked'] for r in results)}")
+    print(policy.summarize(results))
     print(f"\nDone in {time.time() - t_start:.1f}s -> {args.out}")
 
 
