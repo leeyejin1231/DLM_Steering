@@ -71,11 +71,13 @@ class Defender(ABC):
         Must return the model output (with .logits)."""
 
     def after_block(self, x, region, *, block_index, block_positions,
-                    temperature, remasking):
+                    prompt_length, temperature, remasking):
         """Called once after each block's denoising loop completes.
 
-        block_positions: answer slots of the just-finished block. May audit the
-        block or rewrite committed tokens back to MASK_ID.
+        block_positions: answer slots of the just-finished block. prompt_length
+        marks the prompt/generation boundary; committed answer slots before it
+        (e.g. filled DIJA spans) are also remaskable. May audit the block or
+        rewrite committed tokens back to MASK_ID.
         """
 
     @abstractmethod
@@ -575,7 +577,7 @@ class V3(Ours):
 
     @torch.no_grad()
     def after_block(self, x, region, *, block_index, block_positions,
-                    temperature, remasking):
+                    prompt_length, temperature, remasking):
         positions = block_positions[0].nonzero().flatten()
         reading = self._audit(x, region, self._chunk_positions(positions))
         trigger = (block_index == 0
@@ -595,11 +597,17 @@ class V3(Ours):
                  "extra_sampling_steps": self.recovery_steps}
         self.recovery_events.append(event)
 
+        # Remask the finished block plus any committed answer slots inside the
+        # prompt (DIJA spans carry the payload under that attack).
+        span_slots = region[0] & (x[0] != self.mask_id)
+        span_slots[prompt_length:] = False
+        targets = block_positions[0] | span_slots
+        positions = targets.nonzero().flatten()
         old_tokens = x[0, positions].clone()
         x[0, positions] = self.mask_id
         counts = get_num_transfer_tokens(
-            (x == self.mask_id) & block_positions, self.recovery_steps)[0].tolist()
-        eligible = positions[x[0, positions] == self.mask_id]
+            targets.unsqueeze(0), self.recovery_steps)[0].tolist()
+        eligible = positions
         self.in_recovery = True
         try:
             for i in range(self.recovery_steps):
@@ -615,6 +623,7 @@ class V3(Ours):
             self.in_recovery = False
         event["rounds"].append({
             "selected": positions.tolist(),
+            "num_span_positions": int(span_slots.sum()),
             "old_token_ids": old_tokens.tolist(),
             "new_token_ids": x[0, positions].tolist(),
             "round_sampling_forwards": self.recovery_steps,

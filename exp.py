@@ -34,9 +34,11 @@ def parse_args():
     p.add_argument("--n", type=int, default=20)
     p.add_argument("--start", type=int, default=0)
     p.add_argument("--steps", type=int, default=128)
-    p.add_argument("--gen-length", type=int, default=128)
+    p.add_argument("--gen-length", type=int, default=None,
+                   help="assistant tokens to append; default 0 under --attack dija "
+                        "(prompt-span infilling only), else 128")
     p.add_argument("--block-length", type=int, default=32)
-    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--remasking", default="low_confidence")
     p.add_argument("--schedule", default="const", choices=["const", "linear", "cosine"])
     p.add_argument("--seed", type=int, default=42)
@@ -67,7 +69,10 @@ def main():
     print(f"{len(rows)} prompts from {args.source}, attack={args.attack}, "
           f"defense={args.defense}")
 
-    gen_config = {"steps": args.steps, "gen_length": args.gen_length,
+    gen_length = args.gen_length
+    if gen_length is None:
+        gen_length = 0 if args.attack == "dija" else 128
+    gen_config = {"steps": args.steps, "gen_length": gen_length,
                   "block_length": args.block_length, "temperature": args.temperature,
                   "remasking": args.remasking, "schedule": args.schedule}
 

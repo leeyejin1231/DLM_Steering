@@ -51,29 +51,36 @@ def commit_sample(x, logits, eligible, count, temperature, remasking, final=Fals
 def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
              block_length=32, temperature=0.0, remasking="low_confidence",
              schedule="const"):
-    """Diffusion sampling driven by a Defender; None runs undefended."""
+    """Diffusion sampling driven by a Defender; None runs undefended.
+
+    gen_length=0 runs pure infilling: the prompt's own mask slots (e.g. DIJA
+    spans) form a single block denoised over `steps` steps, with no assistant
+    suffix appended."""
     if prompt_ids.ndim != 2 or prompt_ids.shape[0] != 1:
         raise ValueError("generate supports one prompt at a time")
-    if gen_length <= 0 or block_length <= 0 or steps <= 0:
-        raise ValueError("generation length, block length, and steps must be positive")
-    if gen_length % block_length or steps % (gen_length // block_length):
+    if gen_length < 0 or block_length <= 0 or steps <= 0:
+        raise ValueError("gen_length must be >= 0; block length and steps must be positive")
+    if gen_length and (gen_length % block_length or steps % (gen_length // block_length)):
         raise ValueError("gen_length must be a multiple of block_length and steps of num_blocks")
     prompt_length = prompt_ids.shape[1]
     x = torch.full((1, prompt_length + gen_length), MASK_ID, dtype=torch.long,
                    device=model.device)
     x[:, :prompt_length] = prompt_ids.clone()
     region = x == MASK_ID
+    if not region.any():
+        return x
     if defender is not None:
         defender.reset()
 
-    num_blocks = gen_length // block_length
+    num_blocks = gen_length // block_length if gen_length else 1
     steps_per_block = steps // num_blocks
     for num_block in range(num_blocks):
-        block_end = prompt_length + (num_block + 1) * block_length
+        block_end = min(prompt_length + (num_block + 1) * block_length, x.shape[1])
+        block_start = 0 if gen_length == 0 else prompt_length + num_block * block_length
         scope = region.clone()
         scope[:, block_end:] = False
         block_positions = scope.clone()
-        block_positions[:, :prompt_length + num_block * block_length] = False
+        block_positions[:, :block_start] = False
         schedule_counts = get_num_transfer_tokens((x == MASK_ID) & scope, steps_per_block)
 
         for i in range(steps_per_block):
@@ -104,6 +111,7 @@ def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
         if defender is not None:
             defender.after_block(
                 x, region, block_index=num_block, block_positions=block_positions,
+                prompt_length=prompt_length,
                 temperature=temperature, remasking=remasking)
 
     return x
