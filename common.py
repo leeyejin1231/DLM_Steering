@@ -17,6 +17,8 @@ from llada import MODEL_NAME, MASK_ID  # noqa: F401  (re-exported)
 EOT_ID = 126348   # <|eot_id|>, closes the user turn in LLaDA's chat template
 NEWLINE_ID = 198  # '\n'; used to locate the DIJA template inside the prompt
 
+DATA_DIR = Path(__file__).parent / "data"   # populated by data_downloader.py
+
 JBB_HARMFUL_GLOB = ("/mnt/shared/huggingface-cache/hub/datasets--JailbreakBench--JBB-Behaviors"
                     "/snapshots/*/data/harmful-behaviors.csv")
 JBB_BENIGN_GLOB = JBB_HARMFUL_GLOB.replace("harmful-", "benign-")
@@ -93,7 +95,8 @@ def load_prompts(source):
     """
     import pandas as pd
     if source == "jbb_harmful":
-        df = pd.read_csv(glob.glob(JBB_HARMFUL_GLOB)[0])
+        local = DATA_DIR / "jbb_harmful.csv"
+        df = pd.read_csv(local if local.exists() else glob.glob(JBB_HARMFUL_GLOB)[0])
         return [{"index": int(r["Index"]), "prompt": str(r["Goal"]), "target": str(r["Target"])}
                 for _, r in df.iterrows()]
     if source in ("advbench", "harmbench"):
@@ -115,24 +118,27 @@ def load_eval_prompts(source, limit):
         want = "unsafe" if source.endswith("_unsafe") else "safe"
         df = df[df["label"] == want]
         prompts = df["prompt"].tolist()
-    elif source == "jbb_benign":
+    elif source in ("jbb_benign", "jbb_harmful"):
         # Each benign behaviour is the index-matched counterpart of a harmful one
         # ("fictional story about heroin use" vs "defamatory article claiming a
         # president is addicted to heroin"), so topic is held roughly constant
         # and only permissibility differs.
-        df = pd.read_csv(glob.glob(JBB_BENIGN_GLOB)[0])
-        prompts = df["Goal"].tolist()
-    elif source == "jbb_harmful":
-        df = pd.read_csv(glob.glob(JBB_HARMFUL_GLOB)[0])
+        local = DATA_DIR / f"{source}.csv"
+        pattern = JBB_BENIGN_GLOB if source == "jbb_benign" else JBB_HARMFUL_GLOB
+        df = pd.read_csv(local if local.exists() else glob.glob(pattern)[0])
         prompts = df["Goal"].tolist()
     elif source in ("advbench", "harmbench", "strongreject"):
         # Out-of-distribution harmful benchmarks: bare requests in attack styles
         # the steering and detector directions never saw. Shards are concatenated
         # and de-duplicated because some of these ship several splits.
-        name = {"advbench": "AdvBench", "harmbench": "HarmBench",
-                "strongreject": "StrongREJECT"}[source]
-        files = sorted(glob.glob(WALLEDAI_GLOB.format(name), recursive=True))
-        df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+        local = DATA_DIR / f"{source}.parquet"
+        if local.exists():
+            df = pd.read_parquet(local)
+        else:
+            name = {"advbench": "AdvBench", "harmbench": "HarmBench",
+                    "strongreject": "StrongREJECT"}[source]
+            files = sorted(glob.glob(WALLEDAI_GLOB.format(name), recursive=True))
+            df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
         prompts = list(dict.fromkeys(df["prompt"].astype(str).tolist()))
     elif source == "truthfulqa":
         # Plain harmless questions: nothing here should ever be refused, so the
