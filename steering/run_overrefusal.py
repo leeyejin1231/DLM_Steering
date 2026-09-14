@@ -36,7 +36,7 @@ sys.path.insert(0, str(ROOT))
 from llada import MODEL_NAME  # noqa: E402
 # Both steering modules expose the same names; STEER_IMPL selects which one so
 # the benign sets can be generated with either implementation unchanged.
-_impl = importlib.import_module(os.environ.get("STEER_IMPL", "llada_steering"))
+_impl = importlib.import_module(os.environ.get("STEER_IMPL", "llada_steering_v2"))
 Steerer = _impl.Steerer
 generate_steered = _impl.generate_steered
 DetectorGate = _impl.DetectorGate

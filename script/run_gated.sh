@@ -20,7 +20,7 @@ D="--detector $DETECTOR --detector-layer $DETECTOR_LAYER --vector $VECTOR --alph
 say "generating on GPU $GPU_A and GPU $GPU_B"
 
 (
-    CUDA_VISIBLE_DEVICES=$GPU_A $PY llada_steering.py $D \
+    CUDA_VISIBLE_DEVICES=$GPU_A $PY llada_steering_v2.py $D \
         --steps 128 --gen-length 128 --n "$N_HARMFUL" \
         --out outputs/gated_len128.json > log/gated_len128.log 2>&1
     CUDA_VISIBLE_DEVICES=$GPU_A $PY steering/run_overrefusal.py $D \
@@ -32,7 +32,7 @@ say "generating on GPU $GPU_A and GPU $GPU_B"
 ) &
 A=$!
 (
-    CUDA_VISIBLE_DEVICES=$GPU_B $PY llada_steering.py $D \
+    CUDA_VISIBLE_DEVICES=$GPU_B $PY llada_steering_v2.py $D \
         --steps 256 --gen-length 256 --n "$N_HARMFUL" \
         --out outputs/gated_len256.json > log/gated_len256.log 2>&1
     CUDA_VISIBLE_DEVICES=$GPU_B $PY steering/run_overrefusal.py $D \

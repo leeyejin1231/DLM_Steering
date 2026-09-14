@@ -22,7 +22,7 @@ from transformers import AutoModel, AutoTokenizer
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from llada import MODEL_NAME  # noqa: E402
-from llada_steering import Steerer, generate_steered  # noqa: E402
+from llada_steering_v2 import Steerer, generate_steered  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 
