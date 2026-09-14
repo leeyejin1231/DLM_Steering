@@ -13,6 +13,7 @@ transform_prompt() is a separate prompt-side hook for defenses that only
 edit the user message.
 """
 
+import argparse
 import math
 from abc import ABC, abstractmethod
 
@@ -124,19 +125,28 @@ class Ours(Defender):
 
     Call reset() before each response. before_step may rewrite committed
     answer tokens back to MASK_ID in place.
+
+    Steering and remasking are independent axes: --steer {none,fixed,
+    adaptive} picks no steering, a step-0 binary gate, or a continuous
+    per-step gate; --remask {none,fixed} disables or allows the one-shot
+    repair. fixed steering reproduces the steer-only measurements of the
+    old llada_steering_v2 scripts.
     """
 
     name = "ours"
 
     def __init__(self, model, *, gate_layer, gate_vector, threshold, width=1.0,
-                 sites, strength=1.0, transform="additive", mode="repair",
+                 sites, strength=1.0, transform="additive",
+                 steer="adaptive", remask="fixed",
                  max_remask_tokens=16, max_parallel_commit=2, remask_trigger=1.0,
                  initial_only=False, mask_id=MASK_ID):
         """sites: sequence of (layer 1-based, refusal vector [hidden], ref_norm)."""
         if model.training:
             raise ValueError("call model.eval() before constructing the policy")
-        if mode not in ("baseline", "steer", "repair"):
-            raise ValueError("mode must be baseline, steer or repair")
+        if steer not in ("none", "fixed", "adaptive"):
+            raise ValueError("steer must be none, fixed or adaptive")
+        if remask not in ("none", "fixed"):
+            raise ValueError("remask must be none or fixed")
         if transform not in ("additive", "project"):
             raise ValueError("transform must be additive or project")
         if not math.isfinite(threshold) or not math.isfinite(width) or width <= 0:
@@ -147,6 +157,12 @@ class Ours(Defender):
             raise ValueError("token budgets must be positive")
         if not 0 < remask_trigger <= 1:
             raise ValueError("remask_trigger must be in (0, 1]")
+        self.steer_enabled = steer != "none"
+        self.remask_enabled = remask == "fixed"
+        # step-0 binary gate only when steering is fixed and no later
+        # remask decision needs fresh gate readings
+        self.gate_once = steer == "fixed" and remask == "none"
+        self.steer_mode = steer
         blocks = model.model.transformer.blocks
         if not 1 <= gate_layer <= len(blocks):
             raise ValueError(f"gate layer must be in 1..{len(blocks)}")
@@ -164,13 +180,13 @@ class Ours(Defender):
                 raise ValueError("reference norm must be finite and positive")
             self.sites.append((blocks[layer - 1], vector.float() / vector.norm(), float(ref_norm)))
             self.steer_layers.append(layer)
-        if not self.sites:
-            raise ValueError("at least one steering site is required")
+        if self.steer_enabled and not self.sites:
+            raise ValueError("at least one steering site is required when steering is on")
         self.model = model
         self.gate_block = blocks[gate_layer - 1]
         self.gate_vector = gate_vector.float()
         self.threshold, self.width = float(threshold), float(width)
-        self.strength, self.transform, self.mode = float(strength), transform, mode
+        self.strength, self.transform = float(strength), transform
         self.max_remask_tokens, self.max_parallel_commit = max_remask_tokens, max_parallel_commit
         self.remask_trigger, self.initial_only = float(remask_trigger), initial_only
         self.mask_id = mask_id
@@ -192,9 +208,11 @@ class Ours(Defender):
         parser.add_argument("--alpha", type=float, default=1.0,
                             help="Steering strength in units of the layer's mean activation norm.")
         parser.add_argument("--transform", choices=["additive", "project"], default="additive")
-        parser.add_argument("--mode", choices=["baseline", "steer", "repair"], default="repair",
-                            help="baseline: one-time binary gate; steer: adaptive gate; "
-                                 "repair: adaptive gate + one-shot remask.")
+        parser.add_argument("--steer", choices=["none", "fixed", "adaptive"], default="adaptive",
+                            help="none: no steering; fixed: step-0 binary gate; "
+                                 "adaptive: continuous gate every step.")
+        parser.add_argument("--remask", choices=["none", "fixed"], default="fixed",
+                            help="none: never remask; fixed: one-shot committed-token repair.")
         parser.add_argument("--max-remask-tokens", type=int, default=16)
         parser.add_argument("--max-parallel-commit", type=int, default=2)
         parser.add_argument("--remask-trigger", type=float, default=1.0,
@@ -205,16 +223,18 @@ class Ours(Defender):
     @classmethod
     def from_args(cls, args, model):
         device = next(model.parameters()).device
-        bundle = torch.load(args.vector, map_location="cpu")
         sites = []
-        for layer in (int(s) for s in args.layer.split(",")):
-            li = bundle["layers"].index(layer)
-            sites.append((layer, bundle["vector"][li].to(device), bundle["mean_act_norm"][li]))
+        if args.steer != "none":
+            bundle = torch.load(args.vector, map_location="cpu")
+            for layer in (int(s) for s in args.layer.split(",")):
+                li = bundle["layers"].index(layer)
+                sites.append((layer, bundle["vector"][li].to(device), bundle["mean_act_norm"][li]))
         det_vec, det_layer, threshold = load_detector(
             args.detector, args.detector_layer, device, args.gate_threshold)
         return cls(model, gate_layer=det_layer, gate_vector=det_vec,
                    threshold=threshold, width=args.gate_width, sites=sites,
-                   strength=args.alpha, transform=args.transform, mode=args.mode,
+                   strength=args.alpha, transform=args.transform,
+                   steer=args.steer, remask=args.remask,
                    max_remask_tokens=args.max_remask_tokens,
                    max_parallel_commit=args.max_parallel_commit,
                    remask_trigger=args.remask_trigger, initial_only=args.initial_only)
@@ -288,7 +308,7 @@ class Ours(Defender):
             raise ValueError("scope must be an aligned bool mask and steps_remaining positive")
         masks = (x == self.mask_id) & region
         commit_count = None
-        if (self.mode == "repair" and self.monitoring and not self.remasked
+        if (self.remask_enabled and self.monitoring and not self.remasked
                 and self.step > 0 and self.gate_strength >= self.remask_trigger):
             committed = region & ~masks & scope
             budget = max(0, steps_remaining * self.max_parallel_commit - int((masks & scope).sum()))
@@ -324,7 +344,7 @@ class Ours(Defender):
         if pending is None or pending.get("fired"):
             return output
         projection = self._projection(_hidden(output), pending["pool"])
-        if self.mode == "baseline":
+        if self.gate_once:
             g = float(projection >= self.threshold) if self.step == 0 else self.gate_strength
         else:
             g = min(1.0, max(0.0, (projection - self.threshold) / self.width))
@@ -362,8 +382,9 @@ class Ours(Defender):
         source = "generated" if committed.any() else "masked"
         pool = committed[0] if committed.any() else masks[0]
         self._schedule_scale = float(schedule_scale)
-        read_gate = self.monitoring and (self.mode != "baseline" or self.step == 0)
-        steer = self.monitoring and masks.any() and (read_gate or self.gate_strength > 0.0)
+        read_gate = self.monitoring and (not self.gate_once or self.step == 0)
+        steer = (self.steer_enabled and self.monitoring and masks.any()
+                 and (read_gate or self.gate_strength > 0.0))
         self._pending = {"pool": pool, "fired": False, "projection": None, "effective_alpha": 0.0}
         handles = []
         try:
@@ -406,7 +427,8 @@ class Ours(Defender):
         return f"gate opened on {n_open}/{len(results)} prompts, remasked {n_remask}"
 
     def describe(self):
-        return {"defense": self.name, "mode": self.mode, "transform": self.transform,
+        return {"defense": self.name, "steer": self.steer_mode,
+                "remask": self.remask_enabled, "transform": self.transform,
                 "strength": self.strength, "threshold": self.threshold, "width": self.width,
                 "layers": self.steer_layers, "max_remask_tokens": self.max_remask_tokens,
                 "max_parallel_commit": self.max_parallel_commit,
