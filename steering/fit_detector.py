@@ -34,36 +34,18 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from transformers import AutoModel, AutoTokenizer
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from steering.run_overrefusal import load_prompts  # noqa: E402
-
-MODEL_NAME = "GSAI-ML/LLaDA-8B-Instruct"
-MASK_ID = 126336
-
-
-def auroc(pos, neg):
-    x = np.concatenate([pos, neg])
-    order = x.argsort()
-    ranks = np.empty(len(x), dtype=np.float64)
-    ranks[order] = np.arange(1, len(x) + 1)
-    _, inv, cnt = np.unique(x, return_inverse=True, return_counts=True)
-    sums = np.zeros(len(cnt))
-    np.add.at(sums, inv, ranks)
-    ranks = (sums / cnt)[inv]
-    n_p, n_n = len(pos), len(neg)
-    return (ranks[:n_p].sum() - n_p * (n_p + 1) / 2) / (n_p * n_n)
+from common import (  # noqa: E402
+    MODEL_NAME, MASK_ID, auroc, load_eval_prompts, load_llada,
+    prompt_token_ids)
 
 
 @torch.no_grad()
 def prompt_state(model, tokenizer, prompt, gen_length, layers, device):
     """Hidden states averaged over a fully masked answer region, per layer."""
-    formatted = tokenizer.apply_chat_template(
-        [{"role": "user", "content": str(prompt)}],
-        add_generation_prompt=True, tokenize=False)
-    p_ids = tokenizer(formatted)["input_ids"]
+    p_ids = prompt_token_ids(tokenizer, str(prompt))
     x = torch.full((1, len(p_ids) + gen_length), MASK_ID, dtype=torch.long, device=device)
     x[0, : len(p_ids)] = torch.tensor(p_ids, device=device)
     hs = model(x, output_hidden_states=True).hidden_states
@@ -103,10 +85,7 @@ def main():
     print(f"fit pairs: {len(pairs)}")
 
     print(f"loading {MODEL_NAME} ...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    model = AutoModel.from_pretrained(
-        MODEL_NAME, trust_remote_code=True, dtype=torch.bfloat16
-    ).to(device).eval()
+    tokenizer, model = load_llada(device)
 
     H = collect(model, tokenizer, [p["adv_harmful"] for p in pairs],
                 args.gen_length, layers, device, "harmful")
@@ -131,9 +110,9 @@ def main():
     df = pd.read_csv(args.csv)
     eval_harmful = df["prompt"].head(20).tolist()
     eval_sets = {
-        "xstest_safe": load_prompts("xstest_safe", args.n_eval),
-        "truthfulqa": load_prompts("truthfulqa", args.n_eval),
-        "jbb_benign": load_prompts("jbb_benign", args.n_eval),
+        "xstest_safe": load_eval_prompts("xstest_safe", args.n_eval),
+        "truthfulqa": load_eval_prompts("truthfulqa", args.n_eval),
+        "jbb_benign": load_eval_prompts("jbb_benign", args.n_eval),
     }
     print("\nprojecting held-out eval prompt sets ...")
     Eh = collect(model, tokenizer, eval_harmful, args.gen_length, layers, device, "eval-harm")

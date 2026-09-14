@@ -20,30 +20,16 @@ Usage:
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
-from transformers import AutoModel, AutoTokenizer
 
 ROOT = Path(__file__).resolve().parent.parent
-MODEL_NAME = "GSAI-ML/LLaDA-8B-Instruct"
-MASK_ID = 126336
-
-
-def auroc(pos, neg):
-    """Rank-based AUROC of pos scoring above neg."""
-    x = np.concatenate([pos, neg])
-    order = x.argsort()
-    ranks = np.empty(len(x), dtype=np.float64)
-    ranks[order] = np.arange(1, len(x) + 1)
-    # Average ranks over ties so exact duplicates score 0.5, not 0 or 1.
-    _, inv, cnt = np.unique(x, return_inverse=True, return_counts=True)
-    sums = np.zeros(len(cnt))
-    np.add.at(sums, inv, ranks)
-    ranks = (sums / cnt)[inv]
-    n_p, n_n = len(pos), len(neg)
-    return (ranks[:n_p].sum() - n_p * (n_p + 1) / 2) / (n_p * n_n)
+sys.path.insert(0, str(ROOT))
+from common import (  # noqa: E402
+    MODEL_NAME, MASK_ID, auroc, load_llada, prompt_token_ids)
 
 
 @torch.no_grad()
@@ -52,11 +38,7 @@ def collect(model, tokenizer, pairs, t_list, max_resp, layers, seed, device):
     acts = {t: ([], []) for t in t_list}
     kept = []
     for n, p in enumerate(pairs):
-        formatted = tokenizer.apply_chat_template(
-            [{"role": "user", "content": p["adv_harmful"]}],
-            add_generation_prompt=True, tokenize=False,
-        )
-        prompt_ids = tokenizer(formatted)["input_ids"]
+        p_ids = prompt_token_ids(tokenizer, p["adv_harmful"])
         ref = tokenizer(p["refusal_response"], add_special_tokens=False)["input_ids"]
         cmp_ = tokenizer(p["compliant_response"], add_special_tokens=False)["input_ids"]
 
@@ -65,9 +47,9 @@ def collect(model, tokenizer, pairs, t_list, max_resp, layers, seed, device):
         if n_resp < 16:
             continue
         ref, cmp_ = ref[:n_resp], cmp_[:n_resp]
-        n_prompt = len(prompt_ids)
+        n_prompt = len(p_ids)
 
-        base = torch.tensor([prompt_ids + ref, prompt_ids + cmp_], device=device)
+        base = torch.tensor([p_ids + ref, p_ids + cmp_], device=device)
         g = torch.Generator().manual_seed(seed + n)
         perm = torch.randperm(n_resp, generator=g)
 
@@ -113,10 +95,7 @@ def main():
     print(f"fit pairs: {len(pairs)} (held-out eval pairs excluded)")
 
     print(f"loading {MODEL_NAME} on {device} ...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    model = AutoModel.from_pretrained(
-        MODEL_NAME, trust_remote_code=True, dtype=torch.bfloat16
-    ).to(device).eval()
+    tokenizer, model = load_llada(device)
 
     print(f"collecting activations at t={t_list}, layers 1..31 ...")
     acts, kept = collect(model, tokenizer, pairs, t_list, args.max_resp,

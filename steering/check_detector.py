@@ -23,14 +23,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from transformers import AutoModel, AutoTokenizer
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from steering.run_overrefusal import load_prompts  # noqa: E402
-from steering.fit_detector import auroc, collect  # noqa: E402
-
-MODEL_NAME = "GSAI-ML/LLaDA-8B-Instruct"
+from common import (  # noqa: E402
+    MODEL_NAME, auroc, load_detector_bundle, load_eval_prompts, load_llada)
+from steering.fit_detector import collect  # noqa: E402
 
 
 def main():
@@ -41,17 +39,14 @@ def main():
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    b = torch.load(args.detector, map_location="cpu")
+    b = load_detector_bundle(args.detector)
     v, layers, gen_length = b["vector"], b["layers"], b["gen_length"]
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    model = AutoModel.from_pretrained(
-        MODEL_NAME, trust_remote_code=True, dtype=torch.bfloat16
-    ).to(device).eval()
+    tokenizer, model = load_llada(device)
 
     sets = {}
     for name in ("xstest_safe", "xstest_unsafe", "jbb_benign", "jbb_harmful"):
-        ps = load_prompts(name, args.n)
+        ps = load_eval_prompts(name, args.n)
         chars = sum(len(str(p)) for p in ps) / len(ps)
         print(f"{name}: {len(ps)} prompts, mean {chars:.0f} chars")
         sets[name] = (collect(model, tokenizer, ps, gen_length, layers, device, name), chars)
