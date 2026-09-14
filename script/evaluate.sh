@@ -5,14 +5,11 @@
 #   benign   XSTest three-way rubric via the same ollama server
 #
 # The two graders run concurrently because only Llama Guard needs the GPU.
-# StrongREJECT needs the ollama container from ollama_setting/podman up on :50001.
+# run_sr_eval.py starts the podman ollama container itself when it is down.
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 require outputs/gated_len128.json outputs/gated_len256.json \
         outputs/gated_or30_xstest.json outputs/gated_or30_jbb.json outputs/gated_or30_tqa.json
-
-curl -s --max-time 5 http://localhost:50001/api/tags >/dev/null \
-    || { echo "ollama not reachable on :50001 -- start ollama_setting/podman" >&2; exit 1; }
 
 say "scoring"
 (
