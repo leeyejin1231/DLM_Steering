@@ -18,7 +18,6 @@ Usage:
 """
 
 import argparse
-import glob
 import importlib
 import inspect
 import os
@@ -27,13 +26,14 @@ import sys
 import time
 from pathlib import Path
 
-import pandas as pd
-import pyarrow as pa
 import torch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from llada import MODEL_NAME  # noqa: E402
+from common import (  # noqa: E402
+    encode_prompt, load_detector, load_eval_prompts, load_llada,
+    steer_vector_at)
 # Both steering modules expose the same names; STEER_IMPL selects which one so
 # the benign sets can be generated with either implementation unchanged.
 _impl = importlib.import_module(os.environ.get("STEER_IMPL", "llada_steering_v2"))
@@ -41,58 +41,6 @@ Steerer = _impl.Steerer
 generate_steered = _impl.generate_steered
 DetectorGate = _impl.DetectorGate
 add_gate_args = _impl.add_gate_args
-
-XSTEST_GLOB = ("/mnt/shared/huggingface-cache/hub/datasets--walledai--XSTest"
-               "/snapshots/*/**/*.parquet")
-WJ_EVAL_GLOB = ("/mnt/shared/huggingface-cache/datasets/allenai___wildjailbreak"
-                "/eval-*/0.0.0/*/*.arrow")
-TRUTHFULQA_GLOB = ("/mnt/shared/huggingface-cache/hub/datasets--domenicrosati--TruthfulQA"
-                   "/snapshots/*/**/*.csv")
-JBB_BENIGN_GLOB = ("/mnt/shared/huggingface-cache/hub/datasets--JailbreakBench--JBB-Behaviors"
-                   "/snapshots/*/data/benign-behaviors.csv")
-HUB = "/mnt/shared/huggingface-cache/hub/datasets--walledai--{}/snapshots/*/**/*.parquet"
-
-
-def load_prompts(source, limit):
-    if source.startswith("xstest"):
-        df = pd.read_parquet(glob.glob(XSTEST_GLOB, recursive=True)[0])
-        # "xstest_unsafe".endswith("safe") is True, so match the suffix explicitly.
-        want = "unsafe" if source.endswith("_unsafe") else "safe"
-        df = df[df["label"] == want]
-        prompts = df["prompt"].tolist()
-    elif source == "jbb_benign":
-        # Each benign behaviour is the index-matched counterpart of a harmful one
-        # ("fictional story about heroin use" vs "defamatory article claiming a
-        # president is addicted to heroin"), so topic is held roughly constant
-        # and only permissibility differs.
-        df = pd.read_csv(glob.glob(JBB_BENIGN_GLOB)[0])
-        prompts = df["Goal"].tolist()
-    elif source == "jbb_harmful":
-        df = pd.read_csv(glob.glob(JBB_BENIGN_GLOB.replace("benign-", "harmful-"))[0])
-        prompts = df["Goal"].tolist()
-    elif source in ("advbench", "harmbench", "strongreject"):
-        # Out-of-distribution harmful benchmarks: bare requests in attack styles
-        # the steering and detector directions never saw. Shards are concatenated
-        # and de-duplicated because some of these ship several splits.
-        name = {"advbench": "AdvBench", "harmbench": "HarmBench",
-                "strongreject": "StrongREJECT"}[source]
-        files = sorted(glob.glob(HUB.format(name), recursive=True))
-        df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
-        prompts = list(dict.fromkeys(df["prompt"].astype(str).tolist()))
-    elif source == "truthfulqa":
-        # Plain harmless questions: nothing here should ever be refused, so the
-        # refusal rate is a direct read on utility damage rather than on
-        # sensitivity to harmful-sounding surface words.
-        df = pd.read_csv(glob.glob(TRUTHFULQA_GLOB, recursive=True)[0])
-        prompts = df["Question"].tolist()
-    elif source == "wj_benign":
-        f = glob.glob(WJ_EVAL_GLOB)[0]
-        with pa.memory_map(f) as src:
-            ev = pa.ipc.open_stream(src).read_all().to_pandas()
-        prompts = ev[ev["data_type"] == "adversarial_benign"]["adversarial"].tolist()
-    else:
-        raise ValueError(source)
-    return prompts[:limit] if limit else prompts
 
 
 def main():
@@ -120,47 +68,28 @@ def main():
     add_gate_args(ap)
     args = ap.parse_args()
 
-    from transformers import AutoModel, AutoTokenizer
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    prompts = load_prompts(args.source, args.limit)
+    prompts = load_eval_prompts(args.source, args.limit)
     print(f"{args.source}: {len(prompts)} prompts, alpha={args.alpha}")
 
+    tokenizer, model = load_llada(device)
+
     steer_config = None
-    v = None
+    steerer = None
     if args.alpha != 0:
         bundle = torch.load(args.vector, map_location="cpu")
-        layer = args.layer or bundle["best_layer"]
-        li = bundle["layers"].index(layer)
-        v = bundle["vector"][li]
-        act_norm = bundle["mean_act_norm"][li]
+        v, layer, act_norm = steer_vector_at(bundle, args.layer, device)
         steer_config = {"layer": layer, "alpha_rel": args.alpha,
                         "alpha_abs": round(args.alpha * act_norm, 3),
                         "schedule": args.schedule, "vector": args.vector}
+        steerer = Steerer(model, v, layer, steer_config["alpha_abs"])
         print(f"steering: layer {layer}, alpha {args.alpha} -> "
               f"{args.alpha * act_norm:.2f}")
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    model = AutoModel.from_pretrained(
-        MODEL_NAME, trust_remote_code=True, dtype=torch.bfloat16
-    ).to(device).eval()
-
-    steerer = None
-    if v is not None:
-        steerer = Steerer(model, v.to(device), steer_config["layer"],
-                          steer_config["alpha_abs"])
-
     detector = None
-    det_vec = det_layer = threshold = None
     if args.detector:
-        db = torch.load(args.detector, map_location="cpu")
-        det_layer = args.detector_layer or db["best_layer"]
-        det_vec = db["vector"][db["layers"].index(det_layer)].to(device)
-        threshold = args.gate_threshold
-        if threshold is None:
-            threshold = json.loads(
-                (Path(args.detector).parent / "gate_threshold.json").read_text()
-            )["threshold"]
+        det_vec, det_layer, threshold = load_detector(
+            args.detector, args.detector_layer, device, args.gate_threshold)
         detector = DetectorGate(det_vec, det_layer, threshold, args.gate_mode, args.gate_width)
         steer_config = {**(steer_config or {}), "detector": args.detector,
                         "detector_layer": det_layer, "gate_threshold": threshold,
@@ -180,10 +109,7 @@ def main():
 
     results, t_start = [], time.time()
     for i, prompt in enumerate(prompts):
-        formatted = tokenizer.apply_chat_template(
-            [{"role": "user", "content": str(prompt)}],
-            add_generation_prompt=True, tokenize=False)
-        ids = torch.tensor(tokenizer(formatted)["input_ids"], device=device).unsqueeze(0)
+        ids = encode_prompt(tokenizer, str(prompt), device)
         t0 = time.time()
         out = generate_steered(model, ids, steerer=steerer, detector=detector,
                                schedule=args.schedule, **cfg)

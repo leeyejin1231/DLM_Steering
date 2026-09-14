@@ -17,12 +17,12 @@ from pathlib import Path
 
 import pandas as pd
 import torch
-from transformers import AutoModel, AutoTokenizer
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from llada import MODEL_NAME  # noqa: E402
 from llada_steering_v2 import Steerer, generate_steered  # noqa: E402
+from common import encode_prompt, load_llada, steer_vector_at  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -69,10 +69,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     bundle = torch.load(args.vector, map_location="cpu")
-    layer = args.layer or bundle["best_layer"]
-    li = bundle["layers"].index(layer)
-    v = bundle["vector"][li].to(device)
-    act_norm = bundle["mean_act_norm"][li]
+    v, layer, act_norm = steer_vector_at(bundle, args.layer, device)
     print(f"layer {layer}  mean|h| {act_norm:.1f}  auroc {bundle['best_auroc']:.4f}")
 
     df = pd.read_csv(args.csv)
@@ -81,10 +78,7 @@ def main():
     print(f"sweeping on csv rows {args.start}..{args.start + len(rows) - 1} "
           f"(fit split), alphas={alphas}")
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    model = AutoModel.from_pretrained(
-        MODEL_NAME, trust_remote_code=True, dtype=torch.bfloat16
-    ).to(device).eval()
+    tokenizer, model = load_llada(device)
 
     steerer = Steerer(model, v, layer, 0.0)
     cfg = {"steps": args.steps, "gen_length": args.gen_length,
@@ -96,10 +90,7 @@ def main():
         steerer.alpha = a * act_norm
         recs, t0 = [], time.time()
         for idx, row in rows.iterrows():
-            formatted = tokenizer.apply_chat_template(
-                [{"role": "user", "content": str(row["prompt"])}],
-                add_generation_prompt=True, tokenize=False)
-            ids = torch.tensor(tokenizer(formatted)["input_ids"], device=device).unsqueeze(0)
+            ids = encode_prompt(tokenizer, str(row["prompt"]), device)
             o = generate_steered(model, ids, steerer=steerer, schedule=args.schedule, **cfg)
             g = tokenizer.batch_decode(o[:, ids.shape[1]:], skip_special_tokens=True)[0]
             recs.append({"index": int(idx), "generation": g,
