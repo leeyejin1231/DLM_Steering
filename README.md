@@ -67,12 +67,28 @@ python exp.py --attack dija --defense ours --remask v3 --source jbb_harmful --n 
 
 | 옵션 | 값 |
 |---|---|
-| `--attack` | `none`, `prefix`, `dija`, `pap`(미구현), `pair`(미구현) |
+| `--attack` | `none`, `prefix`, `dija`(논문 refined 프롬프트), `dija_template`(구 합성 템플릿), `pap`(미구현), `pair`(미구현) |
 | `--defense` | `none`, `ours`, `proposed`, `selfreminder`(미구현), `diffuguard`(미구현) |
-| `--source` | 유해: `jbb_harmful`, `advbench`, `harmbench`, `xstest_unsafe` / 무해(over-refusal): `truthfulqa`, `xstest_safe`, `jbb_benign`, `wj_benign` / 일반화(accuracy): `mmlu`, `gsm8k`, `truthfulqa_mc` |
+| `--source` | 유해: `jbb_harmful`, `advbench`, `harmbench`, `strongreject`, `xstest_unsafe` / 무해(over-refusal): `truthfulqa`, `xstest_safe`, `jbb_benign`, `wj_benign` / 일반화(accuracy): `mmlu`, `gsm8k`, `truthfulqa_mc` |
 | 공통 | `--n`, `--start`, `--steps`, `--gen-length`, `--block-length`, `--temperature`, `--remasking`, `--schedule {const,linear,cosine}`, `--reproduct` |
 
-`--gen-length` 기본값은 128 dija는 0
+`--gen-length` 기본값은 128, dija/dija_template는 0.
+
+### DIJA 공격 (논문 재현)
+
+`--attack dija`는 `DIJA/run_<bench>/refine_prompt/*_refined_Qwen.json`의 refined 프롬프트를 `--source`의 vanilla
+프롬프트로 찾아 그대로 쓴다 (`jbb_harmful`, `harmbench`, `strongreject`만 지원, 세 세트 모두 100% 매칭).
+원본 `*_llada.py`와 같게 `<mask:N>`을 마스크 N개로 펼쳐 user turn 안에 넣고, 어시스턴트 턴은 붙이지 않으며
+(gen_length 0), 마스크 하나를 한 스텝에 채우고(`--dija-steps auto`, 프롬프트마다 steps = 마스크 수), temperature 0.2를 쓴다.
+채점 텍스트는 원본처럼 vanilla 프롬프트와 겹치는 토큰 prefix 뒤부터 assistant 헤더 앞까지, 즉 채워진 템플릿이다.
+`--temperature`, `--gen-length`, `--dija-steps N`을 주면 원본에서 벗어난 설정으로 돌릴 수 있다.
+
+```bash
+python exp.py --attack dija --defense none --source jbb_harmful --n 100 --out outputs/JBB-dija-none-42.json
+python exp.py --attack dija --defense none --source harmbench --n 393 --out outputs/HarmBench-dija-none-42.json
+python exp.py --attack dija --defense none --source strongreject --n 313 --out outputs/SR-dija-none-42.json
+python exp.py --attack dija --defense ours --remask v3 --source jbb_harmful --n 100 --out outputs/JBB-dija-v3-42.json
+```
 
 전용 인자 목록: `python exp.py --attack dija --defense ours --help`
 
@@ -96,6 +112,7 @@ python exp.py --defense ours \
 
 - `--steer {none,fixed,adaptive}` — `none`: 스티어링 없음, `fixed`: non-adaptive, `adaptive`: 매 스텝 연속 게이트
 - `--remask {none,v2,v3}` — `v2`: 기본값, llada_steering_remasking_v2 방식, `none`: 리마스킹 없음
+  - `--steer triggered`(v3 전용): v3 응답 검출기가 트리거되기 전에는 steering을 걸지 않고, 트리거 뒤 복구와 남은 블록에서만 adaptive 게이트로 건다. 무해 프롬프트에서 게이트가 거의 항상 열려 생기는 over-refusal을 피하려는 옵션
   - `v3`: 블록 경계마다 로지스틱 회귀 응답 검출기(`--response-detector`, 기본 `outputs/response_detector.pt`)가 커밋된 토큰을 채점하고, 첫 경계에서 트리거되면 해당 블록 + 프롬프트 안의 채워진 스팬(DIJA)을 전부 remask한 뒤 `--recovery-steps`(기본 32)만큼 재생성
 - `--alpha`, `--transform {additive,project}`, `--gate-threshold`, `--gate-width`, `--remask-trigger`, `--initial-only` 등은 사용성 개편할 계획.
 

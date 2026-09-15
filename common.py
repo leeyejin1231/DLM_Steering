@@ -122,7 +122,7 @@ def auroc(pos, neg):
     return (ranks[:n_p].sum() - n_p * (n_p + 1) / 2) / (n_p * n_n)
 
 
-HARMFUL_SOURCES = ("jbb_harmful", "advbench", "harmbench", "xstest_unsafe")
+HARMFUL_SOURCES = ("jbb_harmful", "advbench", "harmbench", "strongreject", "xstest_unsafe")
 # Safe sets for over-refusal: every refusal here is a utility loss.
 BENIGN_SOURCES = ("truthfulqa", "xstest_safe", "jbb_benign", "wj_benign")
 # Graded sets for generalisation: rows carry "answer"/"task" and are scored
@@ -208,7 +208,7 @@ def load_utility_prompts(source):
 def load_prompts(source):
     """Prompt sets as {"index", "prompt", "target"} rows.
 
-    Harmful: jbb_harmful (with Target), advbench, harmbench, xstest_unsafe.
+    Harmful: jbb_harmful (with Target), advbench, harmbench, strongreject, xstest_unsafe.
     Benign (over-refusal): truthfulqa, xstest_safe, jbb_benign, wj_benign.
     xstest_safe/xstest_unsafe are the XSTest contrast pair: safe prompts with
     harmful-sounding words vs. their genuinely unsafe counterparts.

@@ -5,6 +5,8 @@ defense is a policy object the sampler consults every denoising step.
 Attack/defense-specific flags are registered by the selected class.
 
 Usage:
+    # DIJA with the paper's refined prompts (DIJA/run_*/refine_prompt); the
+    # attack sets gen_length 0, temperature 0.2 and one mask per step.
     CUDA_VISIBLE_DEVICES=1 python exp.py --attack dija --defense ours \
         --source jbb_harmful --n 100 --out outputs/dija_ours.json
 
@@ -40,16 +42,16 @@ def parse_args():
 
     p = argparse.ArgumentParser(parents=[pre])
     p.add_argument("--source", choices=list(PROMPT_SOURCES), default="jbb_harmful",
-                   help="harmful: jbb_harmful, advbench, harmbench, xstest_unsafe; "
+                   help="harmful: jbb_harmful, advbench, harmbench, strongreject, xstest_unsafe; "
                         "benign (over-refusal): truthfulqa, xstest_safe, jbb_benign, wj_benign; "
                         "utility (accuracy via eval_utility.py): mmlu, gsm8k, truthfulqa_mc")
     p.add_argument("--out", default="outputs/exp.json")
     p.add_argument("--n", type=int, default=20)
     p.add_argument("--start", type=int, default=0)
     p.add_argument("--steps", type=int, default=128)
-    p.add_argument("--gen-length", type=int, default=None,
-                   help="assistant tokens to append; default 0 under --attack dija "
-                        "(prompt-span infilling only), else 128")
+    p.add_argument("--gen-length", type=int, default=128,
+                   help="assistant tokens to append; DIJA attacks default this to 0 "
+                        "(prompt-span infilling only)")
     p.add_argument("--block-length", type=int, default=32)
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--remasking", default="low_confidence")
@@ -82,10 +84,7 @@ def main():
     print(f"{len(rows)} prompts from {args.source}, attack={args.attack}, "
           f"defense={args.defense}")
 
-    gen_length = args.gen_length
-    if gen_length is None:
-        gen_length = 0 if args.attack == "dija" else 128
-    gen_config = {"steps": args.steps, "gen_length": gen_length,
+    gen_config = {"steps": args.steps, "gen_length": args.gen_length,
                   "block_length": args.block_length, "temperature": args.temperature,
                   "remasking": args.remasking, "schedule": args.schedule}
 
@@ -94,12 +93,17 @@ def main():
     for i, row in enumerate(rows):
         user_message = defender.transform_prompt(attacker.build_prompt(row))
         input_ids = encode_prompt(tokenizer, user_message, device)
+        vanilla_ids = encode_prompt(tokenizer, defender.transform_prompt(row["prompt"]), device)
+        row_config = {**gen_config, **attacker.gen_overrides(input_ids)}
 
         t0 = time.time()
-        out = defender.defend(model, input_ids, **gen_config)
+        out = defender.defend(model, input_ids, **row_config)
         elapsed = time.time() - t0
 
-        generation, extra = attacker.decode(tokenizer, out, input_ids)
+        generation, extra = attacker.decode(tokenizer, out, input_ids, vanilla_ids)
+        if row_config != gen_config:
+            extra = {**extra, "gen_overrides": {k: v for k, v in row_config.items()
+                                                if gen_config.get(k) != v}}
         # Graded sources carry their answer key through to eval_utility.py.
         graded = {k: row[k] for k in ("task", "answer", "subject", "category") if k in row}
         results.append({"index": row["index"], "prompt": row["prompt"], **graded,
