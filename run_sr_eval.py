@@ -12,6 +12,7 @@ import argparse
 import json
 from pathlib import Path
 
+from common import run_eval_shards
 from Evaluator import GptOss20b
 
 
@@ -21,10 +22,19 @@ def parse_args():
     p.add_argument("--out", default="outputs/llada8b_sr_len256.json")
     p.add_argument("--jsonl", default=None,
                    help="Streaming/resume file (default: <out>.jsonl).")
+    p.add_argument("--start", type=int, default=0)
+    p.add_argument("--n", type=int, default=None,
+                   help="grade only this many items (default all)")
+    p.add_argument("--gpus", default=None,
+                   help="Comma-separated GPU ids (e.g. 0,1): one ollama "
+                        "container per GPU on --port+i, shard items and merge")
     p.add_argument("--model", default="gpt-oss:20b")
     p.add_argument("--port", type=int, default=50001)
     p.add_argument("--gpu", type=int, default=1,
                    help="nvidia.com/gpu index for the ollama container.")
+    p.add_argument("--container", default=None,
+                   help="podman container name (default 'ollama'; sharded runs "
+                        "use ollama-<port> automatically)")
     p.add_argument("--reasoning-effort", default="low")
     return p.parse_args()
 
@@ -36,15 +46,30 @@ def main():
               "response": r["generation"]} for r in data["results"]]
     print(f"Grading {len(items)} items from {args.inp}")
 
-    jsonl = args.jsonl or str(Path(args.out).with_suffix(".jsonl"))
-    with GptOss20b(model=args.model, port=args.port, gpu=args.gpu,
-                   reasoning_effort=args.reasoning_effort) as grader:
-        graded = grader.evaluate(items, output_path=Path(jsonl))
-        graded.sort(key=lambda r: r["index"])
-        summary = grader.summarize(graded)
+    if args.gpus:
+        def extra(i, gpu):
+            port = args.port + i
+            return ["--port", port, "--gpu", gpu,
+                    "--container", f"ollama-{port}"]
+        graded, head = run_eval_shards(__file__, args, len(items),
+                                       extra_args=extra)
+        summary = GptOss20b.summarize(graded)
+        grader_name = head.get("grader")
+    else:
+        items = items[args.start:
+                      args.start + args.n if args.n is not None else None]
+        jsonl = args.jsonl or str(Path(args.out).with_suffix(".jsonl"))
+        with GptOss20b(model=args.model, port=args.port, gpu=args.gpu,
+                       container=args.container,
+                       reasoning_effort=args.reasoning_effort) as grader:
+            graded = grader.evaluate(items, output_path=Path(jsonl))
+            graded.sort(key=lambda r: r["index"])
+            summary = grader.summarize(graded)
+        grader_name = (f"StrongREJECT / {args.model} "
+                       f"(reasoning_effort={args.reasoning_effort})")
 
     payload = {
-        "grader": f"StrongREJECT / {args.model} (reasoning_effort={args.reasoning_effort})",
+        "grader": grader_name,
         "source": args.inp,
         "source_model": data.get("model"),
         "source_config": data.get("config"),

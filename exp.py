@@ -28,7 +28,7 @@ import time
 from Attacker import ATTACKERS
 from common import (MODEL_NAME, MASK_ID, PROMPT_SOURCES, encode_prompt,
                     enable_reproducibility, force_math_attention, load_llada,
-                    load_prompts, seed_all, write_json)
+                    load_prompts, run_eval_shards, seed_all, write_json)
 from Defender import DEFENDERS
 
 
@@ -69,19 +69,6 @@ def parse_args():
     return p.parse_args()
 
 
-def _strip_flag(argv, name):
-    """Drop --name value and --name=value occurrences from argv."""
-    out, skip = [], False
-    for a in argv:
-        if skip:
-            skip = False
-        elif a == name:
-            skip = True
-        elif not a.startswith(name + "="):
-            out.append(a)
-    return out
-
-
 def run_sharded(args):
     """Launcher path for --gpus: one exp.py subprocess per GPU, then merge.
 
@@ -89,49 +76,10 @@ def run_sharded(args):
     CUDA_VISIBLE_DEVICES set; per-prompt seeding (seed + row index) keeps
     rows identical no matter how they are partitioned.
     """
-    import json
-    import math
-    import os
-    import subprocess
-    import sys
-    from pathlib import Path
-
-    gpu_ids = [g.strip() for g in args.gpus.split(",") if g.strip()]
-    if not gpu_ids:
-        raise ValueError("--gpus needs at least one GPU id")
-    total = min(args.n, len(load_prompts(args.source)) - args.start)
-    if total <= 0:
-        raise ValueError(f"no prompts in range: --start {args.start} --n {args.n}")
-    per = math.ceil(total / len(gpu_ids))
-    out = Path(args.out)
-    argv = _strip_flag(sys.argv[1:], "--gpus")
-
-    procs, parts = [], []
-    for i, gpu in enumerate(gpu_ids):
-        n_i = min(per, total - i * per)
-        if n_i <= 0:
-            break
-        part = out.with_name(f"{out.stem}.part{i}{out.suffix}")
-        log = part.with_suffix(".log")
-        cmd = [sys.executable, str(Path(__file__).resolve()), *argv,
-               "--start", str(args.start + i * per), "--n", str(n_i),
-               "--out", str(part)]
-        env = {**os.environ, "CUDA_VISIBLE_DEVICES": gpu}
-        procs.append(subprocess.Popen(cmd, stdout=open(log, "w"),
-                                      stderr=subprocess.STDOUT, env=env))
-        parts.append(part)
-        print(f"part{i}: gpu={gpu} rows {args.start + i * per}..+{n_i} "
-              f"-> {part} (log {log})", flush=True)
-
-    rc = [p.wait() for p in procs]
-    if any(rc):
-        bad = ", ".join(f"part{i} rc={r}" for i, r in enumerate(rc) if r)
-        raise SystemExit(f"shards failed: {bad} -- see part logs")
-    results = sorted((r for p in parts for r in json.loads(p.read_text())["results"]),
-                     key=lambda r: r["index"])
-    payload = json.loads(parts[0].read_text())
-    write_json(out, {**payload, "results": results})
-    print(f"merged {len(results)} results from {len(parts)} parts -> {out}")
+    results, payload = run_eval_shards(__file__, args,
+                                       len(load_prompts(args.source)))
+    write_json(args.out, {**payload, "results": results})
+    print(f"merged {len(results)} results -> {args.out}")
 
 
 def main():

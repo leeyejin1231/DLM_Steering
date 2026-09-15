@@ -311,3 +311,101 @@ def steer_vector_at(bundle, layer=None, device=None):
     if device is not None:
         v = v.to(device)
     return v, layer, bundle["mean_act_norm"][li]
+
+
+# ---------------------------------------------------------------------------
+# --gpus sharding: one subprocess per GPU over --start/--n slices, then merge.
+# Shared by exp.py and the eval entry points (eval_llamaguard, run_sr_eval,
+# steering/judge_refusal).
+# ---------------------------------------------------------------------------
+
+def strip_argv_flag(argv, name):
+    """Drop --name value and --name=value occurrences from argv."""
+    out, skip = [], False
+    for a in argv:
+        if skip:
+            skip = False
+        elif a == name:
+            skip = True
+        elif not a.startswith(name + "="):
+            out.append(a)
+    return out
+
+
+def shard_slices(total, n_parts, start=0):
+    """Contiguous (start, n) slices covering `total` items across n_parts."""
+    per = -(-total // n_parts)
+    return [(start + i * per, min(per, total - i * per))
+            for i in range(n_parts) if total - i * per > 0]
+
+
+def parse_gpu_ids(spec):
+    """'0,1,2' -> ['0', '1', '2']; raises on empty."""
+    gpu_ids = [g.strip() for g in spec.split(",") if g.strip()]
+    if not gpu_ids:
+        raise ValueError("--gpus needs at least one GPU id")
+    return gpu_ids
+
+
+def spawn_shards(script, argv, gpu_ids, slices, out, extra_args=None):
+    """One `python <script>` subprocess per slice on its own GPU.
+
+    argv should already have --gpus stripped; each child is invoked with
+    --start/--n/--out for its slice plus extra_args(i, gpu) when given
+    (e.g. a distinct ollama --port/--gpu/--container per shard). Child
+    stdout/stderr go to <part>.log next to the part file.
+    Returns [(proc, part_path)].
+    """
+    import os
+    import subprocess
+    import sys
+    out = Path(out)
+    procs = []
+    for i, ((s, n), gpu) in enumerate(zip(slices, gpu_ids)):
+        part = out.with_name(f"{out.stem}.part{i}{out.suffix}")
+        log = part.with_suffix(".log")
+        cmd = [sys.executable, str(Path(script).resolve()), *argv,
+               "--start", str(s), "--n", str(n), "--out", str(part)]
+        if extra_args:
+            cmd += [str(a) for a in extra_args(i, gpu)]
+        env = {**os.environ, "CUDA_VISIBLE_DEVICES": gpu}
+        proc = subprocess.Popen(cmd, stdout=open(log, "w"),
+                                stderr=subprocess.STDOUT, env=env)
+        procs.append((proc, part))
+        print(f"part{i}: gpu={gpu} items {s}..+{n} -> {part} (log {log})",
+              flush=True)
+    return procs
+
+
+def wait_merge_shards(procs):
+    """Wait on spawn_shards procs; return (merged results sorted by index,
+    part0's payload dict)."""
+    rc = [p.wait() for p, _ in procs]
+    if any(rc):
+        bad = ", ".join(f"part{i} rc={r}" for i, r in enumerate(rc) if r)
+        raise SystemExit(f"shards failed: {bad} -- see part logs")
+    payloads = [json.loads(part.read_text()) for _, part in procs]
+    results = sorted((r for p in payloads for r in p["results"]),
+                     key=lambda r: r["index"])
+    return results, payloads[0]
+
+
+def run_eval_shards(script, args, n_items, extra_args=None):
+    """Shared --gpus launcher for eval-style entry points.
+
+    Shards `n_items` items over args.gpus into one subprocess per GPU, waits,
+    and returns (merged results, part0 payload). Caller rewrites the merged
+    summary (Evaluator.summarize is a staticmethod) and writes args.out.
+    """
+    import sys
+    gpu_ids = parse_gpu_ids(args.gpus)
+    total = n_items - args.start
+    if args.n is not None:
+        total = min(total, args.n)
+    if total <= 0:
+        raise ValueError(f"no items in range: --start {args.start} --n {args.n}")
+    argv = strip_argv_flag(sys.argv[1:], "--gpus")
+    procs = spawn_shards(script, argv, gpu_ids,
+                         shard_slices(total, len(gpu_ids), args.start),
+                         args.out, extra_args)
+    return wait_merge_shards(procs)

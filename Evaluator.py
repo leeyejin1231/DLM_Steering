@@ -109,15 +109,17 @@ def _ollama_up(host, timeout=3):
         return False
 
 
-def start_ollama(port=50001, gpu=1, model=None, container="ollama",
+def start_ollama(port=50001, gpu=1, model=None, container=None,
                  image="ollama/ollama", ready_timeout=90):
     """Bring up the podman ollama container serving on `port` (GPU `gpu`).
 
     No-op when the server already answers; returns True if this call started
     the container. Mirrors ollama_setting/podman/*.sh, and `model` is pulled
     via `podman exec` after the server is ready (named volume makes the pull
-    persistent, so it is cheap once done).
+    persistent, so it is cheap once done). container defaults to "ollama";
+    pass a distinct name per port to run several servers side by side.
     """
+    container = container or "ollama"
     host = f"http://localhost:{port}"
     if _ollama_up(host):
         return False
@@ -188,17 +190,19 @@ class Ollama:
 
     def __init__(self, model, port=50001, gpu=1, reasoning_effort="low",
                  num_predict=1000, temperature=0.0, workers=4,
-                 timeout_sec=120, start_container=True, stop_on_close=False):
+                 timeout_sec=120, start_container=True, stop_on_close=False,
+                 container=None):
         self.model = model
         self.port = port
         self.host = f"http://localhost:{port}"
+        self.container = container or "ollama"
         self.reasoning_effort = reasoning_effort
         self.num_predict = num_predict
         self.temperature = temperature
         self.workers = workers
         self.stop_on_close = stop_on_close
         self._started = bool(start_container
-                             and start_ollama(port, gpu, model))
+                             and start_ollama(port, gpu, model, self.container))
         from ollama import Client
         self.client = Client(host=self.host, timeout=timeout_sec)
 
@@ -214,7 +218,8 @@ class Ollama:
 
     def close(self):
         if self._started and self.stop_on_close:
-            subprocess.run(["podman", "stop", "ollama"], capture_output=True)
+            subprocess.run(["podman", "stop", self.container],
+                           capture_output=True)
 
 
 class GptOss20b(Ollama, ASR):
@@ -264,7 +269,8 @@ class GptOss20b(Ollama, ASR):
             out_file.close()
         return results
 
-    def summarize(self, items):
+    @staticmethod
+    def summarize(items):
         valid = [it for it in items
                  if it.get("response") != _STEERING_ERROR
                  and not math.isnan(it.get("sr_score", math.nan))]
@@ -358,9 +364,10 @@ CLASSIFICATION:"""
             out_file.close()
         return results
 
-    def summarize(self, items):
+    @staticmethod
+    def summarize(items):
         counts = {lab: sum(r["judge_label"] == lab for r in items)
-                  for lab in self.LABELS}
+                  for lab in Refusal.LABELS}
         n_err = sum(r["judge_label"] is None for r in items)
         n_ok = len(items) - n_err
         refused = counts["2_full_refusal"] + counts["3_partial_refusal"]
@@ -500,7 +507,8 @@ class LlamaGuard4(ASR):
             out_file.close()
         return results
 
-    def summarize(self, items):
+    @staticmethod
+    def summarize(items):
         summary = _verdict_summary(
             [it["verdict"] for it in items if "verdict" in it])
         refs = [it["reference_verdict"] for it in items

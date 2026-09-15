@@ -13,6 +13,7 @@ import json
 import time
 from pathlib import Path
 
+from common import run_eval_shards
 from Evaluator import LlamaGuard4
 
 
@@ -22,6 +23,12 @@ def parse_args():
     p.add_argument("--out", default="outputs/llada8b_llamaguard4.json")
     p.add_argument("--jsonl", default=None,
                    help="Streaming/resume file (default: <out>.jsonl).")
+    p.add_argument("--start", type=int, default=0)
+    p.add_argument("--n", type=int, default=None,
+                   help="score only this many items (default all)")
+    p.add_argument("--gpus", default=None,
+                   help="Comma-separated GPU ids (e.g. 0,1): shard items into "
+                        "one subprocess per GPU and merge the part JSONs")
     p.add_argument("--max-new-tokens", type=int, default=20)
     p.add_argument(
         "--with-reference",
@@ -43,16 +50,24 @@ def main():
     ]
     print(f"Scoring {len(items)} items from {args.inp}")
 
-    jsonl = args.jsonl or str(Path(args.out).with_suffix(".jsonl"))
     t_start = time.time()
-    with LlamaGuard4(max_new_tokens=args.max_new_tokens,
-                     with_reference=args.with_reference) as grader:
-        scored = grader.evaluate(items, output_path=jsonl)
-        scored.sort(key=lambda r: r["index"])
-        summary = grader.summarize(scored)
+    if args.gpus:
+        scored, head = run_eval_shards(__file__, args, len(items))
+        summary = LlamaGuard4.summarize(scored)
+        model_id = head.get("guard_model")
+    else:
+        items = items[args.start:
+                      args.start + args.n if args.n is not None else None]
+        jsonl = args.jsonl or str(Path(args.out).with_suffix(".jsonl"))
+        with LlamaGuard4(max_new_tokens=args.max_new_tokens,
+                         with_reference=args.with_reference) as grader:
+            scored = grader.evaluate(items, output_path=jsonl)
+            scored.sort(key=lambda r: r["index"])
+            summary = grader.summarize(scored)
+        model_id = grader.model_id
 
     payload = {
-        "guard_model": grader.model_id,
+        "guard_model": model_id,
         "source": args.inp,
         "source_model": data.get("model"),
         "source_config": data.get("config"),

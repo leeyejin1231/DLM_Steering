@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from common import run_eval_shards  # noqa: E402
 from Evaluator import Refusal  # noqa: E402
 
 
@@ -31,9 +32,18 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--jsonl", default=None,
                     help="Streaming/resume file (default: <out>.jsonl).")
+    ap.add_argument("--start", type=int, default=0)
+    ap.add_argument("--n", type=int, default=None,
+                    help="judge only this many items (default all)")
+    ap.add_argument("--gpus", default=None,
+                    help="Comma-separated GPU ids (e.g. 0,1): one ollama "
+                         "container per GPU on --port+i, shard items and merge")
     ap.add_argument("--model", default="gpt-oss:20b")
     ap.add_argument("--port", type=int, default=50001)
     ap.add_argument("--gpu", type=int, default=1)
+    ap.add_argument("--container", default=None,
+                    help="podman container name (default 'ollama'; sharded runs "
+                         "use ollama-<port> automatically)")
     ap.add_argument("--reasoning-effort", default="low")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--num-predict", type=int, default=512,
@@ -44,14 +54,26 @@ def main():
     items = [{**r, "response": r["generation"]} for r in data["results"]]
     print(f"judging {len(items)} items from {args.inp}")
 
-    jsonl = args.jsonl or str(Path(args.out).with_suffix(".jsonl"))
     t_start = time.time()
-    with Refusal(model=args.model, port=args.port, gpu=args.gpu,
-                 reasoning_effort=args.reasoning_effort,
-                 num_predict=args.num_predict, workers=args.workers) as judge:
-        judged = judge.evaluate(items, output_path=jsonl)
-        judged.sort(key=lambda r: r["index"])
-        summary = judge.summarize(judged)
+    if args.gpus:
+        def extra(i, gpu):
+            port = args.port + i
+            return ["--port", port, "--gpu", gpu,
+                    "--container", f"ollama-{port}"]
+        judged, _ = run_eval_shards(__file__, args, len(items),
+                                    extra_args=extra)
+        summary = Refusal.summarize(judged)
+    else:
+        items = items[args.start:
+                      args.start + args.n if args.n is not None else None]
+        jsonl = args.jsonl or str(Path(args.out).with_suffix(".jsonl"))
+        with Refusal(model=args.model, port=args.port, gpu=args.gpu,
+                     container=args.container,
+                     reasoning_effort=args.reasoning_effort,
+                     num_predict=args.num_predict, workers=args.workers) as judge:
+            judged = judge.evaluate(items, output_path=jsonl)
+            judged.sort(key=lambda r: r["index"])
+            summary = judge.summarize(judged)
 
     payload = {"judge": f"XSTest 3-way / {args.model}", "source": args.inp,
                "source_set": data.get("source"), "steering": data.get("steering"),
