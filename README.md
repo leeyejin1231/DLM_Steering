@@ -117,7 +117,8 @@ PYTHONPATH=$PWD/script/diffuguard_stubs python DiffuGuard/models/jailbreakbench_
 
 **2. 실행**
 
-`script/run_diffuguard.sh` 하나로 돌린다. `SOURCE`로 벤치마크를, `CONFIG`로 방어 설정을 골라 한 번에 하나씩 실행하며,
+`script/run_diffuguard.sh`  
+`SOURCE`로 벤치마크를, `CONFIG`로 방어 설정을 골라 한 번에 하나씩 실행하며,
 생성 후 Llama Guard 4와 StrongREJECT 채점까지 이어서 한다. 샘플링 조건은 우리 `--attack dija`와 동일하다
 (gen_length 0, temperature 0.2, CFG 없음, 마스크당 1스텝을 위해 steps 200). 방어 설정은 저자 `DiffuGuard/test.sh`의
 LLaDA-8B DIJA 줄 그대로다 (hidden 자가검사 임계값 0.2, 90% 재마스크, 8스텝 복구, `--fill_all_masks`).
@@ -128,16 +129,13 @@ LLaDA-8B DIJA 줄 그대로다 (hidden 자가검사 임계값 0.2, 90% 재마스
 | `CONFIG` | `hidden`: test.sh 설정 그대로 / `full`: 여기에 `--remasking adaptive_step`을 더한 논문 완전판 |
 | `GPU` | 사용할 GPU 번호 |
 
-```bash
-GPU=1 SOURCE=jbb_harmful  CONFIG=hidden script/run_diffuguard.sh > log/diffuguard_jbb_hidden.log 2>&1
-GPU=1 SOURCE=harmbench    CONFIG=full   script/run_diffuguard.sh > log/diffuguard_harmbench_full.log 2>&1
-# 결과: outputs/<JBB|HarmBench|SR>-dija-dgm-<CONFIG>-42{,_lg4,_sr}.json
-# 러너 원본 출력: outputs/diffuguard_<PREFIX>_dgm-<CONFIG>_raw.json
-# 자가검사 발동 로그: log/diffuguard_<PREFIX>_dgm-<CONFIG>.log ("Refinement Phase" 줄 수)
-```
+
+
+
+주의: 저자 코드는 `--fill_all_masks`일 때 복구 단계에서 프롬프트 토큰까지 포함한 전체 시퀀스의 90%를 되돌림.
 
 HarmBench refined 파일에는 같은 behavior가 7건 중복되어 러너는 400건을 돌리지만 변환 시 첫 건만 남겨
-`common.load_prompts`의 393건과 맞춘다. 프롬프트당 약 35초라 JBB 약 1시간, StrongREJECT 약 3시간, HarmBench 약 4시간이 걸린다.
+`common.load_prompts`의 393건과 맞춘다. 프롬프트당 약 35초라 JBB 약 1시간, StrongREJECT 약 3시간, HarmBench 약 4시간이 걸림.
 
 
 ### 재현 모드
