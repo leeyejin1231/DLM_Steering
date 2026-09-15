@@ -147,8 +147,10 @@ class Ours(Defender):
         """sites: sequence of (layer 1-based, refusal vector [hidden], ref_norm)."""
         if model.training:
             raise ValueError("call model.eval() before constructing the policy")
-        if steer not in ("none", "fixed", "adaptive"):
-            raise ValueError("steer must be none, fixed or adaptive")
+        if steer not in ("none", "fixed", "adaptive", "triggered"):
+            raise ValueError("steer must be none, fixed, adaptive or triggered")
+        if steer == "triggered" and not remask_enabled:
+            raise ValueError("--steer triggered needs the v3 boundary detector (--remask v3)")
         if transform not in ("additive", "project"):
             raise ValueError("transform must be additive or project")
         if not math.isfinite(threshold) or not math.isfinite(width) or width <= 0:
@@ -205,9 +207,13 @@ class Ours(Defender):
         parser.add_argument("--alpha", type=float, default=1.0,
                             help="Steering strength in units of the layer's mean activation norm.")
         parser.add_argument("--transform", choices=["additive", "project"], default="additive")
-        parser.add_argument("--steer", choices=["none", "fixed", "adaptive"], default="adaptive",
+        parser.add_argument("--steer", choices=["none", "fixed", "adaptive", "triggered"],
+                            default="adaptive",
                             help="none: no steering; fixed: step-0 binary gate; "
-                                 "adaptive: continuous gate every step.")
+                                 "adaptive: continuous gate every step; triggered: no "
+                                 "steering until the v3 response detector fires at a block "
+                                 "boundary, then the adaptive gate for the recovery and the "
+                                 "rest of the response (requires --remask v3).")
         parser.add_argument("--remask",
                             choices=["none", "v2", "v3"],
                             default="v2",
@@ -260,6 +266,11 @@ class Ours(Defender):
         self._pending = None
         self._schedule_scale = 1.0
         self.in_recovery = False
+        self.triggered = False   # set by V3.after_block when the response detector fires
+
+    def _steer_armed(self):
+        """triggered mode holds steering back until the boundary detector fires."""
+        return self.steer_mode != "triggered" or self.triggered
 
     # ----------------------------------------------------------------- checks
     def _validate(self, x, region):
@@ -324,7 +335,7 @@ class Ours(Defender):
         self._schedule_scale = float(schedule_scale)
         read_gate = self.monitoring and (not self.gate_once or self.step == 0)
         steer = (self.steer_enabled and self.monitoring and masks.any()
-                 and (read_gate or self.gate_strength > 0.0))
+                 and self._steer_armed() and (read_gate or self.gate_strength > 0.0))
         self._pending = {"pool": pool, "fired": False, "projection": None, "effective_alpha": 0.0}
         handles = []
         try:
@@ -345,6 +356,7 @@ class Ours(Defender):
             "effective_alpha": self._pending["effective_alpha"], "source": source,
             "num_generated_tokens": int(committed.sum()),
             "phase": "block_recovery" if self.in_recovery else "base",
+            "steer_armed": bool(steer),
         })
         if self.step == 0 and self.initial_only and self.gate_strength == 0.0:
             self.monitoring = False
@@ -394,6 +406,9 @@ class V2(Ours):
             raise ValueError("token budgets must be positive")
         if not 0 < remask_trigger <= 1:
             raise ValueError("remask_trigger must be in (0, 1]")
+        if kw.get("steer") == "triggered":
+            raise ValueError("--steer triggered needs the v3 boundary detector (--remask v3); "
+                             "v2 never raises the trigger, so steering would never start")
         self.remask_enabled = bool(remask)
         self.max_remask_tokens = max_remask_tokens
         self.max_parallel_commit = max_parallel_commit
@@ -587,6 +602,7 @@ class V3(Ours):
             "trigger_rule": "response_probability_cutoff_first_boundary"})
         if not trigger:
             return
+        self.triggered = True
 
         from llada import get_num_transfer_tokens
         from sampler import commit_sample
@@ -690,6 +706,11 @@ class ProposedDefense(Defender):
                    max_remask_tokens=args.max_remask_tokens,
                    max_parallel_commit=args.max_parallel_commit,
                    initial_only=not args.no_initial_only)
+
+    def defend(self, model, prompt_ids, **gen_config):
+        # Attacks may override steps per prompt (DIJA: one mask per step).
+        self.total_steps = gen_config.get("steps", self.total_steps)
+        return super().defend(model, prompt_ids, **gen_config)
 
     def reset(self):
         self._policy = Proposed.from_llada(self.model, self.gate, self.csd,
