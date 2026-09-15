@@ -107,30 +107,34 @@ def main():
                   "block_length": args.block_length, "temperature": args.temperature,
                   "remasking": args.remasking, "schedule": args.schedule}
 
+    def respond(user_message):
+        """One user turn through the defense -> (x, ids, cfg, shown)."""
+        shown = defender.transform_prompt(user_message)
+        ids = encode_prompt(tokenizer, shown, device)
+        cfg = {**gen_config, **attacker.gen_overrides(ids)}
+        return defender.defend(model, ids, **cfg), ids, cfg, shown
+
     results = []
     t_start = time.time()
     for i, row in enumerate(rows):
         # Per-prompt seed keeps generation identical under --start/--gpus sharding.
         seed_all(args.seed + int(row["index"]))
-        user_message = defender.transform_prompt(attacker.build_prompt(row))
-        input_ids = encode_prompt(tokenizer, user_message, device)
         vanilla_ids = encode_prompt(tokenizer, defender.transform_prompt(row["prompt"]), device)
-        row_config = {**gen_config, **attacker.gen_overrides(input_ids)}
 
         t0 = time.time()
-        out = defender.defend(model, input_ids, **row_config)
+        result = attacker.run(row, respond, tokenizer, vanilla_ids)
         elapsed = time.time() - t0
 
-        generation, extra = attacker.decode(tokenizer, out, input_ids, vanilla_ids)
-        if row_config != gen_config:
-            extra = {**extra, "gen_overrides": {k: v for k, v in row_config.items()
+        generation, extra = result.generation, result.extra
+        if result.cfg != gen_config:
+            extra = {**extra, "gen_overrides": {k: v for k, v in result.cfg.items()
                                                 if gen_config.get(k) != v}}
         # Graded sources carry their answer key through to eval_utility.py.
         graded = {k: row[k] for k in ("task", "answer", "subject", "category") if k in row}
         results.append({"index": row["index"], "prompt": row["prompt"], **graded,
-                        "attack_prompt": user_message, "generation": generation,
-                        **extra, "num_prompt_tokens": int(input_ids.shape[1]),
-                        "num_prompt_masks": int((input_ids == MASK_ID).sum()),
+                        "attack_prompt": result.attack_prompt, "generation": generation,
+                        **extra, "num_prompt_tokens": int(result.prompt_ids.shape[1]),
+                        "num_prompt_masks": int((result.prompt_ids == MASK_ID).sum()),
                         "seconds": round(elapsed, 2), **defender.result_fields()})
 
         write_json(args.out, {"model": MODEL_NAME, "config": gen_config,
