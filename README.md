@@ -152,14 +152,8 @@ attacker 생성도 원본 그대로: temp 1 / top_p 0.9 / max 500, 오픈소스 
 
 - **모델 백엔드만 대체**: 원작의 Vicuna/GPT-4 API → 로컬 `HFChat`. 프롬프트 원문·샘플링 파라미터·
   파싱·루프·조기종료·재시도는 전부 verbatim 포팅이고, 생성 텍스트 분포만 다르다.
-- **타겟은 항상 방어가 걸린 샘플러**: 모든 후보 프롬프트가 `transform_prompt → encode → defend`를 거치므로
-  `--defense ours` 등을 붙이면 방어 하의 공격이 된다.
 - **in-loop judge ≠ 최종 평가 judge**: 루프 조기종료는 위 `--*-judge`가 하고, 보고용 ASR은 `eval_llamaguard.py`/
   `run_sr_eval.py`로 따로 잰다 — 원작들도 루프와 보고의 judge가 달랐다 (PAIR: 루프 gcg, 보고 GPT-4).
-- **원작과 같은 궤적은 못 낸다**: attacker/파라프레이저는 temp=1 샘플링이고 백엔드가 다르므로 같은
-  seed도 다른 결과를 만든다 — 원작 자체도 API 비결정성 때문에 실행 간 동일하지 않았다. 반대로 우리
-  구현은 `--reproduct`에서 로컬 모델까지 전부 시드가 고정돼 같은 머신에서는 run마다 재현된다.
-  논문 수치와의 비교는 단일 실행이 아니라 여러 seed의 평균 ASR로.
 - PAIR의 `jailbreakbench` judge(JBB 분류기, Together API 필요)는 미포팅.
 
 ### Baseline: DiffuGuard
