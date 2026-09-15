@@ -28,7 +28,8 @@ import time
 from Attacker import ATTACKERS
 from common import (MODEL_NAME, MASK_ID, PROMPT_SOURCES, encode_prompt,
                     enable_reproducibility, force_math_attention, load_llada,
-                    load_prompts, run_eval_shards, seed_all, write_json)
+                    load_prompts, parse_gpu_ids, run_eval_shards, seed_all,
+                    write_json)
 from Defender import DEFENDERS
 
 
@@ -74,10 +75,24 @@ def run_sharded(args):
 
     Each child reruns this file with its own --start/--n/--out slice and
     CUDA_VISIBLE_DEVICES set; per-prompt seeding (seed + row index) keeps
-    rows identical no matter how they are partitioned.
+    rows identical no matter how they are partitioned. Attacks that drive a
+    second LLM (pap/pair) get a (target, attack) GPU pair per shard so the
+    two models never share a card.
     """
+    devices = None
+    if ATTACKERS[args.attack].needs_second_device:
+        ids = parse_gpu_ids(args.gpus)
+        if len(ids) < 2 or len(ids) % 2:
+            raise SystemExit(
+                f"--attack {args.attack} needs an even --gpus list: each "
+                "shard runs the target on one GPU and the attack LLM on "
+                "another (e.g. --gpus 0,1,2,3 -> 2 shards)")
+        devices = [f"{a},{b}" for a, b in zip(ids[::2], ids[1::2])]
+        print(f"attack needs a second device per shard: {len(devices)} "
+              f"shards over pairs {devices}")
     results, payload = run_eval_shards(__file__, args,
-                                       len(load_prompts(args.source)))
+                                       len(load_prompts(args.source)),
+                                       devices=devices)
     write_json(args.out, {**payload, "results": results})
     print(f"merged {len(results)} results -> {args.out}")
 
@@ -119,7 +134,8 @@ def main():
     for i, row in enumerate(rows):
         # Per-prompt seed keeps generation identical under --start/--gpus sharding.
         seed_all(args.seed + int(row["index"]))
-        vanilla_ids = encode_prompt(tokenizer, defender.transform_prompt(row["prompt"]), device)
+        vanilla_ids = (encode_prompt(tokenizer, defender.transform_prompt(row["prompt"]),
+                                     device) if attacker.needs_vanilla else None)
 
         t0 = time.time()
         result = attacker.run(row, respond, tokenizer, vanilla_ids)
@@ -137,9 +153,13 @@ def main():
                         "num_prompt_masks": int((result.prompt_ids == MASK_ID).sum()),
                         "seconds": round(elapsed, 2), **defender.result_fields()})
 
-        write_json(args.out, {"model": MODEL_NAME, "config": gen_config,
-                              "attack": attacker.describe(),
-                              "defense": defender.describe(), "results": results})
+        # Rewrite the full results file periodically (crash safety) -- attack
+        # histories make the payload large, so not every row.
+        if (i + 1) % 5 == 0 or i == len(rows) - 1:
+            write_json(args.out, {"model": MODEL_NAME, "config": gen_config,
+                                  "attack": attacker.describe(),
+                                  "defense": defender.describe(),
+                                  "results": results})
         print(f"[{i + 1}/{len(rows)}] idx={row['index']} {elapsed:.1f}s :: "
               f"{generation[:100].replace(chr(10), ' ')}...", flush=True)
 

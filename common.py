@@ -348,8 +348,10 @@ def parse_gpu_ids(spec):
 
 
 def spawn_shards(script, argv, gpu_ids, slices, out, extra_args=None):
-    """One `python <script>` subprocess per slice on its own GPU.
+    """One `python <script>` subprocess per slice on its own GPU set.
 
+    gpu_ids entries may be comma-separated groups ("0,1"): a shard needing a
+    second model (e.g. an attack LLM) gets two visible devices per process.
     argv should already have --gpus stripped; each child is invoked with
     --start/--n/--out for its slice plus extra_args(i, gpu) when given
     (e.g. a distinct ollama --port/--gpu/--container per shard). Child
@@ -390,15 +392,16 @@ def wait_merge_shards(procs):
     return results, payloads[0]
 
 
-def run_eval_shards(script, args, n_items, extra_args=None):
+def run_eval_shards(script, args, n_items, extra_args=None, devices=None):
     """Shared --gpus launcher for eval-style entry points.
 
     Shards `n_items` items over args.gpus into one subprocess per GPU, waits,
     and returns (merged results, part0 payload). Caller rewrites the merged
     summary (Evaluator.summarize is a staticmethod) and writes args.out.
+    `devices` overrides the parsed --gpus list with per-shard device groups.
     """
     import sys
-    gpu_ids = parse_gpu_ids(args.gpus)
+    gpu_ids = devices if devices is not None else parse_gpu_ids(args.gpus)
     total = n_items - args.start
     if args.n is not None:
         total = min(total, args.n)

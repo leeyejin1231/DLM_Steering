@@ -45,6 +45,8 @@ class AttackResult(NamedTuple):
 
 class Attacker(ABC):
     name: str
+    needs_vanilla = False        # decode() uses the un-attacked prompt ids
+    needs_second_device = False  # attack drives a second local LLM
 
     @classmethod
     def add_args(cls, parser):
@@ -134,6 +136,7 @@ class DIJA(NoAttack):
     """
 
     name = "dija"
+    needs_vanilla = True
 
     def __init__(self, source, dija_dir="DIJA", version="Qwen", steps="auto"):
         if source not in DIJA_REFINED:
@@ -248,7 +251,11 @@ def _assistant_text(tokenizer, out, ids):
 
 def _default_attack_device():
     import torch
-    return "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    if torch.cuda.device_count() > 1:
+        return "cuda:1"
+    print("warning: one GPU visible -- the attack/judge LLM shares the card "
+          "with the target model and may OOM")
+    return "cuda:0"
 
 
 class PAP(NoAttack):
@@ -272,6 +279,7 @@ class PAP(NoAttack):
     """
 
     name = "pap"
+    needs_second_device = True
 
     def __init__(self, llm, judge, techniques, variant="taxonomy", trials=10,
                  taxonomy=None, better_templates=None, one_shot_kd=None):
@@ -433,6 +441,7 @@ class PAIR(NoAttack):
     """
 
     name = "pair"
+    needs_second_device = True
 
     def __init__(self, llm, judge, n_streams=5, n_iterations=5, keep_last_n=4,
                  max_n_attack_attempts=5, attack_max_tokens=500,

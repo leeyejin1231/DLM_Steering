@@ -66,6 +66,10 @@ class HFChat:
         ids = self.tokenizer(text, return_tensors="pt").to(self.model.device)
         kw = {"max_new_tokens": max_new_tokens,
               "pad_token_id": self.tokenizer.eos_token_id}
+        if stop:
+            # Halt at the first stop string instead of burning max_new_tokens
+            # and cutting post-hoc (same litellm stop= semantics).
+            kw.update(stop_strings=list(stop), tokenizer=self.tokenizer)
         if temperature and temperature > 0:
             kw.update(do_sample=True, temperature=temperature, top_p=top_p)
         else:
