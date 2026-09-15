@@ -156,8 +156,10 @@ attacker 생성도 원본 그대로: temp 1 / top_p 0.9 / max 500, 오픈소스 
   `--defense ours` 등을 붙이면 방어 하의 공격이 된다.
 - **in-loop judge ≠ 최종 평가 judge**: 루프 조기종료는 위 `--*-judge`가 하고, 보고용 ASR은 `eval_llamaguard.py`/
   `run_sr_eval.py`로 따로 잰다 — 원작들도 루프와 보고의 judge가 달랐다 (PAIR: 루프 gcg, 보고 GPT-4).
-- **실행 간 비결정적**: attacker/파라프레이저는 temp=1 샘플링이라 `--reproduct`는 타겟 쪽만 결정화하고
-  공격 궤적은 매번 갈린다. 비교는 여러 seed의 평균으로.
+- **원작과 같은 궤적은 못 낸다**: attacker/파라프레이저는 temp=1 샘플링이고 백엔드가 다르므로 같은
+  seed도 다른 결과를 만든다 — 원작 자체도 API 비결정성 때문에 실행 간 동일하지 않았다. 반대로 우리
+  구현은 `--reproduct`에서 로컬 모델까지 전부 시드가 고정돼 같은 머신에서는 run마다 재현된다.
+  논문 수치와의 비교는 단일 실행이 아니라 여러 seed의 평균 ASR로.
 - PAIR의 `jailbreakbench` judge(JBB 분류기, Together API 필요)는 미포팅.
 
 ### Baseline: DiffuGuard
