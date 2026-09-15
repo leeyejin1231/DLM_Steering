@@ -20,11 +20,10 @@ python data_downloader.py   # data/에 jbb_harmful.csv, advbench.parquet, harmbe
 
 ! 추가로, ./outputs/ 폴더에 steer_detector.pt, steer_vector.pt가 있어야하고, 만약 v3로 defense를 하려는 경우에는 response_detector.pt도 있어야 한다.
 
-DIJA 공격을 위해서는 아래의 레포지토리가 필요하다.
+DIJA 공격을 위해서는 아래의 레포지토리가 필요하다 (다른 경로에 두면 `--dija-dir`로 지정).
 
 ```bash
-cd DLM_Steering_Remasking
-git clone https://github.com/ZichenWen1/DIJA.git
+git clone https://github.com/ZichenWen1/DIJA.git   # 레포 루트에 DIJA/ 생성
 ```
 
 ## 실험 실행
@@ -70,7 +69,7 @@ python exp.py --attack dija --defense ours --remask v3 --source jbb_harmful --n 
 | `--attack` | `none`, `prefix`, `dija`(논문 refined 프롬프트), `dija_template`(구 합성 템플릿), `pap`(미구현), `pair`(미구현) |
 | `--defense` | `none`, `ours`, `proposed`, `selfreminder`(미구현), `diffuguard`(미구현) |
 | `--source` | 유해: `jbb_harmful`, `advbench`, `harmbench`, `strongreject`, `xstest_unsafe` / 무해(over-refusal): `truthfulqa`, `xstest_safe`, `jbb_benign`, `wj_benign` / 일반화(accuracy): `mmlu`, `gsm8k`, `truthfulqa_mc` |
-| 공통 | `--n`, `--start`, `--steps`, `--gen-length`, `--block-length`, `--temperature`, `--remasking`, `--schedule {const,linear,cosine}`, `--reproduct` |
+| 공통 | `--n`, `--start`, `--steps`, `--gen-length`, `--block-length`, `--temperature`, `--remasking`, `--schedule {const,linear,cosine}`, `--seed`, `--reproduct`, `--gpus` |
 
 `--gen-length` 기본값은 128, dija/dija_template는 0.
 
@@ -101,6 +100,20 @@ python exp.py --attack dija --defense ours --remask v3 --source jbb_harmful --n 
 python exp.py --source jbb_harmful --n 20 --reproduct --out outputs/base.json
 ```
 
+### 멀티 GPU (`--gpus`)
+
+`--gpus 0,1,...`를 주면 프롬프트를 GPU 수만큼 연속 `--start/--n` 슬라이스로 나눠 GPU당 자식 프로세스를 띄우고
+(`CUDA_VISIBLE_DEVICES` 자동 지정), part JSON을 `--out`으로 합친다. 각 파트의 로그는 `<out>.part<i>.log`.
+
+```bash
+python exp.py --attack dija --defense ours --remask v3 --source jbb_harmful \
+    --n 100 --reproduct --seed 42 --gpus 0,1,2,3,4,5,6,7 --out outputs/JBB-dija-v3-42.json
+```
+
+시드는 프롬프트 단위(`seed + index`)로 적용돼서 GPU 수나 분할 방식과 무관하게 같은 결과가 나온다 —
+`--start/--n` 수동 분할도 같은 이유로 안전하다. (예전에는 프로세스 시작 시 한 번만 시딩해서
+temp>0 분할 실행이 재현되지 않았다.)
+
 ### `--defense ours` 주요 인자
 
 ```bash
@@ -110,11 +123,12 @@ python exp.py --defense ours \
     --steer adaptive --remask v2
 ```
 
-- `--steer {none,fixed,adaptive}` — `none`: 스티어링 없음, `fixed`: non-adaptive, `adaptive`: 매 스텝 연속 게이트
+- `--steer {none,fixed,adaptive,triggered}` — `none`: 스티어링 없음, `fixed`: non-adaptive, `adaptive`: 매 스텝 연속 게이트
 - `--remask {none,v2,v3}` — `v2`: 기본값, llada_steering_remasking_v2 방식, `none`: 리마스킹 없음
   - `--steer triggered`(v3 전용): v3 응답 검출기가 트리거되기 전에는 steering을 걸지 않고, 트리거 뒤 복구와 남은 블록에서만 adaptive 게이트로 건다. 무해 프롬프트에서 게이트가 거의 항상 열려 생기는 over-refusal을 피하려는 옵션
   - `v3`: 블록 경계마다 로지스틱 회귀 응답 검출기(`--response-detector`, 기본 `outputs/response_detector.pt`)가 커밋된 토큰을 채점하고, 첫 경계에서 트리거되면 해당 블록 + 프롬프트 안의 채워진 스팬(DIJA)을 전부 remask한 뒤 `--recovery-steps`(기본 32)만큼 재생성
-- `--alpha`, `--transform {additive,project}`, `--gate-threshold`, `--gate-width`, `--remask-trigger`, `--initial-only` 등은 사용성 개편할 계획.
+- `--alpha`, `--transform {additive,project}`, `--gate-threshold`, `--gate-width`, `--remask-trigger` 등은 사용성 개편할 계획.
+  (`--initial-only`는 제거됨 — `--steer triggered`와 같이 쓰면 step-0에서 감시가 꺼져 스티어링이 영구히 잠기는 조합 버그가 있었다.)
 
 
 ### Over-refusal
@@ -169,10 +183,17 @@ python eval_utility.py --in outputs/TQAmc-none-v3-42.json --out outputs/TQAmc-no
 | `eval_utility.py` | 규칙 기반 (GPU 불필요) | mmlu/gsm8k/truthfulqa_mc 정답 추출 → accuracy |
 
 ```bash
-python eval_llamaguard.py --in outputs/dija_ours.json --out outputs/dija_ours_lg4.json
-python run_sr_eval.py --in outputs/dija_ours.json --out outputs/dija_ours_sr.json --port 50001 --gpu 0
-python steering/judge_refusal.py --in outputs/base.json --out outputs/base_judged.json
+python eval_llamaguard.py --in outputs/dija_ours.json --out outputs/dija_ours_lg4.json --gpus 0,1,2,3
+python run_sr_eval.py --in outputs/dija_ours.json --out outputs/dija_ours_sr.json --gpus 4,5,6,7
+python steering/judge_refusal.py --in outputs/base.json --out outputs/base_judged.json --gpus 4,5
 ```
+
+멀티 GPU: 세 스크립트 모두 `--gpus`로 아이템을 나눠 병렬 채점한다 (`eval_utility.py`는 CPU라 해당 없음).
+
+- `eval_llamaguard.py`는 GPU당 자식 프로세스가 각자 Llama-Guard-4를 로드.
+- `run_sr_eval.py`/`judge_refusal.py`는 샤드마다 ollama 컨테이너를 따로 띄운다 — `--port`부터 i씩 증가한 포트,
+  컨테이너명 `ollama-<port>`, 각각 `--gpus`의 i번째 GPU에 바인딩 (podman 필요. 실행 후 컨테이너는 남는다).
+- 셋 다 `--start/--n`으로 부분 구간만 돌릴 수 있고, 파트별 `.jsonl`로 스트리밍/재개된다.
 
 
 ## 벡터/디텍터 (`steering/`)
