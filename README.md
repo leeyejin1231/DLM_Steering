@@ -102,17 +102,8 @@ python exp.py --source jbb_harmful --n 20 --reproduct --out outputs/base.json
 
 ### 멀티 GPU (`--gpus`)
 
-`--gpus 0,1,...`를 주면 프롬프트를 GPU 수만큼 연속 `--start/--n` 슬라이스로 나눠 GPU당 자식 프로세스를 띄우고
-(`CUDA_VISIBLE_DEVICES` 자동 지정), part JSON을 `--out`으로 합친다. 각 파트의 로그는 `<out>.part<i>.log`.
-
-```bash
-python exp.py --attack dija --defense ours --remask v3 --source jbb_harmful \
-    --n 100 --reproduct --seed 42 --gpus 0,1,2,3,4,5,6,7 --out outputs/JBB-dija-v3-42.json
-```
-
-시드는 프롬프트 단위(`seed + index`)로 적용돼서 GPU 수나 분할 방식과 무관하게 같은 결과가 나온다 —
-`--start/--n` 수동 분할도 같은 이유로 안전하다. (예전에는 프로세스 시작 시 한 번만 시딩해서
-temp>0 분할 실행이 재현되지 않았다.)
+`--gpus 0,1,...`를 주면 프롬프트를 GPU 수만큼 나눠 GPU당 자식 프로세스를 띄운다.
+(`CUDA_VISIBLE_DEVICES` 자동 지정)
 
 ### `--defense ours` 주요 인자
 
