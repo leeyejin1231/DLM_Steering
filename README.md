@@ -26,6 +26,12 @@ DIJA 공격을 위해서는 아래의 레포지토리가 필요하다 (다른 �
 git clone https://github.com/ZichenWen1/DIJA.git   # 레포 루트에 DIJA/ 생성
 ```
 
+baseline 방어인 DiffuGuard(ICLR 2026)를 돌리려면 저자 레포지토리도 같은 위치에 받는다. 별도 conda 환경은 필요 없다 (아래 "Baseline: DiffuGuard" 참고).
+
+```bash
+git clone https://github.com/niez233/DiffuGuard.git
+```
+
 ## 실험 실행
 
 모든 실험은 `exp.py`로 실행 - `--attack`과 `--defense`를 고르면 선택한 공격 및 방어에 맞는 인자값을 넣어야 함.
@@ -67,7 +73,7 @@ python exp.py --attack dija --defense ours --remask v3 --source jbb_harmful --n 
 | 옵션 | 값 |
 |---|---|
 | `--attack` | `none`, `prefix`, `dija`(논문 refined 프롬프트), `dija_template`(구 합성 템플릿), `pap`, `pair` |
-| `--defense` | `none`, `ours`, `proposed`, `selfreminder`(미구현), `diffuguard`(미구현) |
+| `--defense` | `none`, `ours`, `proposed`, `selfreminder`(미구현). DiffuGuard는 `--defense`가 아니라 저자 코드로 돌린다 ("Baseline: DiffuGuard") |
 | `--source` | 유해: `jbb_harmful`, `advbench`, `harmbench`, `strongreject`, `xstest_unsafe` / 무해(over-refusal): `truthfulqa`, `xstest_safe`, `jbb_benign`, `wj_benign` / 일반화(accuracy): `mmlu`, `gsm8k`, `truthfulqa_mc` |
 | 공통 | `--n`, `--start`, `--steps`, `--gen-length`, `--block-length`, `--temperature`, `--remasking`, `--schedule {const,linear,cosine}`, `--seed`, `--reproduct`, `--gpus` |
 
@@ -75,12 +81,9 @@ python exp.py --attack dija --defense ours --remask v3 --source jbb_harmful --n 
 
 ### DIJA 공격 (논문 재현)
 
-`--attack dija`는 `DIJA/run_<bench>/refine_prompt/*_refined_Qwen.json`의 refined 프롬프트를 `--source`의 vanilla
-프롬프트로 찾아 그대로 쓴다 (`jbb_harmful`, `harmbench`, `strongreject`만 지원, 세 세트 모두 100% 매칭).
+`--attack dija`는 `DIJA/run_<bench>/refine_prompt/*_refined_Qwen.json`의 refined 프롬프트 그대로 사용(`jbb_harmful`, `harmbench`, `strongreject`).
 원본 `*_llada.py`와 같게 `<mask:N>`을 마스크 N개로 펼쳐 user turn 안에 넣고, 어시스턴트 턴은 붙이지 않으며
-(gen_length 0), 마스크 하나를 한 스텝에 채우고(`--dija-steps auto`, 프롬프트마다 steps = 마스크 수), temperature 0.2를 쓴다.
-채점 텍스트는 원본처럼 vanilla 프롬프트와 겹치는 토큰 prefix 뒤부터 assistant 헤더 앞까지, 즉 채워진 템플릿이다.
-`--temperature`, `--gen-length`, `--dija-steps N`을 주면 원본에서 벗어난 설정으로 돌릴 수 있다.
+(gen_length 0), 마스크 하나를 한 스텝에 채우고(`--dija-steps auto`, 프롬프트마다 steps = 마스크 수), temperature 0.2를 사용.
 
 ```bash
 python exp.py --attack dija --defense none --source jbb_harmful --n 100 --out outputs/JBB-dija-none-42.json
@@ -156,6 +159,48 @@ attacker 생성도 원본 그대로: temp 1 / top_p 0.9 / max 500, 오픈소스 
 - **실행 간 비결정적**: attacker/파라프레이저는 temp=1 샘플링이라 `--reproduct`는 타겟 쪽만 결정화하고
   공격 궤적은 매번 갈린다. 비교는 여러 seed의 평균으로.
 - PAIR의 `jailbreakbench` judge(JBB 분류기, Together API 필요)는 미포팅.
+
+### Baseline: DiffuGuard
+
+DiffuGuard는 우리 Defender로 재구현하지 않고 저자 코드(`DiffuGuard/models/jailbreakbench_llada.py`)를 수정 없이 그대로
+실행한 뒤, 출력을 `exp.py` 결과 형식으로 바꿔 같은 평가기로 채점한다.
+
+**1. 레포지토리 준비**
+
+```bash
+cd DLM_Steering_Remasking
+git clone https://github.com/niez233/DiffuGuard.git
+```
+
+DiffuGuard 코드는 import 시점에 openai, google.generativeai, boto3, anthropic, bpe를 요구하지만 LLaDA DIJA 실행에서는
+사용하지 않음. 패키지를 설치하는 대신 `script/diffuguard_stubs/`의 빈 모듈을 PYTHONPATH에 올린다. 실행 스크립트가
+자동으로 처리하며, 러너를 직접 부를 때만 아래처럼 지정함.
+
+```bash
+PYTHONPATH=$PWD/script/diffuguard_stubs python DiffuGuard/models/jailbreakbench_llada.py --help
+```
+
+**2. 실행**
+
+`script/run_diffuguard.sh`  
+`SOURCE`로 벤치마크를, `CONFIG`로 방어 설정을 골라 한 번에 하나씩 실행하며,
+생성 후 Llama Guard 4와 StrongREJECT 채점까지 이어서 한다. 샘플링 조건은 우리 `--attack dija`와 동일하다
+(gen_length 0, temperature 0.2, CFG 없음, 마스크당 1스텝을 위해 steps 200). 방어 설정은 저자 `DiffuGuard/test.sh`의
+LLaDA-8B DIJA 줄 그대로다 (hidden 자가검사 임계값 0.2, 90% 재마스크, 8스텝 복구, `--fill_all_masks`).
+
+| 변수 | 값 |
+|---|---|
+| `SOURCE` | `jbb_harmful`(100), `harmbench`(393), `strongreject`(313). 출력 접두어는 `JBB`, `HarmBench`, `SR` |
+| `CONFIG` | `hidden`: test.sh 설정 그대로 / `full`: 여기에 `--remasking adaptive_step`을 더한 논문 완전판 |
+| `GPU` | 사용할 GPU 번호 |
+
+
+
+
+주의: 저자 코드는 `--fill_all_masks`일 때 복구 단계에서 프롬프트 토큰까지 포함한 전체 시퀀스의 90%를 되돌림.
+
+HarmBench refined 파일에는 같은 behavior가 7건 중복되어 러너는 400건을 돌리지만 변환 시 첫 건만 남겨
+`common.load_prompts`의 393건과 맞춘다. 프롬프트당 약 35초라 JBB 약 1시간, StrongREJECT 약 3시간, HarmBench 약 4시간이 걸림.
 
 ### 재현 모드
 
