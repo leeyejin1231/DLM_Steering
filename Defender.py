@@ -231,6 +231,9 @@ class Ours(Defender):
         parser.add_argument("--audit-all-boundaries", action="store_true",
                             help="v3: let the response detector trigger at every "
                                  "block boundary, not only the first.")
+        parser.add_argument("--recovery-alpha-growth", type=float, default=1.0,
+                            help="v3: steering strength multiplier per re-detected "
+                                 "recovery round (round i steers at alpha*growth^i).")
         parser.add_argument("--max-remask-tokens", type=int, default=16)
         parser.add_argument("--max-parallel-commit", type=int, default=2)
         parser.add_argument("--remask-trigger", type=float, default=1.0,
@@ -261,7 +264,8 @@ class Ours(Defender):
         return V3(**shared, response_detector=response_detector,
                   recovery_steps=args.recovery_steps,
                   recovery_rounds=args.recovery_rounds,
-                  audit_all_boundaries=args.audit_all_boundaries)
+                  audit_all_boundaries=args.audit_all_boundaries,
+                  recovery_alpha_growth=args.recovery_alpha_growth)
 
     def reset(self):
         self.gate_strength = 0.0
@@ -271,6 +275,7 @@ class Ours(Defender):
         self.trace = []
         self._pending = None
         self._schedule_scale = 1.0
+        self._steer_boost = 1.0   # V3 recovery rounds may escalate strength
         self.in_recovery = False
         self.triggered = False   # set by V3.after_block when the response detector fires
 
@@ -311,7 +316,7 @@ class Ours(Defender):
 
     def _steer_hook(self, unit, ref_norm, positions):
         def steer(module, inputs, output):
-            g = self.gate_strength * self._schedule_scale
+            g = self.gate_strength * self._schedule_scale * self._steer_boost
             if g <= 0.0 or (self.strength == 0.0 and self.transform == "additive"):
                 return output
             hidden = _hidden(output)
@@ -530,11 +535,14 @@ class V3(Ours):
     name = "v3"
 
     def __init__(self, model, *, response_detector, recovery_steps=32,
-                 recovery_rounds=1, audit_all_boundaries=False, **kw):
+                 recovery_rounds=1, audit_all_boundaries=False,
+                 recovery_alpha_growth=1.0, **kw):
         if recovery_steps <= 0:
             raise ValueError("recovery_steps must be positive")
         if recovery_rounds <= 0:
             raise ValueError("recovery_rounds must be positive")
+        if not math.isfinite(recovery_alpha_growth) or recovery_alpha_growth <= 0:
+            raise ValueError("recovery_alpha_growth must be finite and positive")
         if response_detector is None:
             raise ValueError("--remask v3 requires a response detector "
                              "checkpoint (--response-detector)")
@@ -544,6 +552,7 @@ class V3(Ours):
         self.recovery_steps = int(recovery_steps)
         self.recovery_rounds = int(recovery_rounds)
         self.audit_all_boundaries = bool(audit_all_boundaries)
+        self.recovery_alpha_growth = float(recovery_alpha_growth)
         super().__init__(model, remask_enabled=True, **kw)
         if int(response_detector["layer"]) != self.gate_layer:
             raise ValueError("response detector layer must match the gate layer")
@@ -634,6 +643,8 @@ class V3(Ours):
         counts = get_num_transfer_tokens(
             targets.unsqueeze(0), self.recovery_steps)[0].tolist()
         for round_i in range(self.recovery_rounds):
+            # Re-detected rounds steer harder: strength *= growth ** round_i.
+            self._steer_boost = self.recovery_alpha_growth ** round_i
             old_tokens = x[0, positions].clone()
             x[0, positions] = self.mask_id
             eligible = positions
@@ -652,6 +663,7 @@ class V3(Ours):
                 self.in_recovery = False
             event["rounds"].append({
                 "round": round_i,
+                "steer_boost": self._steer_boost,
                 "selected": positions.tolist(),
                 "num_span_positions": int(span_slots.sum()),
                 "old_token_ids": old_tokens.tolist(),
@@ -666,6 +678,7 @@ class V3(Ours):
                 "trigger_rule": "post_recovery_reaudit"})
             if post["response_probability"] < self._det_threshold:
                 break
+        self._steer_boost = 1.0
 
     def _remasked(self):
         return any(e["applied"] for e in self.recovery_events)
@@ -682,7 +695,8 @@ class V3(Ours):
         d = super().describe()
         d.update(remask="v3", recovery_steps=self.recovery_steps,
                  recovery_rounds=self.recovery_rounds,
-                 audit_all_boundaries=self.audit_all_boundaries)
+                 audit_all_boundaries=self.audit_all_boundaries,
+                 recovery_alpha_growth=self.recovery_alpha_growth)
         return d
 
 

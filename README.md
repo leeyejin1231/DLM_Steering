@@ -118,6 +118,9 @@ python exp.py --defense ours \
 - `--remask {none,v2,v3}` — `v2`: 기본값, llada_steering_remasking_v2 방식, `none`: 리마스킹 없음
   - `--steer triggered`(v3 전용): v3 응답 검출기가 트리거되기 전에는 steering을 걸지 않고, 트리거 뒤 복구와 남은 블록에서만 adaptive 게이트로 건다. 무해 프롬프트에서 게이트가 거의 항상 열려 생기는 over-refusal을 피하려는 옵션
   - `v3`: 블록 경계마다 로지스틱 회귀 응답 검출기(`--response-detector`, 기본 `outputs/response_detector.pt`)가 커밋된 토큰을 채점하고, 첫 경계에서 트리거되면 해당 블록 + 프롬프트 안의 채워진 스팬(DIJA)을 전부 remask한 뒤 `--recovery-steps`(기본 32)만큼 재생성
+  - `--recovery-rounds N`(기본 1): 복구 뒤 다시 채점해서 여전히 flagged면 같은 자리를 다시 remask — 최대 N라운드까지 반복
+  - `--recovery-alpha-growth G`(기본 1.0): 재감지된 라운드의 스티어링 강도 배수 — 라운드 i는 α·G^i로 steer (예: G=2 → 1, 2, 4)
+  - `--audit-all-boundaries`: 첫 경계뿐 아니라 모든 블록 경계에서 트리거 허용 (`gen-length`>0일 때만 의미 있음)
 - `--alpha`, `--transform {additive,project}`, `--gate-threshold`, `--gate-width`, `--remask-trigger` 등은 사용성 개편할 계획.
   (`--initial-only`는 제거됨 — `--steer triggered`와 같이 쓰면 step-0에서 감시가 꺼져 스티어링이 영구히 잠기는 조합 버그가 있었다.)
 
