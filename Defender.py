@@ -71,13 +71,14 @@ class Defender(ABC):
         Must return the model output (with .logits)."""
 
     def after_block(self, x, region, *, block_index, block_positions,
-                    prompt_length, temperature, remasking):
+                    prompt_length, temperature, remasking, last_block=False):
         """Called once after each block's denoising loop completes.
 
         block_positions: answer slots of the just-finished block. prompt_length
         marks the prompt/generation boundary; committed answer slots before it
-        (e.g. filled DIJA spans) are also remaskable. May audit the block or
-        rewrite committed tokens back to MASK_ID.
+        (e.g. filled DIJA spans) are also remaskable. last_block marks the
+        final block (no later forward exists to piggyback an audit on). May
+        audit the block or rewrite committed tokens back to MASK_ID.
         """
 
     @abstractmethod
@@ -278,6 +279,9 @@ class Ours(Defender):
         self._steer_boost = 1.0   # V3 recovery rounds may escalate strength
         self.in_recovery = False
         self.triggered = False   # set by V3.after_block when the response detector fires
+        self._gate_t = torch.zeros((), dtype=torch.float32,
+                                   device=self.gate_vector.device)
+        self._pending_audit = None   # V3 defers non-final boundary audits here
 
     def _steer_armed(self):
         """triggered mode holds steering back until the boundary detector fires."""
@@ -306,22 +310,30 @@ class Ours(Defender):
         pending = self._pending
         if pending is None or pending.get("fired"):
             return output
-        projection = self._projection(_hidden(output), pending["pool"])
+        hidden = _hidden(output)
+        h = hidden[0, pending["pool"]].to(torch.float32).mean(dim=0)
+        proj_t = h @ self.gate_vector.to(h.device)
         if self.gate_once:
-            g = float(projection >= self.threshold) if self.step == 0 else self.gate_strength
+            g_t = (proj_t >= self.threshold).to(torch.float32) if self.step == 0 else self._gate_t
         else:
-            g = min(1.0, max(0.0, (projection - self.threshold) / self.width))
-        self.gate_strength, self.last_projection = g, projection
-        pending["projection"], pending["fired"] = projection, True
+            g_t = ((proj_t - self.threshold) / self.width).clamp(0.0, 1.0)
+        self._gate_t = g_t
+        pending["proj_t"], pending["fired"] = proj_t, True
         return output
 
     def _steer_hook(self, unit, ref_norm, positions):
         def steer(module, inputs, output):
-            g = self.gate_strength * self._schedule_scale * self._steer_boost
-            if g <= 0.0 or (self.strength == 0.0 and self.transform == "additive"):
+            pending = self._pending
+            live = pending is not None and pending.get("fired")
+            if not live and self.gate_strength <= 0.0:
+                return output
+            if self.strength == 0.0 and self.transform == "additive":
                 return output
             hidden = _hidden(output)
             values = hidden[0, positions].to(torch.float32)
+            g = (self._gate_t if live else self.gate_strength)
+            g = torch.as_tensor(g * self._schedule_scale * self._steer_boost,
+                                dtype=torch.float32, device=values.device)
             u = unit.to(values.device)
             if self.transform == "additive":
                 updated = values + (g * self.strength * ref_norm) * u
@@ -331,7 +343,8 @@ class Ours(Defender):
                 updated = values - g * (projection + self.strength * ref_norm) * harmful
             out = hidden.clone()
             out[0, positions] = updated.to(hidden.dtype)
-            self._pending["effective_alpha"] = g * self.strength
+            if pending is not None:
+                pending["alpha_t"] = g * self.strength
             return _replace(output, out)
         return steer
 
@@ -341,34 +354,76 @@ class Ours(Defender):
         """One model forward with in-forward detection and steering."""
         masks = (x == self.mask_id) & region
         committed = region & ~masks
-        # One host sync feeds validate + branch checks + the trace count.
+        # Sync while the GPU queue is empty: one batched read feeds validate +
+        # branch checks + the trace count, and index tensors (not bool masks,
+        # which would nonzero-sync mid-forward) are resolved up front.
         n_region, n_masks, n_committed = torch.stack(
             [region.sum(), masks.sum(), committed.sum()]).tolist()
         self._validate(x, region, n_region)
         source = "generated" if n_committed else "masked"
-        pool = committed[0] if n_committed else masks[0]
         self._schedule_scale = float(schedule_scale)
         read_gate = self.monitoring and (not self.gate_once or self.step == 0)
         steer = (self.steer_enabled and self.monitoring and n_masks
                  and self._steer_armed() and (read_gate or self.gate_strength > 0.0))
-        self._pending = {"pool": pool, "fired": False, "projection": None, "effective_alpha": 0.0}
-        handles = []
+        pool = (committed[0] if n_committed else masks[0]).nonzero().flatten() \
+            if read_gate else None
+        positions = masks[0].nonzero().flatten() if steer else None
+        audit = self._pending_audit     # V3 only: ride this forward's features
+        self._pending_audit = None
+        audit_pools = None
+        if audit is not None:
+            audit["chunks"] = self._chunk_positions(
+                audit["block_row"].nonzero().flatten())
+            audit_pools = [committed[0].nonzero().flatten(), *audit["chunks"]]
+        self._pending = {"pool": pool, "fired": False, "proj_t": None, "alpha_t": 0.0}
+        handles, feats_out = [], []
         try:
             if read_gate:
                 handles.append(self.gate_block.register_forward_hook(self._gate_hook))
             if steer:
                 for block, unit, ref_norm in self.sites:
-                    handles.append(block.register_forward_hook(self._steer_hook(unit, ref_norm, masks[0])))
+                    handles.append(block.register_forward_hook(
+                        self._steer_hook(unit, ref_norm, positions)))
+            if audit_pools is not None:
+                def capture(module, inputs, output):
+                    feats_out.append(torch.stack(
+                        [_hidden(output)[0, p].to(torch.float32).mean(dim=0)
+                         for p in audit_pools]))
+                handles.append(self.gate_block.register_forward_hook(capture))
             output = self.model(x)
         finally:
             for handle in handles:
                 handle.remove()
-        if read_gate and not self._pending["fired"]:
+        pend = self._pending
+        if read_gate and not pend["fired"]:
             raise RuntimeError("model forward did not execute the gate hook")
+        zero = torch.zeros((), dtype=torch.float32, device=x.device)
+        scalars = torch.stack([
+            pend["proj_t"] if pend["fired"] else zero,
+            self._gate_t if pend["fired"] else zero,
+            torch.as_tensor(pend["alpha_t"], dtype=torch.float32,
+                            device=x.device)])
+        if audit is not None:
+            if len(feats_out) != 1:
+                raise RuntimeError("audit hook must execute exactly once per forward")
+            scalars = torch.cat([scalars, self._audit_vector(feats_out[0])])
+        vals = scalars.tolist()
+        proj_v, gate_v, alpha_v = vals[:3]
+        if pend["fired"]:
+            if not math.isfinite(proj_v):
+                raise ValueError("detector returned a non-finite projection")
+            self.gate_strength, self.last_projection = gate_v, proj_v
+        if audit is not None and self._apply_audit(
+                x, region, self._reading(vals[3:], len(audit["chunks"])),
+                audit=audit):
+            # The forward just consumed is stale post-recovery; redo it so the
+            # sampler commits from post-recovery logits.
+            self._pending = None
+            return self.forward(x, region, schedule_scale=schedule_scale)
         self.trace.append({
-            "step": self.step, "projection": self._pending["projection"],
+            "step": self.step, "projection": proj_v if pend["fired"] else None,
             "strength": self.gate_strength, "schedule_scale": self._schedule_scale,
-            "effective_alpha": self._pending["effective_alpha"], "source": source,
+            "effective_alpha": alpha_v, "source": source,
             "num_generated_tokens": n_committed,
             "phase": "block_recovery" if self.in_recovery else "base",
             "steer_armed": bool(steer),
@@ -578,6 +633,22 @@ class V3(Ours):
     def _chunk_positions(positions, size=32):
         return [positions[i:i + size] for i in range(0, positions.numel(), size)]
 
+    def _audit_vector(self, feats):
+        """[committed + chunks] pooled features -> projection/logit/prob vector."""
+        logit = feats[0] @ self._det_weight + self._det_bias
+        return torch.cat([feats @ self.gate_vector,
+                          logit.reshape(1), torch.sigmoid(logit.reshape(1))])
+
+    def _reading(self, values, n_chunks):
+        projection = values[0]
+        return {
+            "projection": projection,
+            "block_projections": values[1:1 + n_chunks],
+            "response_logit": values[-2],
+            "response_probability": values[-1],
+            "strength": min(1.0, max(0.0, (projection - self.threshold) / self.width)),
+        }
+
     @torch.no_grad()
     def _audit(self, x, region, chunks):
         """One unsteered forward capturing gate-layer features pooled over the
@@ -598,25 +669,35 @@ class V3(Ours):
         self.audit_forwards += 1
         if len(feats_out) != 1:
             raise RuntimeError("audit hook must execute exactly once per forward")
-        feats = feats_out[0]
-        logit = feats[0] @ self._det_weight + self._det_bias
-        values = torch.cat(
-            [feats @ self.gate_vector, logit.reshape(1), torch.sigmoid(logit.reshape(1))]
-        ).tolist()
-        projection = values[0]
-        return {
-            "projection": projection,
-            "block_projections": values[1:1 + len(chunks)],
-            "response_logit": values[-2],
-            "response_probability": values[-1],
-            "strength": min(1.0, max(0.0, (projection - self.threshold) / self.width)),
-        }
+        return self._reading(self._audit_vector(feats_out[0]).tolist(), len(chunks))
 
     @torch.no_grad()
     def after_block(self, x, region, *, block_index, block_positions,
-                    prompt_length, temperature, remasking):
-        positions = block_positions[0].nonzero().flatten()
-        reading = self._audit(x, region, self._chunk_positions(positions))
+                    prompt_length, temperature, remasking, last_block=False):
+        if self._pending_audit is not None:
+            # A deferred audit whose next forward never arrived still runs.
+            pending = self._pending_audit
+            self._pending_audit = None
+            reading = self._audit(x, region, self._chunk_positions(
+                pending["block_row"].nonzero().flatten()))
+            self._apply_audit(x, region, reading, audit=pending)
+        audit = {"block_index": block_index, "block_row": block_positions[0],
+                 "prompt_length": prompt_length, "temperature": temperature,
+                 "remasking": remasking}
+        if last_block:
+            # No later forward to piggyback on; audit with a dedicated pass.
+            reading = self._audit(x, region, self._chunk_positions(
+                block_positions[0].nonzero().flatten()))
+            self._apply_audit(x, region, reading, audit=audit)
+        else:
+            # Deferred: the next block's first defended forward captures the
+            # gate-layer features, saving one full forward per clean boundary.
+            self._pending_audit = audit
+
+    def _apply_audit(self, x, region, reading, *, audit):
+        """Record the audit; run recovery when the block still reads as a
+        response. Returns True when recovery ran."""
+        block_index = audit["block_index"]
         trigger = ((self.audit_all_boundaries or block_index == 0)
                    and reading["response_probability"] >= self._det_threshold)
         self.boundary_audits.append({
@@ -625,7 +706,7 @@ class V3(Ours):
                              if self.audit_all_boundaries else
                              "response_probability_cutoff_first_boundary")})
         if not trigger:
-            return
+            return False
         self.triggered = True
 
         event = {"boundary": block_index,
@@ -638,9 +719,11 @@ class V3(Ours):
         # prompt (DIJA spans carry the payload under that attack). With
         # recovery_rounds > 1 the block is re-audited after each regeneration
         # and remasked again while it still reads as a response.
+        prompt_length, temperature = audit["prompt_length"], audit["temperature"]
+        remasking = audit["remasking"]
         span_slots = region[0] & (x[0] != self.mask_id)
         span_slots[prompt_length:] = False
-        targets = block_positions[0] | span_slots
+        targets = audit["block_row"] | span_slots
         positions = targets.nonzero().flatten()
         from llada import get_num_transfer_tokens
         from sampler import commit_sample
@@ -683,6 +766,7 @@ class V3(Ours):
             if post["response_probability"] < self._det_threshold:
                 break
         self._steer_boost = 1.0
+        return True
 
     def _remasked(self):
         return any(e["applied"] for e in self.recovery_events)
