@@ -224,6 +224,13 @@ class Ours(Defender):
                                  "--remask v3*. Its layer must match --detector-layer.")
         parser.add_argument("--recovery-steps", type=int, default=32,
                             help="Steps spent regenerating a triggered block (v3).")
+        parser.add_argument("--recovery-rounds", type=int, default=1,
+                            help="v3: re-audit after each recovery round and remask "
+                                 "again while the block still reads as a response, "
+                                 "up to this many rounds per trigger.")
+        parser.add_argument("--audit-all-boundaries", action="store_true",
+                            help="v3: let the response detector trigger at every "
+                                 "block boundary, not only the first.")
         parser.add_argument("--max-remask-tokens", type=int, default=16)
         parser.add_argument("--max-parallel-commit", type=int, default=2)
         parser.add_argument("--remask-trigger", type=float, default=1.0,
@@ -252,7 +259,9 @@ class Ours(Defender):
         response_detector = torch.load(args.response_detector, map_location="cpu",
                                        weights_only=False)
         return V3(**shared, response_detector=response_detector,
-                  recovery_steps=args.recovery_steps)
+                  recovery_steps=args.recovery_steps,
+                  recovery_rounds=args.recovery_rounds,
+                  audit_all_boundaries=args.audit_all_boundaries)
 
     def reset(self):
         self.gate_strength = 0.0
@@ -520,9 +529,12 @@ class V3(Ours):
 
     name = "v3"
 
-    def __init__(self, model, *, response_detector, recovery_steps=32, **kw):
+    def __init__(self, model, *, response_detector, recovery_steps=32,
+                 recovery_rounds=1, audit_all_boundaries=False, **kw):
         if recovery_steps <= 0:
             raise ValueError("recovery_steps must be positive")
+        if recovery_rounds <= 0:
+            raise ValueError("recovery_rounds must be positive")
         if response_detector is None:
             raise ValueError("--remask v3 requires a response detector "
                              "checkpoint (--response-detector)")
@@ -530,6 +542,8 @@ class V3(Ours):
         if missing:
             raise ValueError(f"response detector missing keys: {sorted(missing)}")
         self.recovery_steps = int(recovery_steps)
+        self.recovery_rounds = int(recovery_rounds)
+        self.audit_all_boundaries = bool(audit_all_boundaries)
         super().__init__(model, remask_enabled=True, **kw)
         if int(response_detector["layer"]) != self.gate_layer:
             raise ValueError("response detector layer must match the gate layer")
@@ -590,17 +604,16 @@ class V3(Ours):
                     prompt_length, temperature, remasking):
         positions = block_positions[0].nonzero().flatten()
         reading = self._audit(x, region, self._chunk_positions(positions))
-        trigger = (block_index == 0
+        trigger = ((self.audit_all_boundaries or block_index == 0)
                    and reading["response_probability"] >= self._det_threshold)
         self.boundary_audits.append({
             "boundary": block_index, **reading, "trigger": trigger,
-            "trigger_rule": "response_probability_cutoff_first_boundary"})
+            "trigger_rule": ("response_probability_cutoff_each_boundary"
+                             if self.audit_all_boundaries else
+                             "response_probability_cutoff_first_boundary")})
         if not trigger:
             return
         self.triggered = True
-
-        from llada import get_num_transfer_tokens
-        from sampler import commit_sample
 
         event = {"boundary": block_index,
                  "pre_audit": reading, "pre_recovery_token_ids": x[0].tolist(),
@@ -609,36 +622,50 @@ class V3(Ours):
         self.recovery_events.append(event)
 
         # Remask the finished block plus any committed answer slots inside the
-        # prompt (DIJA spans carry the payload under that attack).
+        # prompt (DIJA spans carry the payload under that attack). With
+        # recovery_rounds > 1 the block is re-audited after each regeneration
+        # and remasked again while it still reads as a response.
         span_slots = region[0] & (x[0] != self.mask_id)
         span_slots[prompt_length:] = False
         targets = block_positions[0] | span_slots
         positions = targets.nonzero().flatten()
-        old_tokens = x[0, positions].clone()
-        x[0, positions] = self.mask_id
+        from llada import get_num_transfer_tokens
+        from sampler import commit_sample
         counts = get_num_transfer_tokens(
             targets.unsqueeze(0), self.recovery_steps)[0].tolist()
-        eligible = positions
-        self.in_recovery = True
-        try:
-            for i in range(self.recovery_steps):
-                final = i == self.recovery_steps - 1
-                if eligible.numel() == 0:
-                    break
-                if counts[i] == 0 and not final:
-                    continue
-                logits = self.forward(x, region, schedule_scale=1.0).logits
-                eligible = commit_sample(x, logits, eligible, counts[i],
-                                         temperature, remasking, final=final)
-        finally:
-            self.in_recovery = False
-        event["rounds"].append({
-            "selected": positions.tolist(),
-            "num_span_positions": int(span_slots.sum()),
-            "old_token_ids": old_tokens.tolist(),
-            "new_token_ids": x[0, positions].tolist(),
-            "round_sampling_forwards": self.recovery_steps,
-            "post_trial_token_ids": x[0].tolist()})
+        for round_i in range(self.recovery_rounds):
+            old_tokens = x[0, positions].clone()
+            x[0, positions] = self.mask_id
+            eligible = positions
+            self.in_recovery = True
+            try:
+                for i in range(self.recovery_steps):
+                    final = i == self.recovery_steps - 1
+                    if eligible.numel() == 0:
+                        break
+                    if counts[i] == 0 and not final:
+                        continue
+                    logits = self.forward(x, region, schedule_scale=1.0).logits
+                    eligible = commit_sample(x, logits, eligible, counts[i],
+                                             temperature, remasking, final=final)
+            finally:
+                self.in_recovery = False
+            event["rounds"].append({
+                "round": round_i,
+                "selected": positions.tolist(),
+                "num_span_positions": int(span_slots.sum()),
+                "old_token_ids": old_tokens.tolist(),
+                "new_token_ids": x[0, positions].tolist(),
+                "round_sampling_forwards": self.recovery_steps,
+                "post_trial_token_ids": x[0].tolist()})
+            if round_i + 1 >= self.recovery_rounds:
+                break
+            post = self._audit(x, region, self._chunk_positions(positions))
+            self.boundary_audits.append({
+                "boundary": block_index, **post, "trigger": False,
+                "trigger_rule": "post_recovery_reaudit"})
+            if post["response_probability"] < self._det_threshold:
+                break
 
     def _remasked(self):
         return any(e["applied"] for e in self.recovery_events)
@@ -653,7 +680,9 @@ class V3(Ours):
 
     def describe(self):
         d = super().describe()
-        d.update(remask="v3", recovery_steps=self.recovery_steps)
+        d.update(remask="v3", recovery_steps=self.recovery_steps,
+                 recovery_rounds=self.recovery_rounds,
+                 audit_all_boundaries=self.audit_all_boundaries)
         return d
 
 
