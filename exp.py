@@ -60,13 +60,84 @@ def parse_args():
     p.add_argument("--reproduct", action="store_true",
                    help="Bitwise-deterministic generation: fixed seeds, deterministic "
                         "kernels, math SDPA backend. Slower but identical across GPUs.")
+    p.add_argument("--gpus", default=None,
+                   help="Comma-separated GPU ids (e.g. 0,1,2,3): shard the prompt "
+                        "set into contiguous --start/--n slices, run one exp.py "
+                        "subprocess per GPU, and merge the part JSONs into --out.")
     ATTACKERS[known.attack].add_args(p)
     DEFENDERS[known.defense].add_args(p)
     return p.parse_args()
 
 
+def _strip_flag(argv, name):
+    """Drop --name value and --name=value occurrences from argv."""
+    out, skip = [], False
+    for a in argv:
+        if skip:
+            skip = False
+        elif a == name:
+            skip = True
+        elif not a.startswith(name + "="):
+            out.append(a)
+    return out
+
+
+def run_sharded(args):
+    """Launcher path for --gpus: one exp.py subprocess per GPU, then merge.
+
+    Each child reruns this file with its own --start/--n/--out slice and
+    CUDA_VISIBLE_DEVICES set; per-prompt seeding (seed + row index) keeps
+    rows identical no matter how they are partitioned.
+    """
+    import json
+    import math
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    gpu_ids = [g.strip() for g in args.gpus.split(",") if g.strip()]
+    if not gpu_ids:
+        raise ValueError("--gpus needs at least one GPU id")
+    total = min(args.n, len(load_prompts(args.source)) - args.start)
+    if total <= 0:
+        raise ValueError(f"no prompts in range: --start {args.start} --n {args.n}")
+    per = math.ceil(total / len(gpu_ids))
+    out = Path(args.out)
+    argv = _strip_flag(sys.argv[1:], "--gpus")
+
+    procs, parts = [], []
+    for i, gpu in enumerate(gpu_ids):
+        n_i = min(per, total - i * per)
+        if n_i <= 0:
+            break
+        part = out.with_name(f"{out.stem}.part{i}{out.suffix}")
+        log = part.with_suffix(".log")
+        cmd = [sys.executable, str(Path(__file__).resolve()), *argv,
+               "--start", str(args.start + i * per), "--n", str(n_i),
+               "--out", str(part)]
+        env = {**os.environ, "CUDA_VISIBLE_DEVICES": gpu}
+        procs.append(subprocess.Popen(cmd, stdout=open(log, "w"),
+                                      stderr=subprocess.STDOUT, env=env))
+        parts.append(part)
+        print(f"part{i}: gpu={gpu} rows {args.start + i * per}..+{n_i} "
+              f"-> {part} (log {log})", flush=True)
+
+    rc = [p.wait() for p in procs]
+    if any(rc):
+        bad = ", ".join(f"part{i} rc={r}" for i, r in enumerate(rc) if r)
+        raise SystemExit(f"shards failed: {bad} -- see part logs")
+    results = sorted((r for p in parts for r in json.loads(p.read_text())["results"]),
+                     key=lambda r: r["index"])
+    payload = json.loads(parts[0].read_text())
+    write_json(out, {**payload, "results": results})
+    print(f"merged {len(results)} results from {len(parts)} parts -> {out}")
+
+
 def main():
     args = parse_args()
+    if args.gpus:
+        return run_sharded(args)
     attacker = ATTACKERS[args.attack].from_args(args)
     if args.reproduct:
         enable_reproducibility(args.seed)
@@ -91,6 +162,8 @@ def main():
     results = []
     t_start = time.time()
     for i, row in enumerate(rows):
+        # Per-prompt seed keeps generation identical under --start/--gpus sharding.
+        seed_all(args.seed + int(row["index"]))
         user_message = defender.transform_prompt(attacker.build_prompt(row))
         input_ids = encode_prompt(tokenizer, user_message, device)
         vanilla_ids = encode_prompt(tokenizer, defender.transform_prompt(row["prompt"]), device)
