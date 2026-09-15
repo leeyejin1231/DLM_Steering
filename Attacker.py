@@ -434,7 +434,7 @@ class PAIR(NoAttack):
 
     name = "pair"
 
-    def __init__(self, llm, judge, n_streams=3, n_iterations=3, keep_last_n=4,
+    def __init__(self, llm, judge, n_streams=5, n_iterations=5, keep_last_n=4,
                  max_n_attack_attempts=5, attack_max_tokens=500,
                  judge_max_tokens=10, target_str=None):
         self.llm, self.judge = llm, judge
@@ -451,10 +451,13 @@ class PAIR(NoAttack):
         parser.add_argument("--pair-device", default=None,
                             help="Device for the attacker/judge model "
                                  "(default: cuda:1 when visible, else cuda:0).")
-        parser.add_argument("--pair-streams", type=int, default=3,
+        parser.add_argument("--pair-streams", type=int, default=5,
                             help="Concurrent jailbreak conversations "
-                                 "(repo default 3; the paper used 30).")
-        parser.add_argument("--pair-iterations", type=int, default=3)
+                                 "(README-recommended 5; the paper used 20, "
+                                 "the code default is 3).")
+        parser.add_argument("--pair-iterations", type=int, default=5,
+                            help="Attacker refinement rounds "
+                                 "(README-recommended 5; code default 3).")
         parser.add_argument("--pair-keep-last-n", type=int, default=4,
                             help="User+assistant pairs kept per conversation.")
         parser.add_argument("--pair-max-attempts", type=int, default=5,
