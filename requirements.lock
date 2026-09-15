@@ -126,7 +126,7 @@ six==1.17.0
     # via python-dateutil
 sympy==1.14.0
     # via torch
-tokenizers==0.20.3
+tokenizers==0.21.4
     # via
     #   -r requirements.txt
     #   transformers
@@ -139,7 +139,7 @@ tqdm==4.70.1
     #   -r requirements.txt
     #   huggingface-hub
     #   transformers
-transformers==4.46.3
+transformers==4.55.4
     # via -r requirements.txt
 typing-extensions==4.16.0
     # via

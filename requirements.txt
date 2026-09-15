@@ -1,6 +1,6 @@
 torch==2.3.1
-transformers==4.46.3
-tokenizers==0.20.3
+transformers==4.55.4
+tokenizers==0.21.4
 huggingface-hub==0.36.2
 hf-xet==1.6.0
 accelerate
