@@ -34,7 +34,7 @@ def get_num_transfer_tokens(mask_index, steps):
         mask_num.size(0), steps, device=mask_index.device, dtype=torch.int64
     ) + base
     for i in range(mask_num.size(0)):
-        num_transfer_tokens[i, : remainder[i]] += 1
+        num_transfer_tokens[i, : int(remainder[i])] += 1
     return num_transfer_tokens
 
 

@@ -81,7 +81,8 @@ def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
         scope[:, block_end:] = False
         block_positions = scope.clone()
         block_positions[:, :block_start] = False
-        schedule_counts = get_num_transfer_tokens((x == MASK_ID) & scope, steps_per_block)
+        schedule_counts = get_num_transfer_tokens(
+            (x == MASK_ID) & scope, steps_per_block)[0].tolist()
 
         for i in range(steps_per_block):
             commit_count = None
@@ -91,9 +92,8 @@ def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
             if commit_count is not None:
                 # Reopened slots: spread everything still masked before block_end
                 # evenly over the remaining steps of this block.
-                schedule_counts = torch.cat(
-                    [schedule_counts[:, :i],
-                     get_num_transfer_tokens((x == MASK_ID) & scope, steps_per_block - i)], dim=1)
+                schedule_counts = schedule_counts[:i] + get_num_transfer_tokens(
+                    (x == MASK_ID) & scope, steps_per_block - i)[0].tolist()
             mask_index = x == MASK_ID
             eligible = (mask_index & scope)[0].nonzero().flatten()
             if eligible.numel() == 0:
@@ -105,7 +105,7 @@ def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
                 logits = defender.forward(
                     x, region, schedule_scale=step_scale(schedule, i, steps_per_block)).logits
 
-            commit_sample(x, logits, eligible, int(schedule_counts[0, i]),
+            commit_sample(x, logits, eligible, schedule_counts[i],
                           temperature, remasking, final=(i == steps_per_block - 1))
 
         if defender is not None:

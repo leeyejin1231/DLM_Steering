@@ -284,10 +284,11 @@ class Ours(Defender):
         return self.steer_mode != "triggered" or self.triggered
 
     # ----------------------------------------------------------------- checks
-    def _validate(self, x, region):
+    def _validate(self, x, region, region_count=None):
+        nonempty = region.any() if region_count is None else region_count
         if (x.ndim != 2 or x.shape[0] != 1 or x.dtype != torch.long
                 or region.shape != x.shape or region.dtype != torch.bool
-                or region.device != x.device or not region.any()):
+                or region.device != x.device or not nonempty):
             raise ValueError("expected long x and nonempty bool region shaped [1, seq]")
 
     def _projection(self, hidden, pool):
@@ -338,14 +339,17 @@ class Ours(Defender):
     @torch.no_grad()
     def forward(self, x, region, *, schedule_scale=1.0):
         """One model forward with in-forward detection and steering."""
-        self._validate(x, region)
         masks = (x == self.mask_id) & region
         committed = region & ~masks
-        source = "generated" if committed.any() else "masked"
-        pool = committed[0] if committed.any() else masks[0]
+        # One host sync feeds validate + branch checks + the trace count.
+        n_region, n_masks, n_committed = torch.stack(
+            [region.sum(), masks.sum(), committed.sum()]).tolist()
+        self._validate(x, region, n_region)
+        source = "generated" if n_committed else "masked"
+        pool = committed[0] if n_committed else masks[0]
         self._schedule_scale = float(schedule_scale)
         read_gate = self.monitoring and (not self.gate_once or self.step == 0)
-        steer = (self.steer_enabled and self.monitoring and masks.any()
+        steer = (self.steer_enabled and self.monitoring and n_masks
                  and self._steer_armed() and (read_gate or self.gate_strength > 0.0))
         self._pending = {"pool": pool, "fired": False, "projection": None, "effective_alpha": 0.0}
         handles = []
@@ -365,7 +369,7 @@ class Ours(Defender):
             "step": self.step, "projection": self._pending["projection"],
             "strength": self.gate_strength, "schedule_scale": self._schedule_scale,
             "effective_alpha": self._pending["effective_alpha"], "source": source,
-            "num_generated_tokens": int(committed.sum()),
+            "num_generated_tokens": n_committed,
             "phase": "block_recovery" if self.in_recovery else "base",
             "steer_armed": bool(steer),
         })
