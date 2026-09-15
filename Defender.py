@@ -143,7 +143,7 @@ class Ours(Defender):
 
     def __init__(self, model, *, gate_layer, gate_vector, threshold, width=1.0,
                  sites, strength=1.0, transform="additive", steer="adaptive",
-                 remask_enabled=False, initial_only=False, mask_id=MASK_ID):
+                 remask_enabled=False, mask_id=MASK_ID):
         """sites: sequence of (layer 1-based, refusal vector [hidden], ref_norm)."""
         if model.training:
             raise ValueError("call model.eval() before constructing the policy")
@@ -187,7 +187,6 @@ class Ours(Defender):
         self.gate_vector = gate_vector.float()
         self.threshold, self.width = float(threshold), float(width)
         self.strength, self.transform = float(strength), transform
-        self.initial_only = initial_only
         self.mask_id = mask_id
         self.reset()
 
@@ -229,8 +228,6 @@ class Ours(Defender):
         parser.add_argument("--max-parallel-commit", type=int, default=2)
         parser.add_argument("--remask-trigger", type=float, default=1.0,
                             help="Gate strength needed to attempt the v2 one-shot repair.")
-        parser.add_argument("--initial-only", action="store_true",
-                            help="Stop monitoring for the whole response if the step-0 gate is closed.")
 
     @classmethod
     def from_args(cls, args, model):
@@ -246,7 +243,7 @@ class Ours(Defender):
         shared = dict(model=model, gate_layer=det_layer, gate_vector=det_vec,
                       threshold=threshold, width=args.gate_width, sites=sites,
                       strength=args.alpha, transform=args.transform,
-                      steer=args.steer, initial_only=args.initial_only)
+                      steer=args.steer)
         if args.remask in ("none", "v2"):
             return V2(**shared, remask=args.remask == "v2",
                       max_remask_tokens=args.max_remask_tokens,
@@ -358,8 +355,6 @@ class Ours(Defender):
             "phase": "block_recovery" if self.in_recovery else "base",
             "steer_armed": bool(steer),
         })
-        if self.step == 0 and self.initial_only and self.gate_strength == 0.0:
-            self.monitoring = False
         self._pending = None
         self.step += 1
         return output
@@ -385,7 +380,7 @@ class Ours(Defender):
         return {"defense": self.name, "steer": self.steer_mode,
                 "transform": self.transform, "strength": self.strength,
                 "threshold": self.threshold, "width": self.width,
-                "layers": self.steer_layers, "initial_only": self.initial_only}
+                "layers": self.steer_layers}
 
 
 class V2(Ours):
