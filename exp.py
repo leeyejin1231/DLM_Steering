@@ -7,15 +7,26 @@ Attack/defense-specific flags are registered by the selected class.
 Usage:
     CUDA_VISIBLE_DEVICES=1 python exp.py --attack dija --defense ours \
         --source jbb_harmful --n 100 --out outputs/dija_ours.json
+
+    # utility / generalisation: graded sets, scored by eval_utility.py
+    CUDA_VISIBLE_DEVICES=1 python exp.py --attack none --defense ours --remask v3 \
+        --source mmlu --n 500 --out outputs/MMLU-none-v3-42.json
+    python eval_utility.py --in outputs/MMLU-none-v3-42.json --out outputs/MMLU-none-v3-42_acc.json
+
+    # over-refusal: benign prompts under the same defense, then judge refusals
+    CUDA_VISIBLE_DEVICES=1 python exp.py --attack none --defense ours --remask v3 \
+        --source truthfulqa --n 200 --out outputs/TQA-none-v3-42.json
+    python steering/judge_refusal.py --in outputs/TQA-none-v3-42.json \
+        --out outputs/TQA-none-v3-42_judged.json
 """
 
 import argparse
 import time
 
 from Attacker import ATTACKERS
-from common import (MODEL_NAME, MASK_ID, encode_prompt, enable_reproducibility,
-                    force_math_attention, load_llada, load_prompts, seed_all,
-                    write_json)
+from common import (MODEL_NAME, MASK_ID, PROMPT_SOURCES, encode_prompt,
+                    enable_reproducibility, force_math_attention, load_llada,
+                    load_prompts, seed_all, write_json)
 from Defender import DEFENDERS
 
 
@@ -28,8 +39,10 @@ def parse_args():
     known, _ = pre.parse_known_args()
 
     p = argparse.ArgumentParser(parents=[pre])
-    p.add_argument("--source", choices=["jbb_harmful", "advbench", "harmbench"],
-                   default="jbb_harmful")
+    p.add_argument("--source", choices=list(PROMPT_SOURCES), default="jbb_harmful",
+                   help="harmful: jbb_harmful, advbench, harmbench, xstest_unsafe; "
+                        "benign (over-refusal): truthfulqa, xstest_safe, jbb_benign, wj_benign; "
+                        "utility (accuracy via eval_utility.py): mmlu, gsm8k, truthfulqa_mc")
     p.add_argument("--out", default="outputs/exp.json")
     p.add_argument("--n", type=int, default=20)
     p.add_argument("--start", type=int, default=0)
@@ -87,7 +100,9 @@ def main():
         elapsed = time.time() - t0
 
         generation, extra = attacker.decode(tokenizer, out, input_ids)
-        results.append({"index": row["index"], "prompt": row["prompt"],
+        # Graded sources carry their answer key through to eval_utility.py.
+        graded = {k: row[k] for k in ("task", "answer", "subject", "category") if k in row}
+        results.append({"index": row["index"], "prompt": row["prompt"], **graded,
                         "attack_prompt": user_message, "generation": generation,
                         **extra, "num_prompt_tokens": int(input_ids.shape[1]),
                         "num_prompt_masks": int((input_ids == MASK_ID).sum()),

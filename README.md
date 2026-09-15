@@ -20,6 +20,13 @@ python data_downloader.py   # data/에 jbb_harmful.csv, advbench.parquet, harmbe
 
 ! 추가로, ./outputs/ 폴더에 steer_detector.pt, steer_vector.pt가 있어야하고, 만약 v3로 defense를 하려는 경우에는 response_detector.pt도 있어야 한다.
 
+DIJA 공격을 위해서는 아래의 레포지토리가 필요하다.
+
+```bash
+cd DLM_Steering_Remasking
+git clone https://github.com/ZichenWen1/DIJA.git
+```
+
 ## 실험 실행
 
 모든 실험은 `exp.py`로 실행 - `--attack`과 `--defense`를 고르면 선택한 공격 및 방어에 맞는 인자값을 넣어야 함.
@@ -62,7 +69,7 @@ python exp.py --attack dija --defense ours --remask v3 --source jbb_harmful --n 
 |---|---|
 | `--attack` | `none`, `prefix`, `dija`, `pap`(미구현), `pair`(미구현) |
 | `--defense` | `none`, `ours`, `proposed`, `selfreminder`(미구현), `diffuguard`(미구현) |
-| `--source` | `jbb_harmful`, `advbench`, `harmbench` |
+| `--source` | 유해: `jbb_harmful`, `advbench`, `harmbench`, `xstest_unsafe` / 무해(over-refusal): `truthfulqa`, `xstest_safe`, `jbb_benign`, `wj_benign` / 일반화(accuracy): `mmlu`, `gsm8k`, `truthfulqa_mc` |
 | 공통 | `--n`, `--start`, `--steps`, `--gen-length`, `--block-length`, `--temperature`, `--remasking`, `--schedule {const,linear,cosine}`, `--reproduct` |
 
 `--gen-length` 기본값은 128 dija는 0
@@ -92,6 +99,49 @@ python exp.py --defense ours \
   - `v3`: 블록 경계마다 로지스틱 회귀 응답 검출기(`--response-detector`, 기본 `outputs/response_detector.pt`)가 커밋된 토큰을 채점하고, 첫 경계에서 트리거되면 해당 블록 + 프롬프트 안의 채워진 스팬(DIJA)을 전부 remask한 뒤 `--recovery-steps`(기본 32)만큼 재생성
 - `--alpha`, `--transform {additive,project}`, `--gate-threshold`, `--gate-width`, `--remask-trigger`, `--initial-only` 등은 사용성 개편할 계획.
 
+
+### Over-refusal
+
+무해 세트에 방어를 걸어 생성한 뒤 `judge_refusal.py`로 거절률을 잰다. 무해 세트는 target이 없으므로 `--attack none`으로 돌린다.
+
+```bash
+python exp.py --attack none --defense none --source truthfulqa --n 200 --out outputs/TQA-none-none-42.json
+python exp.py --attack none --defense ours --remask v3 --source truthfulqa --n 200 --out outputs/TQA-none-v3-42.json
+python steering/judge_refusal.py --in outputs/TQA-none-v3-42.json --out outputs/TQA-none-v3-42_judged.json
+
+# XSTest: safe 250개는 over-refusal, unsafe 200개는 대조용 정상 거절률
+python exp.py --attack none --defense ours --remask v3 --source xstest_safe --n 250 --out outputs/XSTest-safe-none-v3-42.json
+python exp.py --attack none --defense ours --remask v3 --source xstest_unsafe --n 200 --out outputs/XSTest-unsafe-none-v3-42.json
+python steering/judge_refusal.py --in outputs/XSTest-safe-none-v3-42.json --out outputs/XSTest-safe-none-v3-42_judged.json
+```
+
+### 일반화 성능 (utility)
+
+방어를 걸었을 때 일반 능력이 얼마나 깎이는지 정확도로 잰다. 프롬프트에 정답 키(`answer`, `task`)가 같이 실려
+결과 JSON에 남고, `eval_utility.py`가 생성문에서 답을 뽑아 채점한다. 방어 없는 baseline(`--defense none`)과 같은
+`--n`으로 돌려 비교한다.
+
+| source | n | 형식 | 정답 |
+|---|---|---|---|
+| `mmlu` | 14042 (57과목 test, seed 0 고정 셔플이라 `--n`이 과목 혼합 샘플) | 4지선다, 문자로 답 | A~D |
+| `gsm8k` | 1319 (test) | 단계별 풀이 후 `#### <숫자>` | 숫자 |
+| `truthfulqa_mc` | 817 | MC1 방식: 최선 답 + 오답들을 항목별 셔플 | 문자 |
+
+gsm8k는 풀이가 길어 `--gen-length 256`을 권장한다. 답을 못 뽑은 생성(거절 등)은 오답으로 세고 `unparsed`로 따로 센다.
+
+```bash
+python exp.py --attack none --defense none --source mmlu --n 500 --out outputs/MMLU-none-none-42.json
+python exp.py --attack none --defense ours --remask v3 --source mmlu --n 500 --out outputs/MMLU-none-v3-42.json
+python eval_utility.py --in outputs/MMLU-none-v3-42.json --out outputs/MMLU-none-v3-42_acc.json
+
+python exp.py --attack none --defense ours --remask v3 --source gsm8k --n 300 --gen-length 256 --out outputs/GSM8K-none-v3-42.json
+python eval_utility.py --in outputs/GSM8K-none-v3-42.json --out outputs/GSM8K-none-v3-42_acc.json
+
+python exp.py --attack none --defense ours --remask v3 --source truthfulqa_mc --n 817 --out outputs/TQAmc-none-v3-42.json
+python eval_utility.py --in outputs/TQAmc-none-v3-42.json --out outputs/TQAmc-none-v3-42_acc.json
+```
+
+
 ## 평가
 
 | 스크립트 | 평가자 | 용도 |
@@ -99,12 +149,14 @@ python exp.py --defense ours \
 | `eval_llamaguard.py` | Llama-Guard-4-12B (GPU) | safe/unsafe 판정 → ASR |
 | `run_sr_eval.py` | gpt-oss:20b (ollama) | StrongREJECT 루브릭 → ASR |
 | `steering/judge_refusal.py` | gpt-oss:20b (ollama) | XSTest 3-way → over-refusal |
+| `eval_utility.py` | 규칙 기반 (GPU 불필요) | mmlu/gsm8k/truthfulqa_mc 정답 추출 → accuracy |
 
 ```bash
 python eval_llamaguard.py --in outputs/dija_ours.json --out outputs/dija_ours_lg4.json
 python run_sr_eval.py --in outputs/dija_ours.json --out outputs/dija_ours_sr.json --port 50001 --gpu 0
 python steering/judge_refusal.py --in outputs/base.json --out outputs/base_judged.json
 ```
+
 
 ## 벡터/디텍터 (`steering/`)
 
