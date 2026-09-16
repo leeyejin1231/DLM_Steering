@@ -12,8 +12,11 @@ JUDGE_GPU=${JUDGE_GPU:-1}
 N=${N:-817}
 STEER=${STEER:-adaptive}          # adaptive | triggered | none
 TAG=${TAG:-v3}                    # output name: outputs/TQA-none-${TAG}-42.json
-OUT=outputs/TQA-none-${TAG}-42.json
-COMMON=(--attack none --defense ours --remask v3 --steer "$STEER" --source truthfulqa
+MODEL=${MODEL:-llada}                 # llada | dream (artifacts under outputs/<model>/)
+MODEL_ARGS=""; OUT_DIR=outputs
+if [ "$MODEL" != llada ]; then MODEL_ARGS="--model $MODEL"; OUT_DIR=outputs/$MODEL; mkdir -p "$OUT_DIR"; fi
+OUT=$OUT_DIR/TQA-none-${TAG}-42.json
+COMMON=($MODEL_ARGS --attack none --defense ours --remask v3 --steer "$STEER" --source truthfulqa
         --temperature 0.0 --gen-length 128 --steps 128 --block-length 32)
 
 k=${#GPUS[@]}

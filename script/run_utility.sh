@@ -16,8 +16,11 @@ case "$SOURCE" in
     truthfulqa_mc) PREFIX=TQAmc ;; mmlu) PREFIX=MMLU ;; gsm8k) PREFIX=GSM8K ;;
     *) echo "unknown SOURCE=$SOURCE"; exit 1 ;;
 esac
-OUT=outputs/${PREFIX}-none-${TAG}-42.json
-CUDA_VISIBLE_DEVICES=$GPU python exp.py --attack none $DEFENSE_ARGS --source "$SOURCE" --n "$N" \
+MODEL=${MODEL:-llada}                 # llada | dream (artifacts under outputs/<model>/)
+MODEL_ARGS=""; OUT_DIR=outputs
+if [ "$MODEL" != llada ]; then MODEL_ARGS="--model $MODEL"; OUT_DIR=outputs/$MODEL; mkdir -p "$OUT_DIR"; fi
+OUT=$OUT_DIR/${PREFIX}-none-${TAG}-42.json
+CUDA_VISIBLE_DEVICES=$GPU python exp.py $MODEL_ARGS --attack none $DEFENSE_ARGS --source "$SOURCE" --n "$N" \
     --temperature 0.0 --gen-length "$GEN_LENGTH" --out "$OUT"
 python eval_utility.py --in "$OUT" --out "${OUT%.json}_acc.json"
 echo "DONE $OUT"

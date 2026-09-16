@@ -27,14 +27,16 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from common import (  # noqa: E402
-    MODEL_NAME, auroc, load_detector_bundle, load_eval_prompts, load_llada)
+    MODEL_NAME, OUT_DIR, add_model_arg, auroc, load_detector_bundle,
+    load_eval_prompts, load_model)
 from steering.fit_detector import collect  # noqa: E402
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--detector", default=str(ROOT / "outputs/steer_detector.pt"))
-    ap.add_argument("--out", default=str(ROOT / "outputs/detector_controlled.json"))
+    add_model_arg(ap)
+    ap.add_argument("--detector", default=str(ROOT / OUT_DIR / "steer_detector.pt"))
+    ap.add_argument("--out", default=str(ROOT / OUT_DIR / "detector_controlled.json"))
     ap.add_argument("--n", type=int, default=50)
     args = ap.parse_args()
 
@@ -42,7 +44,7 @@ def main():
     b = load_detector_bundle(args.detector)
     v, layers, gen_length = b["vector"], b["layers"], b["gen_length"]
 
-    tokenizer, model = load_llada(device)
+    tokenizer, model = load_model(device)
 
     sets = {}
     for name in ("xstest_safe", "xstest_unsafe", "jbb_benign", "jbb_harmful"):

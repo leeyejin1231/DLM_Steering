@@ -12,6 +12,7 @@ WildJailbreak roleplay benign prompts and transfers poorly to short questions.
 
 Usage:
     CUDA_VISIBLE_DEVICES=1 python steering/pick_threshold.py --layer 18
+    CUDA_VISIBLE_DEVICES=1 python steering/pick_threshold.py --model dream  # bundle best_layer
 """
 
 import argparse
@@ -24,23 +25,29 @@ import torch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from common import MODEL_NAME, load_detector_bundle, load_llada  # noqa: E402
+from common import (DETECTOR_LAYER, MODEL_NAME, OUT_DIR, add_model_arg,  # noqa: E402
+                    load_detector_bundle, load_model)
 from steering.fit_detector import collect  # noqa: E402
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--detector", default=str(ROOT / "outputs/steer_detector.pt"))
+    add_model_arg(ap)
+    ap.add_argument("--detector", default=str(ROOT / OUT_DIR / "steer_detector.pt"))
     ap.add_argument("--pairs", default=str(ROOT / "data/steer_pairs.json"))
-    ap.add_argument("--layer", type=int, default=18)
+    ap.add_argument("--layer", type=int, default=DETECTOR_LAYER,
+                    help="Gate layer; default 18 for llada, else the bundle's best_layer.")
     ap.add_argument("--percentile", type=float, default=15.0,
                     help="Gate opens for (100-p)%% of fit-split harmful prompts.")
-    ap.add_argument("--out", default=str(ROOT / "outputs/gate_threshold.json"))
+    ap.add_argument("--out", default=str(ROOT / OUT_DIR / "gate_threshold.json"))
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     b = load_detector_bundle(args.detector)
     layers, gen_length = b["layers"], b["gen_length"]
+    if args.layer is None:
+        args.layer = int(b["best_layer"])
+        print(f"--layer not given: using the detector bundle's best_layer {args.layer}")
     li = layers.index(args.layer)
     v = b["vector"][li]
 
@@ -48,7 +55,7 @@ def main():
              if p["split"] == "fit"]
     print(f"fit pairs: {len(pairs)}")
 
-    tokenizer, model = load_llada(device)
+    tokenizer, model = load_model(device)
 
     H = collect(model, tokenizer, [p["adv_harmful"] for p in pairs],
                 gen_length, layers, device, "harm")

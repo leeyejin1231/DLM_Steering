@@ -27,6 +27,8 @@ group lists are stored in the checkpoint like the reference file.
 Usage:
     CUDA_VISIBLE_DEVICES=1,2 python steering/fit_response_detector.py \
         --groups 384 --guard-device cuda:2
+    CUDA_VISIBLE_DEVICES=0,1 python steering/fit_response_detector.py --model dream \
+        --guard-device cuda:1          # layer = outputs/dream detector best_layer
 """
 
 import argparse
@@ -41,8 +43,9 @@ import torch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from common import (MODEL_NAME, MASK_ID, auroc, encode_prompt, load_llada,  # noqa: E402
-                    prompt_token_ids)
+from common import (DETECTOR_LAYER, MODEL_NAME, MASK_ID, OUT_DIR,  # noqa: E402
+                    add_model_arg, auroc, encode_prompt, load_detector_bundle,
+                    load_model, prompt_token_ids)
 
 
 @torch.no_grad()
@@ -97,10 +100,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", default=str(ROOT / "data/llada8b_wild_unsafe_only.csv"),
                     help="WildJailbreak prompt source (only the prompts are used)")
-    ap.add_argument("--out", default=str(ROOT / "outputs/response_detector.pt"))
-    ap.add_argument("--report", default=str(ROOT / "outputs/response_detector_report.json"))
+    add_model_arg(ap)
+    ap.add_argument("--out", default=str(ROOT / OUT_DIR / "response_detector.pt"))
+    ap.add_argument("--report", default=str(ROOT / OUT_DIR / "response_detector_report.json"))
     ap.add_argument("--groups", type=int, default=384)
-    ap.add_argument("--layer", type=int, default=18)
+    ap.add_argument("--layer", type=int, default=DETECTOR_LAYER,
+                    help="Must equal the gate layer V3 runs with. Default 18 for "
+                         "llada, else the --detector bundle's best_layer.")
+    ap.add_argument("--detector", default=str(ROOT / OUT_DIR / "steer_detector.pt"),
+                    help="Prompt-side detector bundle; only read to resolve --layer.")
     ap.add_argument("--C", type=float, default=0.01)
     ap.add_argument("--threshold", type=float, default=0.5,
                     help="probability cutoff V3 triggers on")
@@ -115,6 +123,9 @@ def main():
     ap.add_argument("--guard-device", default="cuda:1")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
+    if args.layer is None:
+        args.layer = int(load_detector_bundle(args.detector)["best_layer"])
+        print(f"--layer not given: using {args.detector} best_layer {args.layer}")
 
     df = pd.read_csv(args.csv)
     rng = np.random.default_rng(args.seed)
@@ -128,7 +139,7 @@ def main():
         gen_length = 0 if args.attack == "dija" else 128
 
     print(f"loading {MODEL_NAME} ...")
-    tokenizer, model = load_llada(args.device)
+    tokenizer, model = load_model(args.device)
 
     feats, texts, groups = [], [], []
     for k, (gi, r) in enumerate(rows.iterrows()):

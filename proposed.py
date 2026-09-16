@@ -8,7 +8,9 @@ Contract:
     state: torch.long [1, sequence], modified in place only by before_step.
     region: torch.bool with the same shape/device; the ORIGINAL answer slots.
     Model blocks return hidden [1, sequence, hidden_size], optionally as the
-    first item of a tuple. model(state) must call the supplied blocks.
+    first item of a tuple. model(state) must call the supplied blocks. Blocks
+    are found at model.blocks, model.model.transformer.blocks (LLaDA) or
+    model.model.layers (Dream); pass mask_id for models other than LLaDA.
     Gate vectors point toward risk. Steering vectors point toward REFUSAL.
     A steering vector is [hidden_size], or [4, hidden_size] for mask ratios
     (0.3, 0.5, 0.7, 0.9)..
@@ -32,6 +34,18 @@ import math
 import torch
 
 __all__ = ['Defense', 'Proposed']
+
+
+def _blocks(model):
+    """Transformer block list of a LLaDA or Dream model (or a wrapper exposing .blocks)."""
+    if hasattr(model, 'blocks'):
+        return model.blocks
+    inner = getattr(model, 'model', None)
+    if hasattr(inner, 'transformer'):
+        return inner.transformer.blocks
+    if hasattr(inner, 'layers'):
+        return inner.layers
+    raise AttributeError('cannot locate transformer blocks on the model')
 
 
 class Defense(ABC):
@@ -101,7 +115,7 @@ class Proposed(Defense):
         directions_by_ratio [4, layers, hidden] enable conditioned steering.
         Use torch.load(path, weights_only=True) to load these dictionaries.
         """
-        blocks = model.model.transformer.blocks
+        blocks = _blocks(model)
         indices = [list(csd['layers']).index(layer) for layer in layers]
         if 'directions_by_ratio' in csd:
             if tuple(csd['mask_ratios']) != (0.3, 0.5, 0.7, 0.9):

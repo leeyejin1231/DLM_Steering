@@ -16,6 +16,7 @@ direction fitted at layer L is applied by hooking blocks[L-1] (see llada_steerin
 
 Usage:
     CUDA_VISIBLE_DEVICES=1 python steering/fit_vector.py
+    CUDA_VISIBLE_DEVICES=1 python steering/fit_vector.py --model dream   # -> outputs/dream/
 """
 
 import argparse
@@ -29,7 +30,8 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from common import (  # noqa: E402
-    MODEL_NAME, MASK_ID, auroc, load_llada, prompt_token_ids)
+    MODEL_NAME, MASK_ID, N_LAYERS, OUT_DIR, add_model_arg, auroc, load_model,
+    prompt_token_ids)
 
 
 @torch.no_grad()
@@ -75,8 +77,9 @@ def collect(model, tokenizer, pairs, t_list, max_resp, layers, seed, device):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pairs", default=str(ROOT / "data/steer_pairs.json"))
-    ap.add_argument("--out", default=str(ROOT / "outputs/steer_vector.pt"))
-    ap.add_argument("--report", default=str(ROOT / "outputs/steer_vector_report.json"))
+    add_model_arg(ap)
+    ap.add_argument("--out", default=str(ROOT / OUT_DIR / "steer_vector.pt"))
+    ap.add_argument("--report", default=str(ROOT / OUT_DIR / "steer_vector_report.json"))
     ap.add_argument("--max-pairs", type=int, default=0, help="0 = all fit pairs.")
     ap.add_argument("--max-resp", type=int, default=192, help="Max response tokens.")
     ap.add_argument("--t-list", default="0.3,0.5,0.7,0.9")
@@ -85,7 +88,8 @@ def main():
     args = ap.parse_args()
 
     t_list = [float(t) for t in args.t_list.split(",")]
-    layers = list(range(1, 32))  # hidden_states[1..31] == blocks[0..30] outputs
+    # hidden_states[1..N-1] == blocks[0..N-2] outputs; hidden_states[N] is post-norm.
+    layers = list(range(1, N_LAYERS))
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     meta = json.loads(Path(args.pairs).read_text())
@@ -95,9 +99,9 @@ def main():
     print(f"fit pairs: {len(pairs)} (held-out eval pairs excluded)")
 
     print(f"loading {MODEL_NAME} on {device} ...")
-    tokenizer, model = load_llada(device)
+    tokenizer, model = load_model(device)
 
-    print(f"collecting activations at t={t_list}, layers 1..31 ...")
+    print(f"collecting activations at t={t_list}, layers 1..{N_LAYERS - 1} ...")
     acts, kept = collect(model, tokenizer, pairs, t_list, args.max_resp,
                          layers, args.seed, device)
     n = len(kept)

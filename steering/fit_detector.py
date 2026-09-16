@@ -24,6 +24,7 @@ built on it will stay open and over-refusal will not improve.
 
 Usage:
     CUDA_VISIBLE_DEVICES=1 python steering/fit_detector.py
+    CUDA_VISIBLE_DEVICES=1 python steering/fit_detector.py --model dream   # -> outputs/dream/
 """
 
 import argparse
@@ -38,8 +39,8 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from common import (  # noqa: E402
-    MODEL_NAME, MASK_ID, auroc, load_eval_prompts, load_llada,
-    prompt_token_ids)
+    MODEL_NAME, MASK_ID, N_LAYERS, OUT_DIR, add_model_arg, auroc,
+    load_eval_prompts, load_model, prompt_token_ids)
 
 
 @torch.no_grad()
@@ -66,8 +67,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pairs", default=str(ROOT / "data/steer_pairs.json"))
     ap.add_argument("--csv", default=str(ROOT / "data/llada8b_wild_unsafe_only.csv"))
-    ap.add_argument("--out", default=str(ROOT / "outputs/steer_detector.pt"))
-    ap.add_argument("--report", default=str(ROOT / "outputs/steer_detector_report.json"))
+    add_model_arg(ap)
+    ap.add_argument("--out", default=str(ROOT / OUT_DIR / "steer_detector.pt"))
+    ap.add_argument("--report", default=str(ROOT / OUT_DIR / "steer_detector_report.json"))
     ap.add_argument("--gen-length", type=int, default=128)
     ap.add_argument("--max-pairs", type=int, default=0)
     ap.add_argument("--n-eval", type=int, default=30)
@@ -75,7 +77,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
-    layers = list(range(1, 32))
+    layers = list(range(1, N_LAYERS))
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     meta = json.loads(Path(args.pairs).read_text())
@@ -85,7 +87,7 @@ def main():
     print(f"fit pairs: {len(pairs)}")
 
     print(f"loading {MODEL_NAME} ...")
-    tokenizer, model = load_llada(device)
+    tokenizer, model = load_model(device)
 
     H = collect(model, tokenizer, [p["adv_harmful"] for p in pairs],
                 args.gen_length, layers, device, "harmful")

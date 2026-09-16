@@ -17,9 +17,10 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import NamedTuple
 
-from common import EOT_ID, MASK_ID, NEWLINE_ID
+from common import EOT_ID, MASK_ID, MASK_TOKEN, NEWLINE_ID
 
-MASK_TOKEN = "<|mdm_mask|>"
+# MASK_TOKEN is the selected model's mask text (<|mdm_mask|> for LLaDA,
+# <|mask|> for Dream); DIJA prompts are model-agnostic apart from it.
 DIJA_MASK_PATTERN = re.compile(r"<mask:(\d+)>")
 
 # DIJA refined prompt files (Wen et al. 2025), keyed by exp.py --source.
@@ -127,7 +128,7 @@ class DIJA(NoAttack):
 
     Reproduces DIJA/run_*/models/*_llada.py: the Qwen-refined prompt for the
     row (looked up by vanilla prompt text in DIJA/run_<bench>/refine_prompt)
-    has its <mask:N> spans expanded to N <|mdm_mask|> tokens inside the user
+    has its <mask:N> spans expanded to N mask tokens inside the user
     turn; nothing is appended after the turn (gen_length 0) and, with
     --dija-steps auto, one mask is committed per step at temperature 0.2,
     exactly as the original generate_llada loop does. The graded response
@@ -203,7 +204,7 @@ class DIJATemplate(NoAttack):
     """Synthetic DIJA-style template (the earlier in-house variant).
 
     The goal, a "Sure, here is ..." target line, and `steps` lines of
-    "Step k:" followed by `span` <|mdm_mask|> tokens, all inside the user
+    "Step k:" followed by `span` mask tokens, all inside the user
     turn. Kept for the outputs produced before the paper's refined prompts
     were wired in; use --attack dija for the faithful reproduction.
     """

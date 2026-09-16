@@ -10,6 +10,11 @@ Usage:
     CUDA_VISIBLE_DEVICES=1 python exp.py --attack dija --defense ours \
         --source jbb_harmful --n 100 --out outputs/dija_ours.json
 
+    # Same method on Dream-v0-Instruct-7B: --model picks the target (vectors
+    # and detectors default to outputs/dream/, see script/build_vectors.sh).
+    CUDA_VISIBLE_DEVICES=1 python exp.py --model dream --attack dija --defense ours \
+        --remask v3 --source jbb_harmful --n 100 --out outputs/dream/JBB-dija-v3-42.json
+
     # utility / generalisation: graded sets, scored by eval_utility.py
     CUDA_VISIBLE_DEVICES=1 python exp.py --attack none --defense ours --remask v3 \
         --source mmlu --n 500 --out outputs/MMLU-none-v3-42.json
@@ -26,10 +31,10 @@ import argparse
 import time
 
 from Attacker import ATTACKERS
-from common import (MODEL_NAME, MASK_ID, PROMPT_SOURCES, encode_prompt,
-                    enable_reproducibility, force_math_attention, load_llada,
-                    load_prompts, parse_gpu_ids, run_eval_shards, seed_all,
-                    write_json)
+from common import (MODEL_NAME, MASK_ID, PROMPT_SOURCES, add_model_arg,
+                    encode_prompt, enable_reproducibility, force_math_attention,
+                    load_model, load_prompts, parse_gpu_ids, run_eval_shards,
+                    seed_all, write_json)
 from Defender import DEFENDERS
 
 
@@ -42,6 +47,7 @@ def parse_args():
     known, _ = pre.parse_known_args()
 
     p = argparse.ArgumentParser(parents=[pre])
+    add_model_arg(p)   # already applied at import time; validated/recorded here
     p.add_argument("--source", choices=list(PROMPT_SOURCES), default="jbb_harmful",
                    help="harmful: jbb_harmful, advbench, harmbench, strongreject, xstest_unsafe; "
                         "benign (over-refusal): truthfulqa, xstest_safe, jbb_benign, wj_benign; "
@@ -108,7 +114,7 @@ def main():
         seed_all(args.seed)
 
     print(f"loading {MODEL_NAME} ...")
-    tokenizer, model = load_llada()
+    tokenizer, model = load_model()
     if args.reproduct:
         force_math_attention()
     device = next(model.parameters()).device

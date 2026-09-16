@@ -1,7 +1,9 @@
 """Shared constants, model loading and IO helpers for the steering experiments.
 
-MODEL_NAME and MASK_ID stay canonically in llada.py (the reference sampler);
-everything else shared lives here.
+The target model (LLaDA-8B-Instruct or Dream-v0-Instruct-7B) is selected by
+models.py from --model / DLM_MODEL before this module binds MODEL_NAME,
+MASK_ID, MASK_TOKEN and EOT_ID; everything downstream imports those by value.
+llada.py keeps its own LLaDA constants as the reference sampler.
 """
 
 import glob
@@ -12,10 +14,17 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from llada import MODEL_NAME, MASK_ID  # noqa: F401  (re-exported)
+from models import MODEL, MODEL_KEY, add_model_arg  # noqa: F401  (re-exported)
 
-EOT_ID = 126348   # <|eot_id|>, closes the user turn in LLaDA's chat template
-NEWLINE_ID = 198  # '\n'; used to locate the DIJA template inside the prompt
+MODEL_NAME = MODEL["name"]
+MASK_ID = MODEL["mask_id"]
+MASK_TOKEN = MODEL["mask_token"]     # text form, expanded into DIJA prompts
+EOT_ID = MODEL["eot_id"]             # closes the user turn in the chat template
+N_LAYERS = MODEL["n_layers"]
+OUT_DIR = MODEL["out_dir"]           # default home of fitted vectors/detectors
+DETECTOR_LAYER = MODEL["detector_layer"]   # None: detector bundle best_layer
+STEER_LAYERS = MODEL["steer_layers"]       # None: vector bundle best_layer
+NEWLINE_ID = 198  # '\n' (same id in both tokenizers); locates the DIJA template
 
 DATA_DIR = Path(__file__).parent / "data"   # populated by data_downloader.py
 
@@ -35,14 +44,74 @@ WALLEDAI_GLOB = ("/mnt/shared/huggingface-cache/hub/datasets--walledai--{}"
                  "/snapshots/*/**/*.parquet")
 
 
-def load_llada(device=None):
-    """LLaDA tokenizer and eval-mode bf16 model on `device`."""
+class ShiftedLogits(torch.nn.Module):
+    """Dream's lm_head is trained with an autoregressive shift: logits[:, p]
+    scores the token at position p+1. Dream's own sampler realigns them with
+    cat([logits[:, :1], logits[:, :-1]], 1) before reading masked slots, and
+    this wrapper does the same so model(x).logits[0, p] scores slot p exactly
+    as LLaDA's does. Hidden states are untouched (they are per-position
+    residual streams, which is what the detectors and steering hooks read),
+    so hooks are registered on .blocks of the wrapped model as usual.
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.inner = model
+
+    def forward(self, input_ids, **kwargs):
+        kwargs.setdefault("use_cache", False)
+        out = self.inner(input_ids, **kwargs)
+        logits = out.logits
+        out.logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
+        return out
+
+    @property
+    def device(self):
+        return self.inner.device
+
+    @property
+    def config(self):
+        return self.inner.config
+
+    @property
+    def blocks(self):
+        return model_blocks(self.inner)
+
+
+def model_blocks(model):
+    """The transformer block list hooks attach to (LLaDA, Dream, or a wrapper)."""
+    if hasattr(model, "blocks"):
+        return model.blocks
+    if hasattr(model, "model") and hasattr(model.model, "transformer"):
+        return model.model.transformer.blocks      # LLaDA
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        return model.model.layers                  # Dream (Qwen2 layout)
+    raise AttributeError("cannot locate transformer blocks on the model")
+
+
+def load_model(device=None):
+    """Tokenizer and eval-mode bf16 model for the selected target on `device`.
+
+    Dream comes back wrapped in ShiftedLogits, and its tokenizer has the chat
+    control tokens (<|im_start|>, <|im_end|>) marked special so
+    skip_special_tokens drops them from decoded generations; their ids are
+    unchanged.
+    """
     from transformers import AutoModel, AutoTokenizer
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    if MODEL["chat_control"]:
+        tokenizer.add_special_tokens(
+            {"additional_special_tokens": list(MODEL["chat_control"])},
+            replace_additional_special_tokens=False)
     model = AutoModel.from_pretrained(MODEL_NAME, trust_remote_code=True,
                                       torch_dtype=torch.bfloat16).to(device).eval()
+    if MODEL["shift_logits"]:
+        model = ShiftedLogits(model).eval()
     return tokenizer, model
+
+
+load_llada = load_model   # historical name; loads whichever model is selected
 
 
 def seed_all(seed):
@@ -69,7 +138,7 @@ def enable_reproducibility(seed=42):
 
 def force_math_attention():
     """Restrict SDPA to the math backend -- the only backend whose numerics are
-    stable across GPU architectures. Call AFTER load_llada: the remote model
+    stable across GPU architectures. Call AFTER load_model: the remote model
     code re-enables flash_sdp in __init__."""
     torch.backends.cuda.enable_flash_sdp(False)
     torch.backends.cuda.enable_mem_efficient_sdp(False)

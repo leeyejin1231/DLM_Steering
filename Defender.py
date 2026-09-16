@@ -20,7 +20,8 @@ from abc import ABC, abstractmethod
 
 import torch
 
-from common import MASK_ID, load_detector
+from common import (DETECTOR_LAYER, MASK_ID, OUT_DIR, STEER_LAYERS, load_detector,
+                    model_blocks)
 from proposed import Proposed
 
 
@@ -163,7 +164,7 @@ class Ours(Defender):
         # remask decision needs fresh gate readings
         self.gate_once = steer == "fixed" and not remask_enabled
         self.steer_mode = steer
-        blocks = model.model.transformer.blocks
+        blocks = model_blocks(model)
         if not 1 <= gate_layer <= len(blocks):
             raise ValueError(f"gate layer must be in 1..{len(blocks)}")
         if gate_vector.ndim != 1 or not torch.isfinite(gate_vector).all() or gate_vector.norm() == 0:
@@ -193,17 +194,23 @@ class Ours(Defender):
 
     @classmethod
     def add_args(cls, parser):
-        parser.add_argument("--vector", default="outputs/steer_vector.pt")
-        parser.add_argument("--detector", default="outputs/steer_detector.pt")
-        parser.add_argument("--detector-layer", type=int, default=18)
+        # Bundle paths and layer defaults follow the selected --model: LLaDA
+        # keeps outputs/ + layers 18/25; other models default to their own
+        # outputs/<model>/ folder and the layers the fitters chose.
+        parser.add_argument("--vector", default=f"{OUT_DIR}/steer_vector.pt")
+        parser.add_argument("--detector", default=f"{OUT_DIR}/steer_detector.pt")
+        parser.add_argument("--detector-layer", type=int, default=DETECTOR_LAYER,
+                            help="Gate layer (hidden-state numbering). Default: 18 for "
+                                 "llada, else the detector bundle's best_layer.")
         parser.add_argument("--gate-threshold", type=float, default=None,
                             help="Projection threshold; defaults to gate_threshold.json "
                                  "next to the detector bundle.")
         parser.add_argument("--gate-width", type=float, default=1.0,
                             help="Projection margin above threshold for full steering.")
-        parser.add_argument("--layer", default="25",
+        parser.add_argument("--layer", default=STEER_LAYERS,
                             help="Comma-separated steering layers (hidden-state numbering; "
-                                 "25 = blocks[24]). All must be after --detector-layer.")
+                                 "25 = blocks[24]). All must be after --detector-layer. "
+                                 "Default: 25 for llada, else the vector bundle's best_layer.")
         parser.add_argument("--alpha", type=float, default=1.0,
                             help="Steering strength in units of the layer's mean activation norm.")
         parser.add_argument("--transform", choices=["additive", "project"], default="additive")
@@ -220,7 +227,8 @@ class Ours(Defender):
                             help="none: never remask; v2: one-shot committed-token window "
                                  "repair; v3: response-detector trigger reopens the first "
                                  "block and regenerates it over --recovery-steps steps.")
-        parser.add_argument("--response-detector", default="outputs/response_detector.pt",
+        parser.add_argument("--response-detector",
+                            default=f"{OUT_DIR}/response_detector.pt",
                             help="Logistic-regression response checkpoint; required by "
                                  "--remask v3*. Its layer must match --detector-layer.")
         parser.add_argument("--recovery-steps", type=int, default=32,
@@ -246,7 +254,9 @@ class Ours(Defender):
         sites = []
         if args.steer != "none":
             bundle = torch.load(args.vector, map_location="cpu")
-            for layer in (int(s) for s in args.layer.split(",")):
+            layer_spec = (str(bundle["best_layer"]) if args.layer is None
+                          else str(args.layer))
+            for layer in (int(s) for s in layer_spec.split(",")):
                 li = bundle["layers"].index(layer)
                 sites.append((layer, bundle["vector"][li].to(device), bundle["mean_act_norm"][li]))
         det_vec, det_layer, threshold = load_detector(
@@ -806,9 +816,9 @@ class ProposedDefense(Defender):
 
     @classmethod
     def add_args(cls, parser):
-        parser.add_argument("--vector", default="outputs/steer_vector.pt")
-        parser.add_argument("--detector", default="outputs/steer_detector.pt")
-        parser.add_argument("--detector-layer", type=int, default=18)
+        parser.add_argument("--vector", default=f"{OUT_DIR}/steer_vector.pt")
+        parser.add_argument("--detector", default=f"{OUT_DIR}/steer_detector.pt")
+        parser.add_argument("--detector-layer", type=int, default=DETECTOR_LAYER)
         parser.add_argument("--gate-threshold", type=float, default=None)
         parser.add_argument("--layers", default="12,16,20,24")
         parser.add_argument("--strength", type=float, default=0.4)
@@ -840,7 +850,8 @@ class ProposedDefense(Defender):
 
     def reset(self):
         self._policy = Proposed.from_llada(self.model, self.gate, self.csd,
-                                           layers=self.layers, **self.options)
+                                           layers=self.layers, mask_id=MASK_ID,
+                                           **self.options)
         self.step, self.trace, self.remask_event = 0, [], None
 
     def before_step(self, x, region, *, scope, steps_remaining):
