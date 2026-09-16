@@ -4,9 +4,22 @@
 # transformers 4.57.1). off / steer on GPU 0, repair on GPU 1.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-export PY=/home/yejin/anaconda3/envs/dlm_remask/bin/python
+export PY="${PY:-/home/yejin/anaconda3/envs/dlm_remask/bin/python}"
+if [ ! -x "$PY" ]; then
+    echo "dlm_remask env not found at $PY -- set PY= to an env matching the header" >&2
+    exit 1
+fi
+# This run also predates the exp.py collapse: llada_steering_remasking_v2.py is gone.
+if [ ! -f llada_steering_remasking_v2.py ]; then
+    echo "superseded script: llada_steering_remasking_v2.py no longer exists;" >&2
+    echo "the current equivalent is exp.py --attack dija --defense ours --remask v2" >&2
+    exit 1
+fi
 export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false RAYON_NUM_THREADS=1
-export HF_HOME=/mnt/shared/huggingface-cache/hub HUGGINGFACE_HUB_CACHE=/mnt/shared/huggingface-cache/hub HF_HUB_OFFLINE=1
+if [ -d /mnt/shared/huggingface-cache ]; then
+    export HF_HOME=/mnt/shared/huggingface-cache
+fi
+export HF_HUB_OFFLINE=1
 COMMON=(--source jbb_harmful --attack dija --gen-length 0 --steps 64 --temperature 0.0 --n 100)
 P=outputs/newenv_dija0_jbb
 mkdir -p outputs log

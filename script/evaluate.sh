@@ -11,7 +11,16 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 require outputs/gated_len128.json outputs/gated_len256.json \
         outputs/gated_or30_xstest.json outputs/gated_or30_jbb.json outputs/gated_or30_tqa.json
 
-say "scoring"
+# Llama Guard keeps GPU_A to itself; the ollama containers take every other
+# card in $GPUS (one server per card, ports 50001+i, reused across the five
+# files below because a container outlives the process that started it).
+OLLAMA_GPUS=""
+for g in ${GPUS//,/ }; do
+    [ "$g" = "$GPU_A" ] || OLLAMA_GPUS="${OLLAMA_GPUS:+$OLLAMA_GPUS,}$g"
+done
+[ -n "$OLLAMA_GPUS" ] || OLLAMA_GPUS="$GPU_A"
+
+say "scoring (Llama Guard on GPU $GPU_A, ollama on $OLLAMA_GPUS)"
 (
     for L in 128 256; do
         CUDA_VISIBLE_DEVICES=$GPU_A $PY eval_llamaguard.py \
@@ -22,11 +31,13 @@ say "scoring"
 A=$!
 (
     for L in 128 256; do
-        $PY run_sr_eval.py --in "outputs/gated_len$L.json" \
+        $PY run_sr_eval.py --gpus "$OLLAMA_GPUS" \
+            --in "outputs/gated_len$L.json" \
             --out "outputs/gated_sr_len$L.json" > "log/gated_sr_$L.log" 2>&1
     done
     for s in xstest jbb tqa; do
-        $PY steering/judge_refusal.py --in "outputs/gated_or30_$s.json" \
+        $PY -m steering.judge_refusal --gpus "$OLLAMA_GPUS" \
+            --in "outputs/gated_or30_$s.json" \
             --out "outputs/gated_or30_${s}_judged.json" > "log/gated_judge_$s.log" 2>&1
     done
 ) &

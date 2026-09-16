@@ -3,9 +3,16 @@
 # and StrongREJECT via ollama gpt-oss:20b on :50001, concurrently. Runs in dlm_remask env.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-export PY=/home/yejin/anaconda3/envs/dlm_remask/bin/python
+export PY="${PY:-/home/yejin/anaconda3/envs/dlm_remask/bin/python}"
+if [ ! -x "$PY" ]; then
+    echo "dlm_remask env not found at $PY -- set PY= to an env matching the header" >&2
+    exit 1
+fi
 export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false RAYON_NUM_THREADS=1
-export HF_HOME=/mnt/shared/huggingface-cache/hub HUGGINGFACE_HUB_CACHE=/mnt/shared/huggingface-cache/hub HF_HUB_OFFLINE=1
+if [ -d /mnt/shared/huggingface-cache ]; then
+    export HF_HOME=/mnt/shared/huggingface-cache
+fi
+export HF_HUB_OFFLINE=1
 P=outputs/newenv_dija0_jbb
 curl -s --max-time 5 http://localhost:50001/api/tags >/dev/null || { echo "ollama not reachable" >&2; exit 1; }
 (

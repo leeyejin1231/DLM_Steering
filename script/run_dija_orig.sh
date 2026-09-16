@@ -8,6 +8,16 @@
 #   proposed  proposed.py via run_proposed_dija.py
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
+# SUPERSEDED, kept as the record of that run: the generation half targets
+# llada_steering_remasking_v2.py and run_proposed_dija.py, both removed when the
+# stack collapsed into exp.py, and the summary block below still reads
+# pre-refactor Llama-Guard keys (summary["generation"]["unsafe_rate"]).
+# Today's equivalent is script/run_dija_jbb.sh once per condition (TAG= and
+# DEFENSE_ARGS=), then: $PY script/report.py outputs/JBB-dija-*_{lg4,sr}.json
+for f in llada_steering_remasking_v2.py run_proposed_dija.py; do
+    [ -f "$f" ] || { echo "superseded script: $f no longer exists -- see the note at the top of $0" >&2; exit 1; }
+done
+
 curl -s --max-time 5 http://localhost:50001/api/tags >/dev/null \
     || { echo "ollama not reachable on :50001 -- start ollama_setting/podman" >&2; exit 1; }
 

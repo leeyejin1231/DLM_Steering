@@ -11,9 +11,14 @@
 #   GPU=<index>
 #
 # Output: outputs/<JBB|HarmBench|SR>-dija-dgm-<CONFIG>-42{,_lg4,_sr}.json
-set -e
-cd "$(dirname "$0")/.."
-export PYTHONPATH=$PWD/script/diffuguard_stubs:${PYTHONPATH}
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+# DiffuGuard/ is the author's repo, cloned alongside this one and gitignored.
+if [ ! -f DiffuGuard/models/jailbreakbench_llada.py ]; then
+    echo "missing DiffuGuard/ -- clone the author repo into $PWD:" >&2
+    echo "  git clone https://github.com/niez233/DiffuGuard.git" >&2
+    exit 1
+fi
+export PYTHONPATH=$PWD/script/diffuguard_stubs:${PYTHONPATH:-}
 export OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false
 GPU=${GPU:-1}
 SOURCE=${SOURCE:-jbb_harmful}      # jbb_harmful | harmbench | strongreject
@@ -39,10 +44,10 @@ TAG=dgm-$CONFIG
 RAW=outputs/diffuguard_${PREFIX}_${TAG}_raw.json
 OUT=outputs/${PREFIX}-dija-${TAG}-42.json
 
-CUDA_VISIBLE_DEVICES=$GPU python DiffuGuard/models/jailbreakbench_llada.py "${BASE[@]}" "${EXTRA[@]}" \
+CUDA_VISIBLE_DEVICES=$GPU $PY DiffuGuard/models/jailbreakbench_llada.py "${BASE[@]}" "${EXTRA[@]}" \
     --output_json "$RAW" > "log/diffuguard_${PREFIX}_${TAG}.log" 2>&1
-python script/convert_diffuguard.py --in "$RAW" --out "$OUT" --source "$SOURCE" --config "$CFG" \
+$PY script/convert_diffuguard.py --in "$RAW" --out "$OUT" --source "$SOURCE" --config "$CFG" \
     --defense "{\"defense\": \"diffuguard\", \"config\": \"$CONFIG\", \"sp_mode\": \"hidden\", \"sp_threshold\": 0.2, \"refinement_steps\": 8, \"remask_ratio\": 0.9, \"remasking\": \"$([ "$CONFIG" = full ] && echo adaptive_step || echo low_confidence)\"}"
-CUDA_VISIBLE_DEVICES=$GPU python eval_llamaguard.py --in "$OUT" --out "${OUT%.json}_lg4.json"
-python run_sr_eval.py --in "$OUT" --out "${OUT%.json}_sr.json" --port 50001 --gpu "$GPU"
+CUDA_VISIBLE_DEVICES=$GPU $PY eval_llamaguard.py --in "$OUT" --out "${OUT%.json}_lg4.json"
+$PY run_sr_eval.py --in "$OUT" --out "${OUT%.json}_sr.json" --port 50001 --gpu "$GPU"
 echo "DONE $OUT"

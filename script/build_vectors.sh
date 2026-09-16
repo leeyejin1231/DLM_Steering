@@ -18,19 +18,19 @@ FORCE=0
 skip() { [ $FORCE -eq 0 ] && [ -e "$1" ] && { echo "exists, skipping: $1"; return 0; }; return 1; }
 
 say "1/4 build_pairs -- contrast dataset (eval prompts held out)"
-skip data/steer_pairs.json || $PY steering/build_pairs.py
+skip data/steer_pairs.json || $PY -m steering.build_pairs
 
 say "2/4 fit_vector -- actuator direction"
 skip outputs/steer_vector.pt || \
-    CUDA_VISIBLE_DEVICES=$GPU_A $PY steering/fit_vector.py 2>&1 | tee log/fit_vector.log
+    CUDA_VISIBLE_DEVICES=$GPU_A $PY -m steering.fit_vector 2>&1 | tee log/fit_vector.log
 
 say "3/4 fit_detector -- prompt-side harmfulness detector"
 skip outputs/steer_detector.pt || \
-    CUDA_VISIBLE_DEVICES=$GPU_A $PY steering/fit_detector.py 2>&1 | tee log/fit_detector.log
+    CUDA_VISIBLE_DEVICES=$GPU_A $PY -m steering.fit_detector 2>&1 | tee log/fit_detector.log
 
 say "4/4 pick_threshold -- gate threshold from fit split"
 skip outputs/gate_threshold.json || \
-    CUDA_VISIBLE_DEVICES=$GPU_A $PY steering/pick_threshold.py --layer "$DETECTOR_LAYER" \
+    CUDA_VISIBLE_DEVICES=$GPU_A $PY -m steering.pick_threshold --layer "$DETECTOR_LAYER" \
         2>&1 | tee log/pick_threshold.log
 
 say "done"
