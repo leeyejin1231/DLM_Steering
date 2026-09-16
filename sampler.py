@@ -16,11 +16,12 @@ like the rest.
 
 import torch
 
-from common import MASK_ID, step_scale
+from common import MASK_ID, MODEL_LOCK, step_scale
 from llada import PAD_ID, add_gumbel_noise, get_num_transfer_tokens
 
 
-def commit_sample(x, logits, eligible, count, temperature, remasking, final=False):
+def commit_sample(x, logits, eligible, count, temperature, remasking,
+                  final=False, rng=None):
     """Commit the `count` highest-confidence eligible positions in place.
 
     eligible: index tensor of still-masked candidate positions. Returns the
@@ -33,13 +34,14 @@ def commit_sample(x, logits, eligible, count, temperature, remasking, final=Fals
     # logits may be full [1, seq, vocab] or pre-sliced to the eligible rows
     # [1, n, vocab] (ln_f hook); identical when every position is eligible.
     sub = logits[0, eligible] if logits.shape[1] == x.shape[1] else logits[0]
-    predicted = add_gumbel_noise(sub, temperature).argmax(-1)
+    predicted = add_gumbel_noise(sub, temperature, rng).argmax(-1)
     if remasking == "low_confidence":
         sub64 = sub.to(torch.float64)
         confidence = (sub64 - sub64.logsumexp(dim=-1, keepdim=True)).exp()
         confidence = confidence.gather(1, predicted[:, None]).squeeze(-1)
     elif remasking == "random":
-        confidence = torch.rand(n, dtype=torch.float64, device=x.device)
+        confidence = torch.rand(n, dtype=torch.float64, device=x.device,
+                                generator=rng)
     else:
         raise NotImplementedError(remasking)
     selected = confidence.topk(k).indices
@@ -52,12 +54,13 @@ def commit_sample(x, logits, eligible, count, temperature, remasking, final=Fals
 @torch.no_grad()
 def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
              block_length=32, temperature=0.0, remasking="low_confidence",
-             schedule="const"):
+             schedule="const", rng=None):
     """Diffusion sampling driven by a Defender; None runs undefended.
 
     gen_length=0 runs pure infilling: the prompt's own mask slots (e.g. DIJA
     spans) form a single block denoised over `steps` steps, with no assistant
-    suffix appended."""
+    suffix appended. rng: per-row torch.Generator; all sampling draws come
+    from it so concurrent row workers stay bit-identical to serial runs."""
     if prompt_ids.ndim != 2 or prompt_ids.shape[0] != 1:
         raise ValueError("generate supports one prompt at a time")
     if gen_length < 0 or block_length <= 0 or steps <= 0:
@@ -103,12 +106,13 @@ def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
 
             if defender is None:
                 ln_f = model.model.transformer.ln_f
-                handle = ln_f.register_forward_hook(
-                    lambda m, i, o: o[:, eligible])
-                try:
-                    logits = model(x).logits
-                finally:
-                    handle.remove()
+                with MODEL_LOCK:
+                    handle = ln_f.register_forward_hook(
+                        lambda m, i, o: o[:, eligible])
+                    try:
+                        logits = model(x).logits
+                    finally:
+                        handle.remove()
             else:
                 logits = defender.forward(
                     x, region, schedule_scale=step_scale(schedule, i, steps_per_block),
@@ -116,14 +120,14 @@ def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
 
             eligible = commit_sample(x, logits, eligible, schedule_counts[i],
                                      temperature, remasking,
-                                     final=(i == steps_per_block - 1))
+                                     final=(i == steps_per_block - 1), rng=rng)
 
         if defender is not None:
             defender.after_block(
                 x, region, block_index=num_block, block_positions=block_positions,
                 prompt_length=prompt_length,
                 temperature=temperature, remasking=remasking,
-                last_block=num_block == num_blocks - 1)
+                last_block=num_block == num_blocks - 1, rng=rng)
 
     return x
 
@@ -131,7 +135,7 @@ def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
 @torch.no_grad()
 def generate_batch(model, prompts, *, steps=128, gen_length=128,
                    block_length=32, temperature=0.0, remasking="low_confidence",
-                   schedule="const", pad_id=PAD_ID):
+                   schedule="const", pad_id=PAD_ID, rng=None):
     """Batched undefended diffusion sampling over left-padded prompts.
 
     prompts: list of (1, L_i) token-id tensors. Rows are left-padded with
@@ -200,12 +204,13 @@ def generate_batch(model, prompts, *, steps=128, gen_length=128,
             # the vocab projection runs on total eligible rows only.
             flat = torch.cat([e + r * width
                               for r, e in enumerate(eligible) if e.numel()])
-            handle = ln_f.register_forward_hook(
-                lambda m, _i, o: o.reshape(-1, o.shape[-1])[flat].unsqueeze(0))
-            try:
-                logits = model(x, attention_mask=attention_mask).logits
-            finally:
-                handle.remove()
+            with MODEL_LOCK:
+                handle = ln_f.register_forward_hook(
+                    lambda m, _i, o: o.reshape(-1, o.shape[-1])[flat].unsqueeze(0))
+                try:
+                    logits = model(x, attention_mask=attention_mask).logits
+                finally:
+                    handle.remove()
             offset = 0
             for r in range(batch):
                 n = eligible[r].numel()
@@ -214,7 +219,7 @@ def generate_batch(model, prompts, *, steps=128, gen_length=128,
                 eligible[r] = commit_sample(
                     x[r:r + 1], logits[:, offset:offset + n], eligible[r],
                     int(schedule_counts[r, i]), temperature, remasking,
-                    final=(i == steps_per_block - 1))
+                    final=(i == steps_per_block - 1), rng=rng)
                 offset += n
 
     return [x[r:r + 1, prompt_len - p.shape[1]:]

@@ -20,7 +20,7 @@ from abc import ABC, abstractmethod
 
 import torch
 
-from common import MASK_ID, load_detector
+from common import MASK_ID, MODEL_LOCK, load_detector
 from proposed import Proposed
 
 
@@ -73,14 +73,17 @@ class Defender(ABC):
         aligned to them. Implementations may ignore it (full logits)."""
 
     def after_block(self, x, region, *, block_index, block_positions,
-                    prompt_length, temperature, remasking, last_block=False):
+                    prompt_length, temperature, remasking, last_block=False,
+                    rng=None):
         """Called once after each block's denoising loop completes.
 
         block_positions: answer slots of the just-finished block. prompt_length
         marks the prompt/generation boundary; committed answer slots before it
         (e.g. filled DIJA spans) are also remaskable. last_block marks the
         final block (no later forward exists to piggyback an audit on). May
-        audit the block or rewrite committed tokens back to MASK_ID.
+        audit the block or rewrite committed tokens back to MASK_ID. rng is
+        the row's torch.Generator, needed by implementations that resample
+        (V3 recovery).
         """
 
     @abstractmethod
@@ -95,19 +98,19 @@ class Defender(ABC):
         """Config dict stored in the result payload."""
         return {"defense": self.name}
 
-    def defend(self, model, prompt_ids, **gen_config):
+    def defend(self, model, prompt_ids, rng=None, **gen_config):
         """Run one defended generation through the unified sampler."""
         from sampler import generate
-        return generate(model, prompt_ids, self, **gen_config)
+        return generate(model, prompt_ids, self, rng=rng, **gen_config)
 
-    def defend_batch(self, model, prompt_ids_list, **gen_config):
+    def defend_batch(self, model, prompt_ids_list, rng=None, **gen_config):
         """A batch of defended generations; sequential by default.
 
         Stateful defenses (remask/recovery branch per sequence) cannot share
         a denoising loop, so only NullDefender overrides this with the truly
         batched sampler.
         """
-        return [self.defend(model, ids, **gen_config)
+        return [self.defend(model, ids, rng=rng, **gen_config)
                 for ids in prompt_ids_list]
 
 
@@ -133,17 +136,18 @@ class NullDefender(Defender):
         if logit_positions is None:
             return self.model(x)
         ln_f = self.model.model.transformer.ln_f
-        handle = ln_f.register_forward_hook(
-            lambda m, i, o: o[:, logit_positions])
-        try:
-            return self.model(x)
-        finally:
-            handle.remove()
+        with MODEL_LOCK:
+            handle = ln_f.register_forward_hook(
+                lambda m, i, o: o[:, logit_positions])
+            try:
+                return self.model(x)
+            finally:
+                handle.remove()
 
-    def defend_batch(self, model, prompt_ids_list, **gen_config):
+    def defend_batch(self, model, prompt_ids_list, rng=None, **gen_config):
         """No hooks -> rows denoise uniformly; safe to share one loop."""
         from sampler import generate_batch
-        return generate_batch(model, prompt_ids_list, **gen_config)
+        return generate_batch(model, prompt_ids_list, rng=rng, **gen_config)
 
     def result_fields(self):
         return {}
@@ -408,26 +412,27 @@ class Ours(Defender):
             audit_pools = [committed[0].nonzero().flatten(), *audit["chunks"]]
         self._pending = {"pool": pool, "fired": False, "proj_t": None, "alpha_t": 0.0}
         handles, feats_out = [], []
-        try:
-            if read_gate:
-                handles.append(self.gate_block.register_forward_hook(self._gate_hook))
-            if steer:
-                for block, unit, ref_norm in self.sites:
-                    handles.append(block.register_forward_hook(
-                        self._steer_hook(unit, ref_norm, positions)))
-            if audit_pools is not None:
-                def capture(module, inputs, output):
-                    feats_out.append(torch.stack(
-                        [_hidden(output)[0, p].to(torch.float32).mean(dim=0)
-                         for p in audit_pools]))
-                handles.append(self.gate_block.register_forward_hook(capture))
-            if logit_positions is not None:
-                handles.append(self.ln_f.register_forward_hook(
-                    lambda m, i, o: o[:, logit_positions]))
-            output = self.model(x)
-        finally:
-            for handle in handles:
-                handle.remove()
+        with MODEL_LOCK:
+            try:
+                if read_gate:
+                    handles.append(self.gate_block.register_forward_hook(self._gate_hook))
+                if steer:
+                    for block, unit, ref_norm in self.sites:
+                        handles.append(block.register_forward_hook(
+                            self._steer_hook(unit, ref_norm, positions)))
+                if audit_pools is not None:
+                    def capture(module, inputs, output):
+                        feats_out.append(torch.stack(
+                            [_hidden(output)[0, p].to(torch.float32).mean(dim=0)
+                             for p in audit_pools]))
+                    handles.append(self.gate_block.register_forward_hook(capture))
+                if logit_positions is not None:
+                    handles.append(self.ln_f.register_forward_hook(
+                        lambda m, i, o: o[:, logit_positions]))
+                output = self.model(x)
+            finally:
+                for handle in handles:
+                    handle.remove()
         pend = self._pending
         if read_gate and not pend["fired"]:
             raise RuntimeError("model forward did not execute the gate hook")
@@ -532,11 +537,12 @@ class V2(Ours):
         def capture(module, inputs, output):
             captured.append(self._projection(_hidden(output), pool))
 
-        handle = self.gate_block.register_forward_hook(capture)
-        try:
-            self.model(x)
-        finally:
-            handle.remove()
+        with MODEL_LOCK:
+            handle = self.gate_block.register_forward_hook(capture)
+            try:
+                self.model(x)
+            finally:
+                handle.remove()
         if len(captured) != 1:
             raise RuntimeError("gate block must execute exactly once per forward")
         return captured[0]
@@ -697,15 +703,16 @@ class V3(Ours):
             feats_out.append(torch.stack(
                 [hidden[0, p].to(torch.float32).mean(dim=0) for p in pools]))
 
-        handle = self.gate_block.register_forward_hook(capture)
         # Audits read only gate-layer features; slice ln_f to zero rows so the
         # vocab projection is skipped entirely.
-        skip_logits = self.ln_f.register_forward_hook(lambda m, i, o: o[:, empty])
-        try:
-            self.model(x)
-        finally:
-            handle.remove()
-            skip_logits.remove()
+        with MODEL_LOCK:
+            handle = self.gate_block.register_forward_hook(capture)
+            skip_logits = self.ln_f.register_forward_hook(lambda m, i, o: o[:, empty])
+            try:
+                self.model(x)
+            finally:
+                handle.remove()
+                skip_logits.remove()
         self.audit_forwards += 1
         if len(feats_out) != 1:
             raise RuntimeError("audit hook must execute exactly once per forward")
@@ -713,7 +720,8 @@ class V3(Ours):
 
     @torch.no_grad()
     def after_block(self, x, region, *, block_index, block_positions,
-                    prompt_length, temperature, remasking, last_block=False):
+                    prompt_length, temperature, remasking, last_block=False,
+                    rng=None):
         if self._pending_audit is not None:
             # A deferred audit whose next forward never arrived still runs.
             pending = self._pending_audit
@@ -723,7 +731,7 @@ class V3(Ours):
             self._apply_audit(x, region, reading, audit=pending)
         audit = {"block_index": block_index, "block_row": block_positions[0],
                  "prompt_length": prompt_length, "temperature": temperature,
-                 "remasking": remasking}
+                 "remasking": remasking, "rng": rng}
         if last_block:
             # No later forward to piggyback on; audit with a dedicated pass.
             reading = self._audit(x, region, self._chunk_positions(
@@ -786,7 +794,8 @@ class V3(Ours):
                     logits = self.forward(x, region, schedule_scale=1.0,
                                           logit_positions=eligible).logits
                     eligible = commit_sample(x, logits, eligible, counts[i],
-                                             temperature, remasking, final=final)
+                                             temperature, remasking, final=final,
+                                             rng=audit.get("rng"))
             finally:
                 self.in_recovery = False
             event["rounds"].append({

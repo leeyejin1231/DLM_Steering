@@ -16,12 +16,19 @@ PAD_ID = 126081   # <|endoftext|>; also the eos/pad id in the model config
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def add_gumbel_noise(logits, temperature):
-    """Gumbel-max sampling. temperature=0 -> greedy (argmax)."""
+def add_gumbel_noise(logits, temperature, rng=None):
+    """Gumbel-max sampling. temperature=0 -> greedy (argmax).
+
+    rng: optional torch.Generator; when given, draws come from it instead of
+    the global CUDA RNG so interleaved row workers cannot perturb each
+    other's streams (rand_like has no generator arg -> rand on same shape).
+    """
     if temperature == 0.0:
         return logits
     logits = logits.to(torch.float64)
-    noise = torch.rand_like(logits)
+    noise = (torch.rand_like(logits) if rng is None else
+             torch.rand(logits.shape, dtype=logits.dtype,
+                        device=logits.device, generator=rng))
     gumbel_noise = (-torch.log(noise)) ** temperature
     return logits.exp() / gumbel_noise
 

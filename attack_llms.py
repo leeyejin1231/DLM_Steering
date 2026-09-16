@@ -18,6 +18,7 @@ apply_chat_template(continue_final_message=True)).
 
 import logging
 import re
+import threading
 
 import torch
 
@@ -37,27 +38,64 @@ class HFChat:
     does not fit next to the 8B target on one 40GB card), else cuda:0.
     """
 
+    _shared, _shared_lock = {}, threading.Lock()
+
+    @classmethod
+    def shared(cls, model_id="Qwen/Qwen3-14B", device=None, dtype=torch.bfloat16):
+        """Process-wide HFChat cache: --row-workers lanes must share one copy
+        of the attack model -- two 14B loads do not fit on one card."""
+        key = (model_id, device, dtype)
+        with cls._shared_lock:
+            if key not in cls._shared:
+                cls._shared[key] = cls(model_id, device=device, dtype=dtype)
+            return cls._shared[key]
+
     def __init__(self, model_id="Qwen/Qwen3-14B", device=None, dtype=torch.bfloat16):
         self.model_id, self.device, self.dtype = model_id, device, dtype
         self.tokenizer = self.model = None
+        self._load_lock = threading.Lock()
+        # model.generate is not thread-safe and samples from the global CUDA
+        # RNG; every call runs under this lock, and seeded calls reseed that
+        # device's generator immediately before generating -> outputs depend
+        # on the call's seed, never on thread scheduling.
+        self._call_lock = threading.Lock()
 
     def load(self):
+        # Double-checked: row workers and mutation-prefetch threads can race
+        # the first call; a second 14B copy on one card would OOM.
         if self.model is not None:
             return
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        device = self.device or ("cuda:1" if torch.cuda.device_count() > 1
-                                 else "cuda:0")
-        print(f"loading attack/judge model {self.model_id} on {device} ...")
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_id, torch_dtype=self.dtype).to(device).eval()
-        self.device = device
+        with self._load_lock:
+            if self.model is not None:
+                return
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            device = self.device or ("cuda:1" if torch.cuda.device_count() > 1
+                                     else "cuda:0")
+            print(f"loading attack/judge model {self.model_id} on {device} ...")
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            # Generation padding is always left; set once so concurrent
+            # generate_batch calls never race a per-call toggle.
+            self.tokenizer.padding_side = "left"
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_id, torch_dtype=self.dtype).to(device).eval()
+            self.device = device
+
+    def _locked_generate(self, ids, kw, seed):
+        """model.generate under the call lock; `seed` reseeds the model's
+        device RNG first so the draw is reproducible at any call order."""
+        with self._call_lock:
+            if seed is not None:
+                idx = self.model.device.index
+                if idx is not None:
+                    torch.cuda.default_generators[idx].manual_seed(seed)
+            return self.model.generate(**ids, **kw)
 
     @torch.no_grad()
     def generate(self, messages, *, temperature=1.0, top_p=1.0,
-                 max_new_tokens=512, stop=(), continue_final=False):
+                 max_new_tokens=512, stop=(), continue_final=False,
+                 seed=None):
         """One chat completion; returns the new text with stop strings cut."""
         self.load()
         text = self.tokenizer.apply_chat_template(
@@ -76,7 +114,7 @@ class HFChat:
             kw.update(do_sample=True, temperature=temperature, top_p=top_p)
         else:
             kw["do_sample"] = False
-        out = self.model.generate(**ids, **kw)
+        out = self._locked_generate(ids, kw, seed)
         new = out[0, ids["input_ids"].shape[1]:]
         text = self.tokenizer.decode(new, skip_special_tokens=True)
         # litellm stop= semantics: cut at the earliest stop-string occurrence.
@@ -87,7 +125,8 @@ class HFChat:
 
     @torch.no_grad()
     def generate_batch(self, messages_list, *, temperature=1.0, top_p=1.0,
-                       max_new_tokens=512, stop=(), continue_final=False):
+                       max_new_tokens=512, stop=(), continue_final=False,
+                       seed=None):
         """generate() over a list of message lists via one left-padded batch.
 
         Same semantics per row (template, sampling knobs, stop-string cut);
@@ -101,13 +140,8 @@ class HFChat:
             add_generation_prompt=not continue_final,
             continue_final_message=continue_final,
             enable_thinking=False) for m in messages_list]
-        prev_side = self.tokenizer.padding_side
-        self.tokenizer.padding_side = "left"
-        try:
-            ids = self.tokenizer(texts, return_tensors="pt",
-                                 padding=True).to(self.model.device)
-        finally:
-            self.tokenizer.padding_side = prev_side
+        ids = self.tokenizer(texts, return_tensors="pt",
+                             padding=True).to(self.model.device)
         kw = {"max_new_tokens": max_new_tokens,
               "pad_token_id": self.tokenizer.pad_token_id}
         if stop:
@@ -116,7 +150,7 @@ class HFChat:
             kw.update(do_sample=True, temperature=temperature, top_p=top_p)
         else:
             kw["do_sample"] = False
-        out = self.model.generate(**ids, **kw)
+        out = self._locked_generate(ids, kw, seed)
         prompt_w = ids["input_ids"].shape[1]
         results = []
         for i in range(out.shape[0]):

@@ -7,12 +7,19 @@ everything else shared lives here.
 import glob
 import json
 import math
+import threading
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from llada import MODEL_NAME, MASK_ID  # noqa: F401  (re-exported)
+
+# Serializes hook-registration -> model(x) -> hook-removal sections. Forward
+# hooks are module-global, so two concurrent forwards (exp.py --row-workers)
+# would otherwise fire each other's hooks. The GPU serializes the kernels
+# anyway; the lock only excludes hook cross-talk.
+MODEL_LOCK = threading.Lock()
 
 EOT_ID = 126348   # <|eot_id|>, closes the user turn in LLaDA's chat template
 NEWLINE_ID = 198  # '\n'; used to locate the DIJA template inside the prompt
