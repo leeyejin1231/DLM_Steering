@@ -152,8 +152,9 @@ class DIJA(NoAttack):
         parser.add_argument("--dija-steps", default="auto",
                             help="'auto': one mask per step like the original loop; "
                                  "or an integer number of steps.")
-        # The original run: prompt infilling only, temperature 0.2.
-        parser.set_defaults(gen_length=0, temperature=0.2)
+        # The original run: prompt infilling only (paper sampling used
+        # temperature 0.2 -- pass --temperature 0.2 for that configuration).
+        parser.set_defaults(gen_length=0)
 
     @classmethod
     def from_args(cls, args):
@@ -296,8 +297,6 @@ class PAP(NoAttack):
                                  "GPT-4/Qi et al. 1-5 rubric on the paraphraser "
                                  "model (5 = jailbreak), 'gcg' = keyword judge, "
                                  "'none' = no early stop.")
-        # Paper: the target model is sampled greedily.
-        parser.set_defaults(temperature=0.0)
 
     @classmethod
     def from_args(cls, args):
@@ -452,9 +451,9 @@ class PAIR(NoAttack):
                             help="Desired response prefix for the attacker's "
                                  "objective; default: the row's target or a "
                                  "'Sure, here is how to ...' synthesis.")
-        # TARGET_TEMP=0; target_max_n_tokens=150 -> 150-token answer window.
-        parser.set_defaults(temperature=0.0, gen_length=150,
-                            block_length=25, steps=150)
+        # TARGET_TEMP=0; target_max_n_tokens=150 -> 150-token answer window
+        # (paper sampling was greedy -- pass --temperature 0 for that setup).
+        parser.set_defaults(gen_length=150, block_length=25, steps=150)
 
     @classmethod
     def from_args(cls, args):
