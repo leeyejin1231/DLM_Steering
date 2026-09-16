@@ -7,6 +7,7 @@ everything else shared lives here.
 import glob
 import json
 import math
+import os
 import threading
 from pathlib import Path
 
@@ -24,31 +25,102 @@ MODEL_LOCK = threading.Lock()
 EOT_ID = 126348   # <|eot_id|>, closes the user turn in LLaDA's chat template
 NEWLINE_ID = 198  # '\n'; used to locate the DIJA template inside the prompt
 
+
+def block_index(layer):
+    """transformer.blocks[] index of a 1-based hidden-state layer.
+
+    THE layer-numbering convention for this repo, stated once here instead of
+    in every file that hooks a block: layer L means hidden_states[L], which is
+    the OUTPUT of blocks[L-1]. So layer 1 is blocks[0] and layer 25 is
+    blocks[24]. Every --layer / --detector-layer flag, every fitted bundle's
+    "layers" list, and every checkpoint's best_layer use this numbering.
+    """
+    if layer < 1:
+        raise ValueError(f"layer numbering is 1-based (layer 1 = blocks[0]); "
+                         f"got {layer}")
+    return layer - 1
+
+
+# Layer sweep shared by the vector and detector fits: hidden_states[1..31],
+# i.e. the outputs of blocks[0..30]. Both fits must sweep the same layers for
+# their "best layer" picks to be comparable.
+FIT_LAYERS = list(range(1, 32))
+
 DATA_DIR = Path(__file__).parent / "data"   # populated by data_downloader.py
 
-JBB_HARMFUL_GLOB = ("/mnt/shared/huggingface-cache/hub/datasets--JailbreakBench--JBB-Behaviors"
+# Recorded as the generation of a row whose attack/defense raised, so graders
+# can tell a failure apart from an empty answer and drop it from their
+# denominators instead of scoring a traceback (or dying on a missing key).
+ERROR_SENTINEL = "[STEERING_ERROR]"
+
+# Dataset locations RELATIVE to a Hugging Face cache root (see _hf_roots).
+# "hub/datasets--*" is the hub layout; bare "datasets/*" is the datasets
+# library's own cache. data/ files win over these -- see load_prompts.
+JBB_HARMFUL_GLOB = ("hub/datasets--JailbreakBench--JBB-Behaviors"
                     "/snapshots/*/data/harmful-behaviors.csv")
 JBB_BENIGN_GLOB = JBB_HARMFUL_GLOB.replace("harmful-", "benign-")
-XSTEST_GLOB = ("/mnt/shared/huggingface-cache/hub/datasets--walledai--XSTest"
-               "/snapshots/*/**/*.parquet")
-WJ_EVAL_GLOB = ("/mnt/shared/huggingface-cache/datasets/allenai___wildjailbreak"
-                "/eval-*/0.0.0/*/*.arrow")
-TRUTHFULQA_GLOB = ("/mnt/shared/huggingface-cache/hub/datasets--domenicrosati--TruthfulQA"
+XSTEST_GLOB = "hub/datasets--walledai--XSTest/snapshots/*/**/*.parquet"
+WJ_EVAL_GLOB = "datasets/allenai___wildjailbreak/eval-*/0.0.0/*/*.arrow"
+TRUTHFULQA_GLOB = ("hub/datasets--domenicrosati--TruthfulQA"
                    "/snapshots/*/**/*.csv")
-GSM8K_GLOB = "/mnt/shared/huggingface-cache/datasets/gsm8k/main/*/*/gsm8k-test.arrow"
-MMLU_GLOB = ("/mnt/shared/huggingface-cache/datasets/hails___mmlu_no_train"
-             "/*/*/*/mmlu_no_train-test.arrow")
-WALLEDAI_GLOB = ("/mnt/shared/huggingface-cache/hub/datasets--walledai--{}"
-                 "/snapshots/*/**/*.parquet")
+GSM8K_GLOB = "datasets/gsm8k/main/*/*/gsm8k-test.arrow"
+MMLU_GLOB = "datasets/hails___mmlu_no_train/*/*/*/mmlu_no_train-test.arrow"
+WALLEDAI_GLOB = "hub/datasets--walledai--{}/snapshots/*/**/*.parquet"
+
+# The shared mount this project was first run on. Kept as a fallback root so
+# those machines keep resolving, but it is no longer assumed to exist.
+LEGACY_HF_ROOT = Path("/mnt/shared/huggingface-cache")
+
+
+def _hf_roots():
+    """Hugging Face cache roots to search, most specific first.
+
+    A root is the directory holding both "hub/" and "datasets/". $HF_HOME is
+    that root; $HUGGINGFACE_HUB_CACHE points one level deeper at hub/, so its
+    parent is taken. Roots that do not exist simply match nothing.
+    """
+    roots, seen = [], set()
+    for value in (os.environ.get("HF_HOME"),
+                  os.environ.get("HUGGINGFACE_HUB_CACHE")):
+        if value:
+            path = Path(value)
+            roots.append(path.parent if path.name == "hub" else path)
+    roots.append(Path.home() / ".cache" / "huggingface")
+    roots.append(LEGACY_HF_ROOT)
+    return [r for r in roots if not (str(r) in seen or seen.add(str(r)))]
+
+
+def hf_glob(pattern, required=True):
+    """Sorted cache files matching `pattern` under the first root that has any.
+
+    `pattern` is relative to a cache root, so one call works against $HF_HOME,
+    the default user cache, or the legacy shared mount.
+    """
+    for root in _hf_roots():
+        hits = sorted(glob.glob(str(root / pattern), recursive=True))
+        if hits:
+            return hits
+    if required:
+        raise FileNotFoundError(
+            f"no Hugging Face cache file matches {pattern!r} under any of "
+            f"{[str(r) for r in _hf_roots()]} -- set HF_HOME, or run "
+            f"data_downloader.py to populate {DATA_DIR}")
+    return []
 
 
 def load_llada(device=None):
-    """LLaDA tokenizer and eval-mode bf16 model on `device`."""
+    """LLaDA tokenizer and eval-mode bf16 model on `device`.
+
+    device_map puts each checkpoint shard straight on the target device.
+    `.to(device)` instead materialises the whole 16 GB state dict in CPU RAM
+    first, which measures ~3x slower (15.6s -> 5.0s) for bit-identical weights.
+    """
     from transformers import AutoModel, AutoTokenizer
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     model = AutoModel.from_pretrained(MODEL_NAME, trust_remote_code=True,
-                                      torch_dtype=torch.bfloat16).to(device).eval()
+                                      torch_dtype=torch.bfloat16,
+                                      device_map={"": device}).eval()
     return tokenizer, model
 
 
@@ -66,7 +138,6 @@ def enable_reproducibility(seed=42):
 
     Must run before the first CUDA op so CUBLAS_WORKSPACE_CONFIG is already
     set when the cublas handle is created."""
-    import os
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     seed_all(seed)
     torch.use_deterministic_algorithms(True)
@@ -129,7 +200,8 @@ def auroc(pos, neg):
     return (ranks[:n_p].sum() - n_p * (n_p + 1) / 2) / (n_p * n_n)
 
 
-HARMFUL_SOURCES = ("jbb_harmful", "advbench", "harmbench", "strongreject", "xstest_unsafe")
+HARMFUL_SOURCES = ("jbb_harmful", "advbench", "harmbench", "strongreject",
+                   "xstest_unsafe", "wj_unsafe")
 # Safe sets for over-refusal: every refusal here is a utility loss.
 BENIGN_SOURCES = ("truthfulqa", "xstest_safe", "jbb_benign", "wj_benign")
 # Graded sets for generalisation: rows carry "answer"/"task" and are scored
@@ -173,9 +245,7 @@ def load_utility_prompts(source):
     import pandas as pd
     rows = []
     if source == "mmlu":
-        files = sorted(glob.glob(MMLU_GLOB))
-        if not files:
-            raise FileNotFoundError(MMLU_GLOB)
+        files = hf_glob(MMLU_GLOB)
         df = pd.concat([_read_arrow(f) for f in files], ignore_index=True)
         order = list(range(len(df)))
         random.Random(0).shuffle(order)
@@ -187,17 +257,14 @@ def load_utility_prompts(source):
                                              f"The following is a multiple choice question about {subject}."),
                          "answer": LETTERS[int(r["answer"])], "target": None})
     elif source == "gsm8k":
-        files = glob.glob(GSM8K_GLOB)
-        if not files:
-            raise FileNotFoundError(GSM8K_GLOB)
-        df = _read_arrow(files[0])
+        df = _read_arrow(hf_glob(GSM8K_GLOB)[0])
         for i, r in df.iterrows():
             gold = str(r["answer"]).split("####")[-1].strip().replace(",", "")
             rows.append({"index": int(i), "task": "gsm8k",
                          "prompt": f"{r['question']}\n\n{GSM8K_INSTRUCTION}",
                          "answer": gold, "target": None})
     elif source == "truthfulqa_mc":
-        df = pd.read_csv(glob.glob(TRUTHFULQA_GLOB, recursive=True)[0])
+        df = pd.read_csv(hf_glob(TRUTHFULQA_GLOB)[0])
         for i, r in df.iterrows():
             best = str(r["Best Answer"]).strip()
             wrong = [a.strip() for a in str(r["Incorrect Answers"]).split(";") if a.strip()]
@@ -227,7 +294,7 @@ def load_prompts(source):
         return load_utility_prompts(source)
     if source == "jbb_harmful":
         local = DATA_DIR / "jbb_harmful.csv"
-        df = pd.read_csv(local if local.exists() else glob.glob(JBB_HARMFUL_GLOB)[0])
+        df = pd.read_csv(local if local.exists() else hf_glob(JBB_HARMFUL_GLOB)[0])
         return [{"index": int(r["Index"]), "prompt": str(r["Goal"]), "target": str(r["Target"])}
                 for _, r in df.iterrows()]
     if source in PROMPT_SOURCES:
@@ -244,7 +311,7 @@ def load_eval_prompts(source, limit):
     """
     import pandas as pd
     if source.startswith("xstest"):
-        df = pd.read_parquet(glob.glob(XSTEST_GLOB, recursive=True)[0])
+        df = pd.read_parquet(hf_glob(XSTEST_GLOB)[0])
         # "xstest_unsafe".endswith("safe") is True, so match the suffix explicitly.
         want = "unsafe" if source.endswith("_unsafe") else "safe"
         df = df[df["label"] == want]
@@ -256,7 +323,7 @@ def load_eval_prompts(source, limit):
         # and only permissibility differs.
         local = DATA_DIR / f"{source}.csv"
         pattern = JBB_BENIGN_GLOB if source == "jbb_benign" else JBB_HARMFUL_GLOB
-        df = pd.read_csv(local if local.exists() else glob.glob(pattern)[0])
+        df = pd.read_csv(local if local.exists() else hf_glob(pattern)[0])
         prompts = df["Goal"].tolist()
     elif source in ("advbench", "harmbench", "strongreject"):
         # Out-of-distribution harmful benchmarks: bare requests in attack styles
@@ -268,18 +335,24 @@ def load_eval_prompts(source, limit):
         else:
             name = {"advbench": "AdvBench", "harmbench": "HarmBench",
                     "strongreject": "StrongREJECT"}[source]
-            files = sorted(glob.glob(WALLEDAI_GLOB.format(name), recursive=True))
+            files = hf_glob(WALLEDAI_GLOB.format(name))
             df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
         prompts = list(dict.fromkeys(df["prompt"].astype(str).tolist()))
     elif source == "truthfulqa":
         # Plain harmless questions: nothing here should ever be refused, so the
         # refusal rate is a direct read on utility damage rather than on
         # sensitivity to harmful-sounding surface words.
-        df = pd.read_csv(glob.glob(TRUTHFULQA_GLOB, recursive=True)[0])
+        df = pd.read_csv(hf_glob(TRUTHFULQA_GLOB)[0])
         prompts = df["Question"].tolist()
+    elif source == "wj_unsafe":
+        # The WildJailbreak adversarial-harmful prompts the steering vector and
+        # detector were fitted on. Rows 0..19 are the held-out eval split the
+        # gated pipeline reports; the fits use rows 20+.
+        df = pd.read_csv(DATA_DIR / "llada8b_wild_unsafe_only.csv")
+        prompts = df["prompt"].tolist()
     elif source == "wj_benign":
         import pyarrow as pa
-        f = glob.glob(WJ_EVAL_GLOB)[0]
+        f = hf_glob(WJ_EVAL_GLOB)[0]
         with pa.memory_map(f) as src:
             ev = pa.ipc.open_stream(src).read_all().to_pandas()
         prompts = ev[ev["data_type"] == "adversarial_benign"]["adversarial"].tolist()
@@ -354,8 +427,55 @@ def parse_gpu_ids(spec):
     return gpu_ids
 
 
+def plan_shards(spec, pairs=False):
+    """Resolve --gpus into per-shard device groups, or pin this process.
+
+    Returns [] when the spec names a single group: there is nothing to run in
+    parallel, so CUDA_VISIBLE_DEVICES is set here and the caller does the work
+    inline. That skips a subprocess, a second model load and the .partN files
+    a one-shard run would otherwise leave behind -- which is what `--gpus 0` on
+    a single-GPU machine means.
+
+    `pairs` groups the ids two at a time, for an attack that drives a second
+    model and must keep it off the target's card.
+
+    Must be called before the first CUDA op, since it may set
+    CUDA_VISIBLE_DEVICES.
+    """
+    import os
+    ids = parse_gpu_ids(spec)
+    if pairs:
+        if len(ids) < 2 or len(ids) % 2:
+            raise SystemExit(
+                "this attack needs an even --gpus list: each shard runs the "
+                "target on one GPU and the attack LLM on another "
+                "(e.g. --gpus 0,1,2,3 -> 2 shards)")
+        groups = [f"{a},{b}" for a, b in zip(ids[::2], ids[1::2])]
+    else:
+        groups = ids
+    if len(groups) == 1:
+        os.environ["CUDA_VISIBLE_DEVICES"] = groups[0]
+        return []
+    return groups
+
+
+def child_launcher(entry):
+    """The `python ...` prefix a shard child is invoked with.
+
+    A path ending in .py is run directly; anything else is a dotted module
+    name run with -m, which is what members of the steering package need for
+    their absolute imports of common.py / Evaluator.py to resolve.
+    """
+    import sys
+    if str(entry).endswith(".py"):
+        return [sys.executable, str(Path(entry).resolve())]
+    return [sys.executable, "-m", str(entry)]
+
+
 def spawn_shards(script, argv, gpu_ids, slices, out, extra_args=None):
     """One `python <script>` subprocess per slice on its own GPU set.
+
+    `script` is a file path or a dotted module name -- see child_launcher.
 
     gpu_ids entries may be comma-separated groups ("0,1"): a shard needing a
     second model (e.g. an attack LLM) gets two visible devices per process.
@@ -373,7 +493,7 @@ def spawn_shards(script, argv, gpu_ids, slices, out, extra_args=None):
     for i, ((s, n), gpu) in enumerate(zip(slices, gpu_ids)):
         part = out.with_name(f"{out.stem}.part{i}{out.suffix}")
         log = part.with_suffix(".log")
-        cmd = [sys.executable, str(Path(script).resolve()), *argv,
+        cmd = [*child_launcher(script), *argv,
                "--start", str(s), "--n", str(n), "--out", str(part)]
         if extra_args:
             cmd += [str(a) for a in extra_args(i, gpu)]
