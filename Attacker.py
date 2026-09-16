@@ -111,12 +111,8 @@ class Prefix(NoAttack):
         self.prefix = Path(prefix_file).read_text().rstrip()
 
     @classmethod
-    def add_args(cls, parser):
-        parser.add_argument("--prefix-file", default="attacks/prefix.txt")
-
-    @classmethod
     def from_args(cls, args):
-        return cls(args.prefix_file)
+        return cls()
 
     def build_prompt(self, row):
         return f"{self.prefix}\n\n{row['prompt']}"
@@ -153,10 +149,6 @@ class DIJA(NoAttack):
 
     @classmethod
     def add_args(cls, parser):
-        parser.add_argument("--dija-dir", default="DIJA",
-                            help="DIJA repo root holding run_*/refine_prompt/*.json")
-        parser.add_argument("--dija-version", default="Qwen",
-                            help="Refined-prompt file suffix (refiner model).")
         parser.add_argument("--dija-steps", default="auto",
                             help="'auto': one mask per step like the original loop; "
                                  "or an integer number of steps.")
@@ -166,7 +158,7 @@ class DIJA(NoAttack):
     @classmethod
     def from_args(cls, args):
         steps = args.dija_steps if args.dija_steps == "auto" else int(args.dija_steps)
-        return cls(args.source, args.dija_dir, args.dija_version, steps)
+        return cls(args.source, steps=steps)
 
     def build_prompt(self, row):
         key = row["prompt"].strip()
@@ -295,9 +287,6 @@ class PAP(NoAttack):
     def add_args(cls, parser):
         parser.add_argument("--pap-llm", default="Qwen/Qwen3-14B",
                             help="HF model for the persuasive paraphraser.")
-        parser.add_argument("--pap-device", default=None,
-                            help="Device for the paraphraser/judge model "
-                                 "(default: cuda:1 when visible, else cuda:0).")
         parser.add_argument("--pap-trials", type=int, default=10,
                             help="Max retries of the row's assigned technique "
                                  "(paper: 10 trials).")
@@ -307,8 +296,6 @@ class PAP(NoAttack):
                                  "GPT-4/Qi et al. 1-5 rubric on the paraphraser "
                                  "model (5 = jailbreak), 'gcg' = keyword judge, "
                                  "'none' = no early stop.")
-        parser.add_argument("--pap-taxonomy", default=None,
-                            help="Path to persuasion_taxonomy.jsonl.")
         # Paper: the target model is sampled greedily.
         parser.set_defaults(temperature=0.0)
 
@@ -316,11 +303,9 @@ class PAP(NoAttack):
     def from_args(cls, args):
         import attack_prompts
         from attack_llms import HFChat, make_loop_judge
-        llm = HFChat.shared(args.pap_llm,
-                            device=args.pap_device or _default_attack_device())
+        llm = HFChat.shared(args.pap_llm, device=_default_attack_device())
         judge = make_loop_judge(args.pap_judge, llm, kind="pap")
-        taxonomy = {t["ss_technique"]: t for t in attack_prompts.load_pap_taxonomy(
-            args.pap_taxonomy or attack_prompts.PAP_TAXONOMY_PATH)}
+        taxonomy = {t["ss_technique"]: t for t in attack_prompts.load_pap_taxonomy()}
         lowered = {k.lower(): k for k in taxonomy}
         missing = [t for t in cls.TOP5 if t.lower() not in lowered]
         if missing:
@@ -442,9 +427,6 @@ class PAIR(NoAttack):
     def add_args(cls, parser):
         parser.add_argument("--pair-llm", default="Qwen/Qwen3-14B",
                             help="HF model for the attacker (and hf judge).")
-        parser.add_argument("--pair-device", default=None,
-                            help="Device for the attacker/judge model "
-                                 "(default: cuda:1 when visible, else cuda:0).")
         parser.add_argument("--pair-streams", type=int, default=5,
                             help="Concurrent jailbreak conversations "
                                  "(README-recommended 5; the paper used 20, "
@@ -477,8 +459,7 @@ class PAIR(NoAttack):
     @classmethod
     def from_args(cls, args):
         from attack_llms import HFChat, make_loop_judge
-        llm = HFChat.shared(args.pair_llm,
-                            device=args.pair_device or _default_attack_device())
+        llm = HFChat.shared(args.pair_llm, device=_default_attack_device())
         judge = make_loop_judge(args.pair_judge, llm, kind="pair")
         if hasattr(judge, "max_n_tokens"):
             judge.max_n_tokens = args.pair_judge_tokens

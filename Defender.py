@@ -865,7 +865,6 @@ class ProposedDefense(Defender):
         parser.add_argument("--mode", choices=["baseline", "steer", "repair"], default="repair")
         parser.add_argument("--max-remask-tokens", type=int, default=16)
         parser.add_argument("--max-parallel-commit", type=int, default=2)
-        parser.add_argument("--no-initial-only", action="store_true")
 
     @classmethod
     def from_args(cls, args, model):
@@ -880,8 +879,7 @@ class ProposedDefense(Defender):
         return cls(model, gate, csd, layers=layers, total_steps=args.steps,
                    strength=args.strength, mode=args.mode,
                    max_remask_tokens=args.max_remask_tokens,
-                   max_parallel_commit=args.max_parallel_commit,
-                   initial_only=not args.no_initial_only)
+                   max_parallel_commit=args.max_parallel_commit)
 
     def defend(self, model, prompt_ids, **gen_config):
         # Attacks may override steps per prompt (DIJA: one mask per step).
