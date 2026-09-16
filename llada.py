@@ -12,6 +12,7 @@ from transformers import AutoModel, AutoTokenizer
 
 MODEL_NAME = "GSAI-ML/LLaDA-8B-Instruct"
 MASK_ID = 126336  # [MASK] token id used by LLaDA
+PAD_ID = 126081   # <|endoftext|>; also the eos/pad id in the model config
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 

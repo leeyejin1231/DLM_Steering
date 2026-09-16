@@ -100,6 +100,16 @@ class Defender(ABC):
         from sampler import generate
         return generate(model, prompt_ids, self, **gen_config)
 
+    def defend_batch(self, model, prompt_ids_list, **gen_config):
+        """A batch of defended generations; sequential by default.
+
+        Stateful defenses (remask/recovery branch per sequence) cannot share
+        a denoising loop, so only NullDefender overrides this with the truly
+        batched sampler.
+        """
+        return [self.defend(model, ids, **gen_config)
+                for ids in prompt_ids_list]
+
 
 class NullDefender(Defender):
     """Undefended reference: plain model forwards."""
@@ -129,6 +139,11 @@ class NullDefender(Defender):
             return self.model(x)
         finally:
             handle.remove()
+
+    def defend_batch(self, model, prompt_ids_list, **gen_config):
+        """No hooks -> rows denoise uniformly; safe to share one loop."""
+        from sampler import generate_batch
+        return generate_batch(model, prompt_ids_list, **gen_config)
 
     def result_fields(self):
         return {}

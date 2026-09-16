@@ -129,6 +129,23 @@ def main():
         cfg = {**gen_config, **attacker.gen_overrides(ids)}
         return defender.defend(model, ids, **cfg), ids, cfg, shown
 
+    def respond_batch(user_messages):
+        """A batch of user turns -> list of (x, ids, cfg, shown).
+
+        defender.defend_batch is a real batched denoising loop under
+        --defense none and a sequential fallback otherwise; per-prompt
+        gen_overrides that disagree also fall back to sequential calls.
+        """
+        shown = [defender.transform_prompt(m) for m in user_messages]
+        all_ids = [encode_prompt(tokenizer, s, device) for s in shown]
+        cfgs = [{**gen_config, **attacker.gen_overrides(i)} for i in all_ids]
+        if all(c == cfgs[0] for c in cfgs):
+            outs = defender.defend_batch(model, all_ids, **cfgs[0])
+        else:
+            outs = [defender.defend(model, i, **c)
+                    for i, c in zip(all_ids, cfgs)]
+        return list(zip(outs, all_ids, cfgs, shown))
+
     results = []
     t_start = time.time()
     for i, row in enumerate(rows):
@@ -138,7 +155,8 @@ def main():
                                      device) if attacker.needs_vanilla else None)
 
         t0 = time.time()
-        result = attacker.run(row, respond, tokenizer, vanilla_ids)
+        result = attacker.run(row, respond, tokenizer, vanilla_ids,
+                              respond_batch=respond_batch)
         elapsed = time.time() - t0
 
         generation, extra = result.generation, result.extra

@@ -67,12 +67,14 @@ class Attacker(ABC):
         vanilla_ids: the un-attacked user turn encoded the same way (after the
         defense's prompt transform), for attacks that grade relative to it."""
 
-    def run(self, row, respond, tokenizer, vanilla_ids=None):
+    def run(self, row, respond, tokenizer, vanilla_ids=None, respond_batch=None):
         """Drive the per-row attack; default is the one-shot path.
 
         respond(user_message) sends one user turn through the defense and
         returns (x, prompt_ids, cfg, shown) where shown is the text the target
-        actually saw (after defender.transform_prompt)."""
+        actually saw (after defender.transform_prompt). respond_batch does the
+        same for a list of messages -- a real batched sampler under --defense
+        none, a sequential fallback otherwise."""
         out, ids, cfg, shown = respond(self.build_prompt(row))
         generation, extra = self.decode(tokenizer, out, ids, vanilla_ids)
         return AttackResult(shown, generation, extra, cfg, ids)
@@ -282,12 +284,16 @@ class PAP(NoAttack):
     needs_second_device = True
 
     def __init__(self, llm, judge, techniques, variant="taxonomy", trials=10,
-                 taxonomy=None, better_templates=None, one_shot_kd=None):
+                 taxonomy=None, better_templates=None, one_shot_kd=None,
+                 batch=8):
         self.llm, self.judge = llm, judge
         self.techniques, self.variant, self.trials = techniques, variant, trials
+        if batch <= 0:
+            raise ValueError("--pap-batch must be positive")
         self.taxonomy = taxonomy or {}
         self.better_templates = better_templates or {}
         self.one_shot_kd = one_shot_kd
+        self.batch = batch
 
     @classmethod
     def add_args(cls, parser):
@@ -317,6 +323,11 @@ class PAP(NoAttack):
                             help="Path to persuasion_taxonomy.jsonl.")
         parser.add_argument("--pap-better-templates", default=None,
                             help="Path to the better-in-context templates json.")
+        parser.add_argument("--pap-batch", type=int, default=8,
+                            help="Techniques mutated/evaluated per batched call "
+                                 "(the scan still runs in order and stops at the "
+                                 "first jailbreak; leftover chunk work is "
+                                 "discarded). 1 = fully sequential.")
         # Paper: the target model is sampled greedily.
         parser.set_defaults(temperature=0.0)
 
@@ -338,7 +349,8 @@ class PAP(NoAttack):
             kw["one_shot_kd"] = attack_prompts.load_one_shot_kd()
             pool = [t["ss_technique"] for t in taxonomy]
         techniques = cls._resolve_techniques(args.pap_techniques, pool)
-        return cls(llm, judge, techniques, args.pap_variant, args.pap_trials, **kw)
+        return cls(llm, judge, techniques, args.pap_variant, args.pap_trials,
+                   batch=args.pap_batch, **kw)
 
     @staticmethod
     def _resolve_techniques(spec, pool):
@@ -389,28 +401,53 @@ class PAP(NoAttack):
                 temperature=1, top_p=1, max_new_tokens=2500)
             return remove_quotes([raw])[0]
 
-    def run(self, row, respond, tokenizer, vanilla_ids=None):
+    def _mutate_batch(self, goal, techniques):
+        """One paraphrase per technique via a single batched call.
+
+        The 'better' variant keeps its per-technique infinite-retry loop --
+        its reference quirk (the unescaped '%' template) lives inside that
+        retry and must not be hoisted into batch prompt construction.
+        """
+        from attack_prompts import remove_quotes
+        if self.variant == "better":
+            return [self._mutate(goal, t) for t in techniques]
+        convs = [[{"role": "user", "content": self.one_shot_kd % (
+            t["ss_technique"], t["ss_definition"], t["ss_example"],
+            goal, t["ss_technique"], goal, goal)}]
+            for t in (self.taxonomy[x] for x in techniques)]
+        raws = self.llm.generate_batch(convs, temperature=1, top_p=1,
+                                       max_new_tokens=2500)
+        return remove_quotes(raws)
+
+    def run(self, row, respond, tokenizer, vanilla_ids=None, respond_batch=None):
         goal = row["prompt"]
         history, best, best_score = [], None, -1
+        jb_score = getattr(self.judge, "jailbreak_score", 10)
+        answer = respond_batch or (lambda msgs: [respond(m) for m in msgs])
         for trial in range(1, self.trials + 1):
-            for tech in self.techniques:
-                pap = self._mutate(goal, tech)
-                out, ids, cfg, shown = respond(pap)
-                resp = _assistant_text(tokenizer, out, ids)
-                score = self.judge.score([pap], [resp], goal, None)[0]
-                history.append({"trial": trial, "technique": tech,
-                                "pap": pap, "response": resp, "score": score})
-                print(f"    [pap] t{trial} {tech}: score={score}", flush=True)
-                if score is not None and score > best_score:
-                    best, best_score = (shown, resp, ids, cfg, tech), score
-                if score == getattr(self.judge, "jailbreak_score", 10):
-                    extra = {"assistant_text": resp,
-                             "pap": {"jailbroken": True, "technique": tech,
-                                     "trial": trial, "queries_to_jailbreak":
-                                     (trial - 1) * len(self.techniques)
-                                     + self.techniques.index(tech) + 1,
-                                     "history": history}}
-                    return AttackResult(shown, resp, extra, cfg, ids)
+            for lo in range(0, len(self.techniques), self.batch):
+                chunk = self.techniques[lo:lo + self.batch]
+                paps = self._mutate_batch(goal, chunk)
+                outs = answer(paps)
+                resps = [_assistant_text(tokenizer, o, i) for o, i, _, _ in outs]
+                scores = self.judge.score(paps, resps, goal, None)
+                for tech, pap, (out, ids, cfg, shown), resp, score in zip(
+                        chunk, paps, outs, resps, scores):
+                    history.append({"trial": trial, "technique": tech,
+                                    "pap": pap, "response": resp,
+                                    "score": score})
+                    print(f"    [pap] t{trial} {tech}: score={score}",
+                          flush=True)
+                    if score is not None and score > best_score:
+                        best, best_score = (shown, resp, ids, cfg, tech), score
+                    if score == jb_score:
+                        extra = {"assistant_text": resp,
+                                 "pap": {"jailbroken": True, "technique": tech,
+                                         "trial": trial, "queries_to_jailbreak":
+                                         (trial - 1) * len(self.techniques)
+                                         + self.techniques.index(tech) + 1,
+                                         "history": history}}
+                        return AttackResult(shown, resp, extra, cfg, ids)
         shown, resp, ids, cfg, tech = best
         extra = {"assistant_text": resp,
                  "pap": {"jailbroken": False, "best_score": best_score,
@@ -525,14 +562,18 @@ class PAIR(NoAttack):
         indices = list(range(len(convs)))
         valid = [None] * len(convs)
         for _ in range(self.max_n_attack_attempts):
-            for i in list(indices):
-                conv = convs[i]
-                msgs = ([{"role": "system", "content": conv["system"]}]
-                        + conv["msgs"]
-                        + [{"role": "assistant", "content": init_message}])
-                raw = self.llm.generate(msgs, temperature=1, top_p=0.9,
-                                        max_new_tokens=self.attack_max_tokens,
-                                        stop=["}"], continue_final=True)
+            # Streams are independent within an iteration, so one left-padded
+            # batch covers all pending convs (the reference's batched_generate);
+            # parse failures re-batch on the next attempt round.
+            msgs_batch = [([{"role": "system", "content": convs[i]["system"]}]
+                           + convs[i]["msgs"]
+                           + [{"role": "assistant", "content": init_message}])
+                          for i in indices]
+            raws = self.llm.generate_batch(
+                msgs_batch, temperature=1, top_p=0.9,
+                max_new_tokens=self.attack_max_tokens,
+                stop=["}"], continue_final=True)
+            for i, raw in zip(list(indices), raws):
                 full_output = init_message + raw + "}"
                 attack_dict, json_str = extract_json(full_output)
                 if attack_dict is not None:
@@ -547,7 +588,7 @@ class PAIR(NoAttack):
             conv["msgs"].append({"role": "assistant", "content": json_str})
         return [a for a, _ in valid]
 
-    def run(self, row, respond, tokenizer, vanilla_ids=None):
+    def run(self, row, respond, tokenizer, vanilla_ids=None, respond_batch=None):
         from attack_prompts import (get_attacker_system_prompts, get_init_msg,
                                     process_target_response)
         goal, target_str = row["prompt"], self._target_str(row)
@@ -563,9 +604,11 @@ class PAIR(NoAttack):
                              for r, s in zip(target_responses, judge_scores)]
             attacks = self._get_attacks(convs, processed)
             adv_prompts = [a["prompt"] for a in attacks]
+            outs = (respond_batch(adv_prompts) if respond_batch is not None
+                    else [respond(a) for a in adv_prompts])
             target_responses = []
-            for i, adv in enumerate(adv_prompts):
-                out, ids, cfg, shown = respond(adv)
+            for i, (adv, (out, ids, cfg, shown)) in enumerate(
+                    zip(adv_prompts, outs)):
                 resp = _assistant_text(tokenizer, out, ids)
                 target_responses.append(resp)
                 attempts.append({"iteration": iteration, "stream": i,

@@ -17,7 +17,7 @@ like the rest.
 import torch
 
 from common import MASK_ID, step_scale
-from llada import add_gumbel_noise, get_num_transfer_tokens
+from llada import PAD_ID, add_gumbel_noise, get_num_transfer_tokens
 
 
 def commit_sample(x, logits, eligible, count, temperature, remasking, final=False):
@@ -126,3 +126,96 @@ def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
                 last_block=num_block == num_blocks - 1)
 
     return x
+
+
+@torch.no_grad()
+def generate_batch(model, prompts, *, steps=128, gen_length=128,
+                   block_length=32, temperature=0.0, remasking="low_confidence",
+                   schedule="const", pad_id=PAD_ID):
+    """Batched undefended diffusion sampling over left-padded prompts.
+
+    prompts: list of (1, L_i) token-id tensors. Rows are left-padded with
+    pad_id so every prompt ends at the same column and the appended answer
+    region (hence block boundaries) aligns across the batch; pad columns are
+    excluded via attention_mask, so each row denoises as in generate() (RoPE
+    keeps real-token relative positions unchanged). Defense policies hold
+    per-sequence state with divergent control flow (remask/recovery), so
+    they cannot run here -- this is the --defense none path. `schedule` is
+    accepted for signature parity with generate(); it only feeds defender
+    hooks, which do not run. Returns one (1, L_i + gen_length) sequence per
+    input prompt, padding stripped.
+
+    Batched kernels reduce in a different order than the per-prompt path, so
+    outputs are numerically equivalent but not guaranteed bit-identical.
+    """
+    if gen_length < 0 or block_length <= 0 or steps <= 0:
+        raise ValueError("gen_length must be >= 0; block length and steps must be positive")
+    if gen_length and (gen_length % block_length or steps % (gen_length // block_length)):
+        raise ValueError("gen_length must be a multiple of block_length and steps of num_blocks")
+    for p in prompts:
+        if p.ndim != 2 or p.shape[0] != 1:
+            raise ValueError("generate_batch takes a list of (1, L) tensors")
+    if not prompts:
+        return []
+    if len(prompts) == 1:
+        return [generate(model, prompts[0], defender=None, steps=steps,
+                         gen_length=gen_length, block_length=block_length,
+                         temperature=temperature, remasking=remasking)]
+
+    batch = len(prompts)
+    prompt_len = max(p.shape[1] for p in prompts)
+    width = prompt_len + gen_length
+    x = torch.full((batch, width), MASK_ID, dtype=torch.long,
+                   device=model.device)
+    attention_mask = torch.zeros(batch, width, dtype=torch.long,
+                                 device=model.device)
+    for r, p in enumerate(prompts):
+        pad = prompt_len - p.shape[1]
+        x[r, :pad] = pad_id
+        x[r, pad:pad + p.shape[1]] = p[0]
+        attention_mask[r, pad:] = 1
+    region = x == MASK_ID
+    if not region.any():
+        return [x[r:r + 1, prompt_len - p.shape[1]:]
+                for r, p in enumerate(prompts)]
+
+    num_blocks = gen_length // block_length if gen_length else 1
+    steps_per_block = steps // num_blocks
+    ln_f = model.model.transformer.ln_f
+    for num_block in range(num_blocks):
+        block_end = (min(prompt_len + (num_block + 1) * block_length, width)
+                     if gen_length else width)
+        scope = region.clone()
+        scope[:, block_end:] = False
+        schedule_counts = get_num_transfer_tokens(
+            (x == MASK_ID) & scope, steps_per_block)
+        eligible = [((x[r] == MASK_ID) & scope[r]).nonzero().flatten()
+                    for r in range(batch)]
+
+        for i in range(steps_per_block):
+            if not any(e.numel() for e in eligible):
+                break
+            # Per-row eligible positions differ, so flatten them into
+            # (row * width + pos) and slice ln_f's [B*seq, hidden] once:
+            # the vocab projection runs on total eligible rows only.
+            flat = torch.cat([e + r * width
+                              for r, e in enumerate(eligible) if e.numel()])
+            handle = ln_f.register_forward_hook(
+                lambda m, _i, o: o.reshape(-1, o.shape[-1])[flat].unsqueeze(0))
+            try:
+                logits = model(x, attention_mask=attention_mask).logits
+            finally:
+                handle.remove()
+            offset = 0
+            for r in range(batch):
+                n = eligible[r].numel()
+                if not n:
+                    continue
+                eligible[r] = commit_sample(
+                    x[r:r + 1], logits[:, offset:offset + n], eligible[r],
+                    int(schedule_counts[r, i]), temperature, remasking,
+                    final=(i == steps_per_block - 1))
+                offset += n
+
+    return [x[r:r + 1, prompt_len - p.shape[1]:]
+            for r, p in enumerate(prompts)]

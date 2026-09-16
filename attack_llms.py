@@ -49,6 +49,8 @@ class HFChat:
                                  else "cuda:0")
         print(f"loading attack/judge model {self.model_id} on {device} ...")
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_id, torch_dtype=self.dtype).to(device).eval()
         self.device = device
@@ -82,6 +84,49 @@ class HFChat:
         if cut:
             text = text[:min(cut)]
         return text
+
+    @torch.no_grad()
+    def generate_batch(self, messages_list, *, temperature=1.0, top_p=1.0,
+                       max_new_tokens=512, stop=(), continue_final=False):
+        """generate() over a list of message lists via one left-padded batch.
+
+        Same semantics per row (template, sampling knobs, stop-string cut);
+        rows that finish early are pad-filled and decoded with
+        skip_special_tokens, so outputs match sequential calls modulo batched
+        kernel/RNG differences -- not guaranteed bit-identical.
+        """
+        self.load()
+        texts = [self.tokenizer.apply_chat_template(
+            m, tokenize=False,
+            add_generation_prompt=not continue_final,
+            continue_final_message=continue_final,
+            enable_thinking=False) for m in messages_list]
+        prev_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"
+        try:
+            ids = self.tokenizer(texts, return_tensors="pt",
+                                 padding=True).to(self.model.device)
+        finally:
+            self.tokenizer.padding_side = prev_side
+        kw = {"max_new_tokens": max_new_tokens,
+              "pad_token_id": self.tokenizer.pad_token_id}
+        if stop:
+            kw.update(stop_strings=list(stop), tokenizer=self.tokenizer)
+        if temperature and temperature > 0:
+            kw.update(do_sample=True, temperature=temperature, top_p=top_p)
+        else:
+            kw["do_sample"] = False
+        out = self.model.generate(**ids, **kw)
+        prompt_w = ids["input_ids"].shape[1]
+        results = []
+        for i in range(out.shape[0]):
+            text = self.tokenizer.decode(out[i, prompt_w:],
+                                         skip_special_tokens=True)
+            cut = [j for j in (text.find(s) for s in stop) if j >= 0]
+            if cut:
+                text = text[:min(cut)]
+            results.append(text)
+        return results
 
     def close(self):
         self.model = None
@@ -201,14 +246,12 @@ class PairHFJudge:
 
     def score(self, prompts, responses, goal, target_str):
         system = get_judge_system_prompt(goal, target_str)
-        outputs = []
-        for prompt, response in zip(prompts, responses):
-            conv = [{"role": "system", "content": system},
-                    {"role": "user", "content": get_judge_prompt(prompt, response)}]
-            raw = self.llm.generate(conv, temperature=0, top_p=1,
-                                    max_new_tokens=self.max_n_tokens)
-            outputs.append(self.process_output(raw))
-        return outputs
+        convs = [[{"role": "system", "content": system},
+                  {"role": "user", "content": get_judge_prompt(p, r)}]
+                 for p, r in zip(prompts, responses)]
+        raws = self.llm.generate_batch(convs, temperature=0, top_p=1,
+                                       max_new_tokens=self.max_n_tokens)
+        return [self.process_output(raw) for raw in raws]
 
 
 class QiJudge:
@@ -230,14 +273,12 @@ class QiJudge:
         # The behavior slot takes the original harmful goal (HarmBench
         # convention), not the persuasive paraphrase the target saw.
         behaviors = [goal] * len(responses) if goal is not None else prompts
-        outputs = []
-        for behavior, generation in zip(behaviors, responses):
-            conv = [{"role": "user",
-                     "content": self.template % (behavior, generation)}]
-            raw = self.llm.generate(conv, temperature=0, top_p=0,
-                                    max_new_tokens=self.max_n_tokens)
-            outputs.append(qi_extract_score(raw))
-        return outputs
+        convs = [[{"role": "user",
+                  "content": self.template % (b, g)}]
+                 for b, g in zip(behaviors, responses)]
+        raws = self.llm.generate_batch(convs, temperature=0, top_p=0,
+                                       max_new_tokens=self.max_n_tokens)
+        return [qi_extract_score(raw) for raw in raws]
 
 
 def make_loop_judge(spec, llm, *, kind):
