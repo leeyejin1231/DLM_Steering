@@ -124,7 +124,7 @@ def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
 
         if defender is not None:
             defender.after_block(
-                x, region, block_index=num_block, block_positions=block_positions,
+                x, region, block_number=num_block, block_positions=block_positions,
                 prompt_length=prompt_length,
                 temperature=temperature, remasking=remasking,
                 last_block=num_block == num_blocks - 1, rng=rng)
@@ -162,9 +162,13 @@ def generate_batch(model, prompts, *, steps=128, gen_length=128,
     if not prompts:
         return []
     if len(prompts) == 1:
+        # rng and schedule must be forwarded: this is the same generation the
+        # caller would get from defend(), and dropping rng would silently move
+        # sampling back to the global RNG, breaking per-row determinism.
         return [generate(model, prompts[0], defender=None, steps=steps,
                          gen_length=gen_length, block_length=block_length,
-                         temperature=temperature, remasking=remasking)]
+                         temperature=temperature, remasking=remasking,
+                         schedule=schedule, rng=rng)]
 
     batch = len(prompts)
     prompt_len = max(p.shape[1] for p in prompts)

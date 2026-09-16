@@ -14,14 +14,14 @@ transform_prompt() is a separate prompt-side hook for defenses that only
 edit the user message.
 """
 
-import argparse
 import math
 from abc import ABC, abstractmethod
+from dataclasses import asdict, dataclass, field
+from typing import Any
 
 import torch
 
-from common import MASK_ID, MODEL_LOCK, load_detector
-from proposed import Proposed
+from common import MASK_ID, MODEL_LOCK, block_index, load_detector
 
 
 def _hidden(output):
@@ -30,6 +30,83 @@ def _hidden(output):
 
 def _replace(output, hidden):
     return (hidden,) + tuple(output[1:]) if isinstance(output, tuple) else hidden
+
+
+class _GateReached(Exception):
+    """Stops a detector-only forward once the gate block has been captured.
+
+    Nothing after blocks[gate_layer - 1] can change what the detector reads, so
+    on a probe or audit pass the remaining blocks and the vocab projection are
+    pure waste (~1.8x on this model, where the gate sits at layer 18 of 32).
+    The captured features are bit-identical to a full forward's.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Per-forward state. Forward hooks cannot return values to their caller, so a
+# forward() and the hooks it registers communicate through these objects; they
+# live for exactly one model call.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _GatePass:
+    """Scratch shared by one forward() and its gate/steering hooks."""
+    pool: Any = None        # positions the gate projection is averaged over
+    fired: bool = False     # the gate hook ran (it is skipped when idle)
+    projection: Any = None  # 0-d tensor; stays unsynced until _read_scalars
+    alpha: Any = 0.0        # effective steering alpha the steer hook applied
+
+
+@dataclass
+class _ForwardPlan:
+    """What one forward() reads, steers and audits -- decided before the call.
+
+    Every index tensor is resolved here rather than inside a hook: a nonzero()
+    in the middle of the model call would sync the GPU mid-forward.
+    """
+    source: str             # "generated" once any answer token is committed
+    n_committed: int
+    read_gate: bool
+    steer: bool
+    gate_pool: Any = None        # index tensor for the gate, or None
+    steer_positions: Any = None  # masked slots the steering hook pushes
+    audit: Any = None            # _PendingAudit riding this forward, or None
+    audit_pools: Any = None      # index tensors the audit hook pools over
+
+
+@dataclass
+class _StepScalars:
+    """The scalars one forward needs, after a single batched GPU sync."""
+    projection: float
+    gate_strength: float
+    effective_alpha: float
+    audit_values: list = field(default_factory=list)
+
+
+@dataclass
+class _PendingAudit:
+    """A finished block whose boundary audit rides the next forward.
+
+    V3 defers non-final boundaries so the gate-layer features come from a
+    forward the sampler needs anyway, saving one full pass per clean boundary.
+    """
+    block_number: int       # which block just finished (0-based)
+    block_row: Any          # bool [seq]: that block's answer slots
+    prompt_length: int
+    temperature: float
+    remasking: str
+    rng: Any = None
+    chunks: list = field(default_factory=list)
+
+
+@dataclass
+class _BoundaryReading:
+    """What the response detector saw at one block boundary."""
+    projection: float        # gate direction over every committed token
+    block_projections: list  # ... and over each chunk of the finished block
+    response_logit: float
+    response_probability: float
+    strength: float          # gate strength implied by `projection`
 
 
 class Defender(ABC):
@@ -72,11 +149,13 @@ class Defender(ABC):
         given, restricts the vocab projection to those rows -- .logits is then
         aligned to them. Implementations may ignore it (full logits)."""
 
-    def after_block(self, x, region, *, block_index, block_positions,
+    def after_block(self, x, region, *, block_number, block_positions,
                     prompt_length, temperature, remasking, last_block=False,
                     rng=None):
         """Called once after each block's denoising loop completes.
 
+        block_number: which block just finished, 0-based (not to be confused
+        with common.block_index, which maps a layer to a transformer block).
         block_positions: answer slots of the just-finished block. prompt_length
         marks the prompt/generation boundary; committed answer slots before it
         (e.g. filled DIJA spans) are also remaskable. last_block marks the
@@ -90,8 +169,13 @@ class Defender(ABC):
     def result_fields(self):
         """Fields merged into this response's result record."""
 
-    def summarize(self, results):
-        """One-line run summary, or None."""
+    @staticmethod
+    def summarize(results):
+        """One-line run summary of a finished run, or None.
+
+        Static like Evaluator.summarize so the --gpus parent can summarise the
+        merged shards without building a policy of its own.
+        """
         return None
 
     def describe(self):
@@ -165,8 +249,8 @@ class Ours(Defender):
     llada_steering_remasking_v2 method) or V3 (response-detector boundary
     audit + block recovery). --steer {none,fixed,adaptive} is a separate
     axis: no steering, a step-0 binary gate, or the continuous per-step
-    gate. fixed steering reproduces the steer-only measurements of the
-    old llada_steering_v2 scripts.
+    gate. fixed steering is the steer-only configuration (gate read once,
+    never remask) that the earlier standalone steering scripts measured.
     """
 
     name = "ours"
@@ -207,13 +291,14 @@ class Ours(Defender):
                 raise ValueError("steering vectors must be finite nonzero 1D tensors")
             if not math.isfinite(ref_norm) or ref_norm <= 0:
                 raise ValueError("reference norm must be finite and positive")
-            self.sites.append((blocks[layer - 1], vector.float() / vector.norm(), float(ref_norm)))
+            self.sites.append((blocks[block_index(layer)],
+                               vector.float() / vector.norm(), float(ref_norm)))
             self.steer_layers.append(layer)
         if self.steer_enabled and not self.sites:
             raise ValueError("at least one steering site is required when steering is on")
         self.model = model
         self.gate_layer = gate_layer
-        self.gate_block = blocks[gate_layer - 1]
+        self.gate_block = blocks[block_index(gate_layer)]
         self.ln_f = model.model.transformer.ln_f
         self.gate_vector = gate_vector.float()
         self.threshold, self.width = float(threshold), float(width)
@@ -337,24 +422,37 @@ class Ours(Defender):
 
     # ------------------------------------------------------------------ hooks
     def _gate_hook(self, module, inputs, output):
+        """Project the current answer onto the detector direction, set the gate.
+
+        Runs on blocks[gate_layer - 1], so every steering hook later in the
+        same forward reads a gate strength computed from this same step.
+        """
         pending = self._pending
-        if pending is None or pending.get("fired"):
+        if pending is None or pending.fired:
             return output
         hidden = _hidden(output)
-        h = hidden[0, pending["pool"]].to(torch.float32).mean(dim=0)
+        h = hidden[0, pending.pool].to(torch.float32).mean(dim=0)
         proj_t = h @ self.gate_vector.to(h.device)
         if self.gate_once:
             g_t = (proj_t >= self.threshold).to(torch.float32) if self.step == 0 else self._gate_t
         else:
             g_t = ((proj_t - self.threshold) / self.width).clamp(0.0, 1.0)
         self._gate_t = g_t
-        pending["proj_t"], pending["fired"] = proj_t, True
+        pending.projection, pending.fired = proj_t, True
         return output
+
+    def _audit_capture_hook(self, pools, out):
+        """Gate-layer hook: mean-pool hidden states over each index tensor."""
+        def capture(module, inputs, output):
+            out.append(torch.stack(
+                [_hidden(output)[0, p].to(torch.float32).mean(dim=0)
+                 for p in pools]))
+        return capture
 
     def _steer_hook(self, unit, ref_norm, positions):
         def steer(module, inputs, output):
             pending = self._pending
-            live = pending is not None and pending.get("fired")
+            live = pending is not None and pending.fired
             if not live and self.gate_strength <= 0.0:
                 return output
             if self.strength == 0.0 and self.transform == "additive":
@@ -374,100 +472,158 @@ class Ours(Defender):
             out = hidden.clone()
             out[0, positions] = updated.to(hidden.dtype)
             if pending is not None:
-                pending["alpha_t"] = g * self.strength
+                pending.alpha = g * self.strength
             return _replace(output, out)
         return steer
 
-    # ---------------------------------------------------------------- forward
-    @torch.no_grad()
-    def forward(self, x, region, *, schedule_scale=1.0, logit_positions=None):
-        """One model forward with in-forward detection and steering.
+    # ------------------------------------------------------- forward machinery
+    # Layout of the single batched scalar read: projection, gate strength,
+    # effective alpha, then the audit vector when an audit rides this forward.
+    _N_STEP_SCALARS = 3
 
-        logit_positions: index tensor of positions the caller will read logits
-        for (the eligible set). Given, ln_f's output is sliced to those rows so
-        the vocab projection runs on n positions instead of the full sequence;
-        output.logits is then [1, n, vocab] aligned to logit_positions."""
+    def _plan_forward(self, x, region):
+        """Decide what this forward reads, steers and audits.
+
+        One batched .tolist() covers every count the decisions need, and all
+        index tensors are resolved here -- a nonzero() inside a hook would sync
+        the GPU in the middle of the model call.
+        """
         masks = (x == self.mask_id) & region
         committed = region & ~masks
-        # Sync while the GPU queue is empty: one batched read feeds validate +
-        # branch checks + the trace count, and index tensors (not bool masks,
-        # which would nonzero-sync mid-forward) are resolved up front.
         n_region, n_masks, n_committed = torch.stack(
             [region.sum(), masks.sum(), committed.sum()]).tolist()
         self._validate(x, region, n_region)
-        source = "generated" if n_committed else "masked"
-        self._schedule_scale = float(schedule_scale)
+
         read_gate = self.monitoring and (not self.gate_once or self.step == 0)
-        steer = (self.steer_enabled and self.monitoring and n_masks
-                 and self._steer_armed() and (read_gate or self.gate_strength > 0.0))
-        pool = (committed[0] if n_committed else masks[0]).nonzero().flatten() \
-            if read_gate else None
-        positions = masks[0].nonzero().flatten() if steer else None
-        audit = self._pending_audit     # V3 only: ride this forward's features
+        steer = bool(self.steer_enabled and self.monitoring and n_masks
+                     and self._steer_armed()
+                     and (read_gate or self.gate_strength > 0.0))
+        # Before anything is committed the gate has to read the masked slots
+        # themselves; after that it reads what the model actually wrote.
+        gate_pool = None
+        if read_gate:
+            gate_pool = (committed[0] if n_committed
+                         else masks[0]).nonzero().flatten()
+
+        audit, audit_pools = self._pending_audit, None
         self._pending_audit = None
-        audit_pools = None
         if audit is not None:
-            audit["chunks"] = self._chunk_positions(
-                audit["block_row"].nonzero().flatten())
-            audit_pools = [committed[0].nonzero().flatten(), *audit["chunks"]]
-        self._pending = {"pool": pool, "fired": False, "proj_t": None, "alpha_t": 0.0}
-        handles, feats_out = [], []
+            audit.chunks = self._chunk_positions(
+                audit.block_row.nonzero().flatten())
+            audit_pools = [committed[0].nonzero().flatten(), *audit.chunks]
+
+        return _ForwardPlan(
+            source="generated" if n_committed else "masked",
+            n_committed=n_committed, read_gate=read_gate, steer=steer,
+            gate_pool=gate_pool,
+            steer_positions=masks[0].nonzero().flatten() if steer else None,
+            audit=audit, audit_pools=audit_pools)
+
+    def _run_hooked_forward(self, x, plan, logit_positions):
+        """One model call with this step's hooks; they are always removed.
+
+        Returns (model output, captured audit features). Forward hooks are
+        module-global, so MODEL_LOCK spans the whole register/call/remove
+        window -- see common.MODEL_LOCK.
+        """
+        handles, feats = [], []
         with MODEL_LOCK:
             try:
-                if read_gate:
-                    handles.append(self.gate_block.register_forward_hook(self._gate_hook))
-                if steer:
+                if plan.read_gate:
+                    handles.append(self.gate_block.register_forward_hook(
+                        self._gate_hook))
+                if plan.steer:
                     for block, unit, ref_norm in self.sites:
                         handles.append(block.register_forward_hook(
-                            self._steer_hook(unit, ref_norm, positions)))
-                if audit_pools is not None:
-                    def capture(module, inputs, output):
-                        feats_out.append(torch.stack(
-                            [_hidden(output)[0, p].to(torch.float32).mean(dim=0)
-                             for p in audit_pools]))
-                    handles.append(self.gate_block.register_forward_hook(capture))
+                            self._steer_hook(unit, ref_norm,
+                                             plan.steer_positions)))
+                if plan.audit_pools is not None:
+                    handles.append(self.gate_block.register_forward_hook(
+                        self._audit_capture_hook(plan.audit_pools, feats)))
                 if logit_positions is not None:
+                    # Slice ln_f so the vocab projection runs only on the rows
+                    # the sampler is about to read.
                     handles.append(self.ln_f.register_forward_hook(
                         lambda m, i, o: o[:, logit_positions]))
                 output = self.model(x)
             finally:
                 for handle in handles:
                     handle.remove()
-        pend = self._pending
-        if read_gate and not pend["fired"]:
+        if plan.read_gate and not self._pending.fired:
             raise RuntimeError("model forward did not execute the gate hook")
+        if plan.audit_pools is not None and len(feats) != 1:
+            raise RuntimeError("audit hook must execute exactly once per forward")
+        return output, feats
+
+    def _read_scalars(self, x, plan, feats):
+        """Sync every scalar this step needs in ONE .tolist().
+
+        Each .item()/.tolist() is a GPU sync, so the trace values and the audit
+        vector are stacked into one tensor and read back together.
+        """
+        pending = self._pending
         zero = torch.zeros((), dtype=torch.float32, device=x.device)
         scalars = torch.stack([
-            pend["proj_t"] if pend["fired"] else zero,
-            self._gate_t if pend["fired"] else zero,
-            torch.as_tensor(pend["alpha_t"], dtype=torch.float32,
+            pending.projection if pending.fired else zero,
+            self._gate_t if pending.fired else zero,
+            torch.as_tensor(pending.alpha, dtype=torch.float32,
                             device=x.device)])
-        if audit is not None:
-            if len(feats_out) != 1:
-                raise RuntimeError("audit hook must execute exactly once per forward")
-            scalars = torch.cat([scalars, self._audit_vector(feats_out[0])])
-        vals = scalars.tolist()
-        proj_v, gate_v, alpha_v = vals[:3]
-        if pend["fired"]:
-            if not math.isfinite(proj_v):
+        if plan.audit is not None:
+            scalars = torch.cat([scalars, self._audit_vector(feats[0])])
+        values = scalars.tolist()
+        projection, gate_strength, alpha = values[:self._N_STEP_SCALARS]
+        return _StepScalars(projection, gate_strength, alpha,
+                            values[self._N_STEP_SCALARS:])
+
+    def _trace_step(self, plan, scalars):
+        """Append this step's row to the per-response gate trace."""
+        self.trace.append({
+            "step": self.step,
+            "projection": scalars.projection if self._pending.fired else None,
+            "strength": self.gate_strength,
+            "schedule_scale": self._schedule_scale,
+            "effective_alpha": scalars.effective_alpha,
+            "source": plan.source,
+            "num_generated_tokens": plan.n_committed,
+            "phase": "block_recovery" if self.in_recovery else "base",
+            "steer_armed": plan.steer,
+        })
+
+    @torch.no_grad()
+    def forward(self, x, region, *, schedule_scale=1.0, logit_positions=None):
+        """One model forward with in-forward detection and steering.
+
+        Detection, steering and (for V3) the deferred boundary audit all ride
+        the same model call: _plan_forward decides what to do, the hooks do it
+        during the call, and _read_scalars syncs the results back in one go.
+
+        logit_positions: index tensor of positions the caller will read logits
+        for (the eligible set). Given, ln_f's output is sliced to those rows so
+        the vocab projection runs on n positions instead of the full sequence;
+        output.logits is then [1, n, vocab] aligned to logit_positions."""
+        self._schedule_scale = float(schedule_scale)
+        plan = self._plan_forward(x, region)
+        self._pending = _GatePass(pool=plan.gate_pool)
+        output, feats = self._run_hooked_forward(x, plan, logit_positions)
+        scalars = self._read_scalars(x, plan, feats)
+
+        if self._pending.fired:
+            if not math.isfinite(scalars.projection):
                 raise ValueError("detector returned a non-finite projection")
-            self.gate_strength, self.last_projection = gate_v, proj_v
-        if audit is not None and self._apply_audit(
-                x, region, self._reading(vals[3:], len(audit["chunks"])),
-                audit=audit):
+            self.gate_strength = scalars.gate_strength
+            self.last_projection = scalars.projection
+
+        if plan.audit is not None and self._apply_audit(
+                x, region,
+                self._reading(scalars.audit_values, len(plan.audit.chunks)),
+                audit=plan.audit):
             # The forward just consumed is stale post-recovery; redo it so the
             # sampler commits from post-recovery logits.
             self._pending = None
             return self.forward(x, region, schedule_scale=schedule_scale,
                                 logit_positions=logit_positions)
-        self.trace.append({
-            "step": self.step, "projection": proj_v if pend["fired"] else None,
-            "strength": self.gate_strength, "schedule_scale": self._schedule_scale,
-            "effective_alpha": alpha_v, "source": source,
-            "num_generated_tokens": n_committed,
-            "phase": "block_recovery" if self.in_recovery else "base",
-            "steer_armed": bool(steer),
-        })
+
+        self._trace_step(plan, scalars)
         self._pending = None
         self.step += 1
         return output
@@ -484,10 +640,13 @@ class Ours(Defender):
                 "remasked": self._remasked(),
                 "gate_trace": self.trace}
 
-    def summarize(self, results):
-        n_open = sum(r["gate_open"] for r in results)
-        n_remask = sum(r["remasked"] for r in results)
-        return f"gate opened on {n_open}/{len(results)} prompts, remasked {n_remask}"
+    @staticmethod
+    def summarize(results):
+        graded = [r for r in results if "gate_open" in r]
+        n_open = sum(r["gate_open"] for r in graded)
+        n_remask = sum(r["remasked"] for r in graded)
+        return (f"gate opened on {n_open}/{len(graded)} prompts, "
+                f"remasked {n_remask}")
 
     def describe(self):
         return {"defense": self.name, "steer": self.steer_mode,
@@ -502,8 +661,7 @@ class V2(Ours):
     Once committed answer tokens exist and the gate strength reaches
     --remask-trigger, a single remasking attempt probes candidate windows
     of committed tokens with detector-only forwards and reopens the window
-    whose removal lowers the projection the most. This is the
-    llada_steering_remasking_v2 method.
+    whose removal lowers the projection the most.
     """
 
     name = "v2"
@@ -531,39 +689,70 @@ class V2(Ours):
     # ---------------------------------------------------------------- probes
     @torch.no_grad()
     def score(self, x, pool):
-        """Detector-only forward (no steering). pool: bool [seq] positions to average."""
+        """Detector-only forward (no steering). pool: bool [seq] positions to average.
+
+        Stops at the gate block -- see _GateReached. One repair runs this once
+        per candidate window plus a baseline, so the saving is the whole probe.
+        """
         captured = []
 
         def capture(module, inputs, output):
             captured.append(self._projection(_hidden(output), pool))
+            raise _GateReached
 
         with MODEL_LOCK:
             handle = self.gate_block.register_forward_hook(capture)
             try:
                 self.model(x)
+            except _GateReached:
+                pass
             finally:
                 handle.remove()
         if len(captured) != 1:
             raise RuntimeError("gate block must execute exactly once per forward")
         return captured[0]
 
+    # Each candidate window costs one detector-only forward, so the probe set
+    # is capped and evenly sampled rather than exhaustive.
+    MAX_PROBE_WINDOWS = 8
+
     @staticmethod
-    def _candidates(region, committed, count):
+    def _committed_runs(region, committed):
+        """Maximal stretches of committed answer positions.
+
+        A run is broken only by a position OUTSIDE the answer region: a slot
+        that is inside the region but still masked does NOT split it, so a
+        half-filled stretch stays a single candidate window.
+        """
         runs, run = [], []
-        for index in range(len(region) + 1):
-            if index < len(region) and region[index]:
+        for index in range(len(region)):
+            if region[index]:
                 if committed[index]:
                     run.append(index)
             elif run:
                 runs.append(run)
                 run = []
+        if run:
+            runs.append(run)
+        return runs
+
+    @classmethod
+    def _candidates(cls, region, committed, count):
+        """Up to MAX_PROBE_WINDOWS windows of at most `count` committed tokens.
+
+        Windows tile each run end to end; if that yields more than the cap, an
+        evenly spaced subset spanning the first and last window is kept.
+        """
+        runs = cls._committed_runs(region, committed)
         if not runs or count <= 0:
             return []
         size = min(count, max(map(len, runs)))
         windows = [run[i:i + size] for run in runs
                    for i in range(0, len(run) - size + 1, size)]
-        if len(windows) > 8:
-            windows = [windows[round(i * (len(windows) - 1) / 7)] for i in range(8)]
+        if len(windows) > cls.MAX_PROBE_WINDOWS:
+            last = cls.MAX_PROBE_WINDOWS - 1
+            windows = [windows[round(i * (len(windows) - 1) / last)]
+                       for i in range(cls.MAX_PROBE_WINDOWS)]
         return windows
 
     def before_step(self, x, region, *, scope, steps_remaining):
@@ -681,14 +870,20 @@ class V3(Ours):
                           logit.reshape(1), torch.sigmoid(logit.reshape(1))])
 
     def _reading(self, values, n_chunks):
+        """Parse the audit slice of a forward's scalars into a named reading.
+
+        `values` is the tail _audit_vector produced: the committed-pool
+        projection, one projection per block chunk, then the response
+        detector's logit and probability.
+        """
         projection = values[0]
-        return {
-            "projection": projection,
-            "block_projections": values[1:1 + n_chunks],
-            "response_logit": values[-2],
-            "response_probability": values[-1],
-            "strength": min(1.0, max(0.0, (projection - self.threshold) / self.width)),
-        }
+        return _BoundaryReading(
+            projection=projection,
+            block_projections=values[1:1 + n_chunks],
+            response_logit=values[-2],
+            response_probability=values[-1],
+            strength=min(1.0, max(0.0,
+                                  (projection - self.threshold) / self.width)))
 
     @torch.no_grad()
     def _audit(self, x, region, chunks):
@@ -696,30 +891,29 @@ class V3(Ours):
         committed tokens and each chunk of the finished block."""
         pools = [(region[0] & (x[0] != self.mask_id)).nonzero().flatten(), *chunks]
         feats_out = []
-        empty = torch.empty(0, dtype=torch.long, device=x.device)
+        capture = self._audit_capture_hook(pools, feats_out)
 
-        def capture(module, inputs, output):
-            hidden = _hidden(output)
-            feats_out.append(torch.stack(
-                [hidden[0, p].to(torch.float32).mean(dim=0) for p in pools]))
+        def capture_and_stop(module, inputs, output):
+            capture(module, inputs, output)
+            raise _GateReached
 
-        # Audits read only gate-layer features; slice ln_f to zero rows so the
-        # vocab projection is skipped entirely.
+        # Audits read only gate-layer features, so the forward stops there --
+        # see _GateReached. ln_f is never reached, vocab projection included.
         with MODEL_LOCK:
-            handle = self.gate_block.register_forward_hook(capture)
-            skip_logits = self.ln_f.register_forward_hook(lambda m, i, o: o[:, empty])
+            handle = self.gate_block.register_forward_hook(capture_and_stop)
             try:
                 self.model(x)
+            except _GateReached:
+                pass
             finally:
                 handle.remove()
-                skip_logits.remove()
         self.audit_forwards += 1
         if len(feats_out) != 1:
             raise RuntimeError("audit hook must execute exactly once per forward")
         return self._reading(self._audit_vector(feats_out[0]).tolist(), len(chunks))
 
     @torch.no_grad()
-    def after_block(self, x, region, *, block_index, block_positions,
+    def after_block(self, x, region, *, block_number, block_positions,
                     prompt_length, temperature, remasking, last_block=False,
                     rng=None):
         if self._pending_audit is not None:
@@ -727,11 +921,13 @@ class V3(Ours):
             pending = self._pending_audit
             self._pending_audit = None
             reading = self._audit(x, region, self._chunk_positions(
-                pending["block_row"].nonzero().flatten()))
+                pending.block_row.nonzero().flatten()))
             self._apply_audit(x, region, reading, audit=pending)
-        audit = {"block_index": block_index, "block_row": block_positions[0],
-                 "prompt_length": prompt_length, "temperature": temperature,
-                 "remasking": remasking, "rng": rng}
+        audit = _PendingAudit(block_number=block_number,
+                              block_row=block_positions[0],
+                              prompt_length=prompt_length,
+                              temperature=temperature, remasking=remasking,
+                              rng=rng)
         if last_block:
             # No later forward to piggyback on; audit with a dedicated pass.
             reading = self._audit(x, region, self._chunk_positions(
@@ -745,11 +941,11 @@ class V3(Ours):
     def _apply_audit(self, x, region, reading, *, audit):
         """Record the audit; run recovery when the block still reads as a
         response. Returns True when recovery ran."""
-        block_index = audit["block_index"]
-        trigger = ((self.audit_all_boundaries or block_index == 0)
-                   and reading["response_probability"] >= self._det_threshold)
+        block_number = audit.block_number
+        trigger = ((self.audit_all_boundaries or block_number == 0)
+                   and reading.response_probability >= self._det_threshold)
         self.boundary_audits.append({
-            "boundary": block_index, **reading, "trigger": trigger,
+            "boundary": block_number, **asdict(reading), "trigger": trigger,
             "trigger_rule": ("response_probability_cutoff_each_boundary"
                              if self.audit_all_boundaries else
                              "response_probability_cutoff_first_boundary")})
@@ -757,8 +953,9 @@ class V3(Ours):
             return False
         self.triggered = True
 
-        event = {"boundary": block_index,
-                 "pre_audit": reading, "pre_recovery_token_ids": x[0].tolist(),
+        event = {"boundary": block_number,
+                 "pre_audit": asdict(reading),
+                 "pre_recovery_token_ids": x[0].tolist(),
                  "rounds": [], "applied": True,
                  "extra_sampling_steps": self.recovery_steps}
         self.recovery_events.append(event)
@@ -767,11 +964,11 @@ class V3(Ours):
         # prompt (DIJA spans carry the payload under that attack). With
         # recovery_rounds > 1 the block is re-audited after each regeneration
         # and remasked again while it still reads as a response.
-        prompt_length, temperature = audit["prompt_length"], audit["temperature"]
-        remasking = audit["remasking"]
+        prompt_length, temperature = audit.prompt_length, audit.temperature
+        remasking = audit.remasking
         span_slots = region[0] & (x[0] != self.mask_id)
         span_slots[prompt_length:] = False
-        targets = audit["block_row"] | span_slots
+        targets = audit.block_row | span_slots
         positions = targets.nonzero().flatten()
         from llada import get_num_transfer_tokens
         from sampler import commit_sample
@@ -795,7 +992,7 @@ class V3(Ours):
                                           logit_positions=eligible).logits
                     eligible = commit_sample(x, logits, eligible, counts[i],
                                              temperature, remasking, final=final,
-                                             rng=audit.get("rng"))
+                                             rng=audit.rng)
             finally:
                 self.in_recovery = False
             event["rounds"].append({
@@ -811,9 +1008,9 @@ class V3(Ours):
                 break
             post = self._audit(x, region, self._chunk_positions(positions))
             self.boundary_audits.append({
-                "boundary": block_index, **post, "trigger": False,
+                "boundary": block_number, **asdict(post), "trigger": False,
                 "trigger_rule": "post_recovery_reaudit"})
-            if post["response_probability"] < self._det_threshold:
+            if post.response_probability < self._det_threshold:
                 break
         self._steer_boost = 1.0
         return True
@@ -836,89 +1033,6 @@ class V3(Ours):
                  audit_all_boundaries=self.audit_all_boundaries,
                  recovery_alpha_growth=self.recovery_alpha_growth)
         return d
-
-
-class ProposedDefense(Defender):
-    """proposed.py's single-file defense, adapted to the Defender protocol.
-
-    proposed.py wants one instance per response, so reset() builds a fresh
-    Proposed; its before_step is block-agnostic and budgets against the whole
-    generation, so it is driven with total-step accounting here.
-    """
-
-    name = "proposed"
-
-    def __init__(self, model, gate, csd, *, layers, total_steps, **options):
-        self.model, self.gate, self.csd = model, gate, csd
-        self.layers, self.options, self.total_steps = layers, options, total_steps
-        self._policy = None
-        self.step, self.trace, self.remask_event = 0, [], None
-
-    @classmethod
-    def add_args(cls, parser):
-        parser.add_argument("--vector", default="outputs/steer_vector.pt")
-        parser.add_argument("--detector", default="outputs/steer_detector.pt")
-        parser.add_argument("--detector-layer", type=int, default=18)
-        parser.add_argument("--gate-threshold", type=float, default=None)
-        parser.add_argument("--layers", default="12,16,20,24")
-        parser.add_argument("--strength", type=float, default=0.4)
-        parser.add_argument("--mode", choices=["baseline", "steer", "repair"], default="repair")
-        parser.add_argument("--max-remask-tokens", type=int, default=16)
-        parser.add_argument("--max-parallel-commit", type=int, default=2)
-
-    @classmethod
-    def from_args(cls, args, model):
-        device = next(model.parameters()).device
-        csd = torch.load(args.vector, map_location="cpu")
-        det_vec, det_layer, threshold = load_detector(
-            args.detector, args.detector_layer, device, args.gate_threshold)
-        gate = {"layer": det_layer, "vector": det_vec,
-                "center": torch.zeros_like(det_vec), "scale": 1.0, "threshold": threshold}
-        csd = {"layers": csd["layers"], "vector": csd["vector"].to(device)}
-        layers = tuple(int(s) for s in args.layers.split(","))
-        return cls(model, gate, csd, layers=layers, total_steps=args.steps,
-                   strength=args.strength, mode=args.mode,
-                   max_remask_tokens=args.max_remask_tokens,
-                   max_parallel_commit=args.max_parallel_commit)
-
-    def defend(self, model, prompt_ids, **gen_config):
-        # Attacks may override steps per prompt (DIJA: one mask per step).
-        self.total_steps = gen_config.get("steps", self.total_steps)
-        return super().defend(model, prompt_ids, **gen_config)
-
-    def reset(self):
-        self._policy = Proposed.from_llada(self.model, self.gate, self.csd,
-                                           layers=self.layers, **self.options)
-        self.step, self.trace, self.remask_event = 0, [], None
-
-    def before_step(self, x, region, *, scope, steps_remaining):
-        before = int(((x == MASK_ID) & region).sum())
-        masks, _, _ = self._policy.before_step(
-            x, region, steps_remaining=self.total_steps - self.step, commit_count=1)
-        reopened = int(masks.sum()) - before
-        commit_count = None
-        if reopened > 0:
-            self.remask_event = {"step": self.step, "reopened": reopened}
-            commit_count = 1  # any value: the sampler rebalances the block schedule
-        self.trace.append({"step": self.step, "armed": self._policy.armed,
-                           "done": self._policy.done})
-        return commit_count
-
-    def forward(self, x, region, *, schedule_scale, logit_positions=None):
-        self.step += 1
-        return self._policy.forward(x, region)
-
-    def result_fields(self):
-        return {"gate_open": self._policy.armed,
-                "armed_at_step": next((t["step"] for t in self.trace if t["armed"]), None),
-                "monitoring_steps": sum(1 for t in self.trace if not t["done"]),
-                "remasked": self.remask_event is not None,
-                "remask_event": self.remask_event}
-
-    def summarize(self, results):
-        n_open = sum(r["gate_open"] for r in results)
-        n_remask = sum(r["remasked"] for r in results)
-        return f"gate opened on {n_open}/{len(results)} prompts, remasked {n_remask}"
 
 
 class SelfReminder(NullDefender):
@@ -971,4 +1085,4 @@ class DiffuGuard(Defender):
         return {}
 
 
-DEFENDERS = {d.name: d for d in (NullDefender, Ours, ProposedDefense, SelfReminder, DiffuGuard)}
+DEFENDERS = {d.name: d for d in (NullDefender, Ours, SelfReminder, DiffuGuard)}
