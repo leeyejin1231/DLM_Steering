@@ -13,23 +13,21 @@ These contrasts hold length and source fixed and vary only permissibility:
     jbb_harmful   vs jbb_benign    index-matched counterparts, topic controlled
 
 Usage:
-    CUDA_VISIBLE_DEVICES=1 python steering/check_detector.py
+    CUDA_VISIBLE_DEVICES=1 python -m steering.check_detector
 """
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-from common import (  # noqa: E402
-    MODEL_NAME, auroc, load_detector_bundle, load_eval_prompts, load_llada)
-from steering.fit_detector import collect  # noqa: E402
+from common import (
+    auroc, load_detector_bundle, load_eval_prompts, load_llada)
+from steering.fit_detector import collect
 
+ROOT = Path(__file__).resolve().parent.parent
 
 def main():
     ap = argparse.ArgumentParser()

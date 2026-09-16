@@ -11,20 +11,17 @@ On a *safe* prompt set, over-refusal rate = (full_refusal + partial_refusal) / n
 On an *unsafe* set the same quantity is the desired refusal rate.
 
 Usage:
-    python steering/judge_refusal.py --in outputs/or_xstest_safe_steer.json \
+    python -m steering.judge_refusal --in outputs/or_xstest_safe_steer.json \
                                      --out outputs/or_xstest_safe_steer_judged.json
 """
 
 import argparse
 import json
-import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from common import run_eval_shards  # noqa: E402
-from Evaluator import Refusal  # noqa: E402
-
+from common import plan_shards, run_eval_shards
+from Evaluator import Refusal
 
 def main():
     ap = argparse.ArgumentParser()
@@ -55,13 +52,16 @@ def main():
     print(f"judging {len(items)} items from {args.inp}")
 
     t_start = time.time()
-    if args.gpus:
+    devices = plan_shards(args.gpus) if args.gpus else []
+    if devices:
         def extra(i, gpu):
             port = args.port + i
             return ["--port", port, "--gpu", gpu,
                     "--container", f"ollama-{port}"]
-        judged, _ = run_eval_shards(__file__, args, len(items),
-                                    extra_args=extra)
+        # A shard child must re-enter as a module: steering/ is a package, so
+        # running this file by path would not find common.py.
+        judged, _ = run_eval_shards("steering.judge_refusal", args, len(items),
+                                    extra_args=extra, devices=devices)
         summary = Refusal.summarize(judged)
     else:
         items = items[args.start:

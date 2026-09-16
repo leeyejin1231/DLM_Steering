@@ -16,7 +16,7 @@ The first --n-eval CSV rows are the prompts already used for baseline eval, and
 are excluded from fitting entirely.
 
 Usage:
-    python steering/build_pairs.py [--n-eval 20] [--seed 0]
+    python -m steering.build_pairs [--n-eval 20] [--seed 0]
 """
 
 import argparse

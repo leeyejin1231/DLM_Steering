@@ -23,24 +23,22 @@ questions, a different distribution entirely. If it cannot separate those, a gat
 built on it will stay open and over-refusal will not improve.
 
 Usage:
-    CUDA_VISIBLE_DEVICES=1 python steering/fit_detector.py
+    CUDA_VISIBLE_DEVICES=1 python -m steering.fit_detector
 """
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-from common import (  # noqa: E402
-    MODEL_NAME, MASK_ID, auroc, load_eval_prompts, load_llada,
+from common import (
+    FIT_LAYERS, MODEL_NAME, MASK_ID, auroc, load_eval_prompts, load_llada,
     prompt_token_ids)
 
+ROOT = Path(__file__).resolve().parent.parent
 
 @torch.no_grad()
 def prompt_state(model, tokenizer, prompt, gen_length, layers, device):
@@ -75,7 +73,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
-    layers = list(range(1, 32))
+    layers = FIT_LAYERS  # shared with fit_vector.py so the picks compare
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     meta = json.loads(Path(args.pairs).read_text())

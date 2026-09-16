@@ -11,22 +11,20 @@ harmful-vs-benign is reported as a cross-check, but it is calibrated on long
 WildJailbreak roleplay benign prompts and transfers poorly to short questions.
 
 Usage:
-    CUDA_VISIBLE_DEVICES=1 python steering/pick_threshold.py --layer 18
+    CUDA_VISIBLE_DEVICES=1 python -m steering.pick_threshold --layer 18
 """
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-from common import MODEL_NAME, load_detector_bundle, load_llada  # noqa: E402
-from steering.fit_detector import collect  # noqa: E402
+from common import load_detector_bundle, load_llada
+from steering.fit_detector import collect
 
+ROOT = Path(__file__).resolve().parent.parent
 
 def main():
     ap = argparse.ArgumentParser()

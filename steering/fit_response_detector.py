@@ -25,25 +25,22 @@ The split is by prompt group: each row is one group and train/validation
 group lists are stored in the checkpoint like the reference file.
 
 Usage:
-    CUDA_VISIBLE_DEVICES=1,2 python steering/fit_response_detector.py \
+    CUDA_VISIBLE_DEVICES=1,2 python -m steering.fit_response_detector \
         --groups 384 --guard-device cuda:2
 """
 
 import argparse
 import json
 import re
-import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-from common import (MODEL_NAME, MASK_ID, auroc, encode_prompt, load_llada,  # noqa: E402
-                    prompt_token_ids)
+from common import MODEL_NAME, MASK_ID, auroc, encode_prompt, load_llada
 
+ROOT = Path(__file__).resolve().parent.parent
 
 @torch.no_grad()
 def sample_state(model, x, slot_positions, layer):
