@@ -13,7 +13,7 @@ import json
 import time
 from pathlib import Path
 
-from common import run_eval_shards
+from common import plan_shards, run_eval_shards
 from Evaluator import LlamaGuard4
 
 
@@ -30,6 +30,14 @@ def parse_args():
                    help="Comma-separated GPU ids (e.g. 0,1): shard items into "
                         "one subprocess per GPU and merge the part JSONs")
     p.add_argument("--max-new-tokens", type=int, default=20)
+    p.add_argument("--batch-size", type=int, default=16,
+                   help="Items per Llama Guard forward (default 16: 1.9x "
+                        "end-to-end on a 100-row file, more on longer ones). "
+                        "Items are grouped by length so a batch is not held up "
+                        "by its longest member. Batching changes the reduction "
+                        "order, which can move a verdict the model is torn on; "
+                        "pass 1 to grade one at a time and reproduce an older "
+                        "run exactly. Lower it if the grader OOMs.")
     p.add_argument(
         "--with-reference",
         action="store_true",
@@ -51,8 +59,12 @@ def main():
     print(f"Scoring {len(items)} items from {args.inp}")
 
     t_start = time.time()
-    if args.gpus:
-        scored, head = run_eval_shards(__file__, args, len(items))
+    # [] means one shard: plan_shards pinned this process to that GPU, so the
+    # work runs inline instead of spawning a single child.
+    devices = plan_shards(args.gpus) if args.gpus else []
+    if devices:
+        scored, head = run_eval_shards(__file__, args, len(items),
+                                       devices=devices)
         summary = LlamaGuard4.summarize(scored)
         model_id = head.get("guard_model")
     else:
@@ -60,7 +72,8 @@ def main():
                       args.start + args.n if args.n is not None else None]
         jsonl = args.jsonl or str(Path(args.out).with_suffix(".jsonl"))
         with LlamaGuard4(max_new_tokens=args.max_new_tokens,
-                         with_reference=args.with_reference) as grader:
+                         with_reference=args.with_reference,
+                         batch_size=args.batch_size) as grader:
             scored = grader.evaluate(items, output_path=jsonl)
             scored.sort(key=lambda r: r["index"])
             summary = grader.summarize(scored)

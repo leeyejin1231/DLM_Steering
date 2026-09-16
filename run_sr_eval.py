@@ -12,7 +12,7 @@ import argparse
 import json
 from pathlib import Path
 
-from common import run_eval_shards
+from common import plan_shards, run_eval_shards
 from Evaluator import GptOss20b
 
 
@@ -36,6 +36,10 @@ def parse_args():
                    help="podman container name (default 'ollama'; sharded runs "
                         "use ollama-<port> automatically)")
     p.add_argument("--reasoning-effort", default="low")
+    p.add_argument("--workers", type=int, default=4,
+                   help="Concurrent requests per ollama server. The run prints "
+                        "the effective concurrency it actually achieved; raise "
+                        "this only while that number still tracks it.")
     return p.parse_args()
 
 
@@ -46,13 +50,14 @@ def main():
               "response": r["generation"]} for r in data["results"]]
     print(f"Grading {len(items)} items from {args.inp}")
 
-    if args.gpus:
+    devices = plan_shards(args.gpus) if args.gpus else []
+    if devices:
         def extra(i, gpu):
             port = args.port + i
             return ["--port", port, "--gpu", gpu,
                     "--container", f"ollama-{port}"]
         graded, head = run_eval_shards(__file__, args, len(items),
-                                       extra_args=extra)
+                                       extra_args=extra, devices=devices)
         summary = GptOss20b.summarize(graded)
         grader_name = head.get("grader")
     else:
@@ -60,7 +65,7 @@ def main():
                       args.start + args.n if args.n is not None else None]
         jsonl = args.jsonl or str(Path(args.out).with_suffix(".jsonl"))
         with GptOss20b(model=args.model, port=args.port, gpu=args.gpu,
-                       container=args.container,
+                       container=args.container, workers=args.workers,
                        reasoning_effort=args.reasoning_effort) as grader:
             graded = grader.evaluate(items, output_path=Path(jsonl))
             graded.sort(key=lambda r: r["index"])

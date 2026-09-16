@@ -1,4 +1,10 @@
-"""LLaDA-8B-Instruct inference.
+"""Undefended LLaDA-8B-Instruct reference sampler, and the repo's shared helpers.
+
+Not an experiment file: `main()` here is the unmodified baseline (no detection,
+no steering, no remasking) kept so the official loop stays readable next to
+ours, and the rest of the codebase imports `MODEL_NAME`, `MASK_ID`, `PAD_ID`,
+`add_gumbel_noise` and `get_num_transfer_tokens` from it. The experiment entry
+point is exp.py; `exp.py --attack none --defense none` is this file's `main()`.
 
 LLaDA is a masked diffusion language model, so generation is done by
 iteratively denoising [MASK] tokens rather than autoregressive decoding.
@@ -13,7 +19,6 @@ from transformers import AutoModel, AutoTokenizer
 MODEL_NAME = "GSAI-ML/LLaDA-8B-Instruct"
 MASK_ID = 126336  # [MASK] token id used by LLaDA
 PAD_ID = 126081   # <|endoftext|>; also the eos/pad id in the model config
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def add_gumbel_noise(logits, temperature, rng=None):
@@ -127,6 +132,10 @@ def generate(
 
 
 def main():
+    # Resolved here, not at import: this module is imported for its constants
+    # and helpers, and those imports must not touch CUDA. Every other entry
+    # point picks its device the same way, inside main().
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Loading {MODEL_NAME} ...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     model = (

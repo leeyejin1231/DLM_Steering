@@ -22,9 +22,8 @@ import threading
 
 import torch
 
-from attack_prompts import (extract_content, get_judge_prompt,
-                            get_judge_system_prompt, load_qi_judge_template,
-                            qi_extract_score)
+from attack_prompts import (get_judge_prompt, get_judge_system_prompt,
+                            load_qi_judge_template, qi_extract_score)
 
 logger = logging.getLogger("attacks")
 

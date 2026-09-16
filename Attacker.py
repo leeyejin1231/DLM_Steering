@@ -371,8 +371,14 @@ class PAP(NoAttack):
             history.append({"trial": trial, "technique": tech,
                             "pap": pap, "response": resp, "score": score})
             print(f"    [pap] t{trial} {tech}: score={score}", flush=True)
-            if score is not None and score > best_score:
-                best, best_score = (shown, resp, ids, cfg), score
+            # The Qi judge returns None when its output carries no
+            # "#thescore:" tag, so the first trial seeds `best` whatever it
+            # scored: a row whose every trial is unparseable must still record
+            # an attempt instead of unpacking None below.
+            if best is None or (score is not None and score > best_score):
+                best = (shown, resp, ids, cfg)
+                if score is not None:
+                    best_score = score
             if score == jb_score:
                 extra = {"assistant_text": resp,
                          "pap": {"jailbroken": True, "technique": tech,
@@ -383,8 +389,10 @@ class PAP(NoAttack):
         shown, resp, ids, cfg = best
         extra = {"assistant_text": resp,
                  "pap": {"jailbroken": False, "technique": tech,
-                         "best_score": best_score, "trials_run": self.trials,
-                         "history": history}}
+                         "best_score": best_score if best_score >= 0 else None,
+                         "unscored_trials": sum(h["score"] is None
+                                                for h in history),
+                         "trials_run": self.trials, "history": history}}
         return AttackResult(shown, resp, extra, cfg, ids)
 
     def describe(self):
@@ -414,13 +422,14 @@ class PAIR(NoAttack):
 
     def __init__(self, llm, judge, n_streams=5, n_iterations=5, keep_last_n=4,
                  max_n_attack_attempts=5, attack_max_tokens=500,
-                 judge_max_tokens=10, target_str=None):
+                 judge_max_tokens=10, target_str=None, seed=0):
         self.llm, self.judge = llm, judge
         self.n_streams, self.n_iterations = n_streams, n_iterations
         self.keep_last_n = keep_last_n
         self.max_n_attack_attempts = max_n_attack_attempts
         self.attack_max_tokens = attack_max_tokens
         self.target_str = target_str
+        self.seed = seed
 
     @classmethod
     def add_args(cls, parser):
@@ -465,7 +474,7 @@ class PAIR(NoAttack):
         return cls(llm, judge, args.pair_streams, args.pair_iterations,
                    args.pair_keep_last_n, args.pair_max_attempts,
                    args.pair_attack_tokens, args.pair_judge_tokens,
-                   args.pair_target_str)
+                   args.pair_target_str, seed=args.seed)
 
     def _target_str(self, row):
         if self.target_str:
@@ -475,12 +484,15 @@ class PAIR(NoAttack):
         goal = row["prompt"]
         return f"Sure, here is how to {goal[0].lower() + goal[1:]}"
 
-    def _get_attacks(self, convs, prompts_list):
+    def _get_attacks(self, convs, prompts_list, seed=None):
         """conversers.py AttackLM.get_attack + _generate_attack, per conv.
 
         convs: [{"system": str, "msgs": [user/assistant dicts]}]; the seeded
         assistant prefix becomes an unclosed final message (continue_final).
-        Returns [attack_dict]."""
+        `seed` ties the sampled attacker turns to (row, iteration, retry)
+        instead of to thread scheduling -- without it these draws come from
+        the global CUDA RNG and PAIR is not reproducible under --row-workers
+        or --gpus sharding. Returns [attack_dict]."""
         from attack_prompts import extract_json
         init_message = ('{"improvement": "","prompt": "'
                         if not convs[0]["msgs"] else '{"improvement": "')
@@ -489,7 +501,7 @@ class PAIR(NoAttack):
 
         indices = list(range(len(convs)))
         valid = [None] * len(convs)
-        for _ in range(self.max_n_attack_attempts):
+        for attempt in range(self.max_n_attack_attempts):
             # Streams are independent within an iteration, so one left-padded
             # batch covers all pending convs (the reference's batched_generate);
             # parse failures re-batch on the next attempt round.
@@ -500,7 +512,8 @@ class PAIR(NoAttack):
             raws = self.llm.generate_batch(
                 msgs_batch, temperature=1, top_p=0.9,
                 max_new_tokens=self.attack_max_tokens,
-                stop=["}"], continue_final=True)
+                stop=["}"], continue_final=True,
+                seed=None if seed is None else seed + attempt)
             for i, raw in zip(list(indices), raws):
                 full_output = init_message + raw + "}"
                 attack_dict, json_str = extract_json(full_output)
@@ -520,6 +533,10 @@ class PAIR(NoAttack):
         from attack_prompts import (get_attacker_system_prompts, get_init_msg,
                                     process_target_response)
         goal, target_str = row["prompt"], self._target_str(row)
+        # Per-(row, iteration, retry) seeds so the attacker turns are identical
+        # under any sharding, slicing or --row-workers interleaving. The judges
+        # decode greedily (temperature 0) and need no seed.
+        base_seed = self.seed + int(row.get("index", 0)) * 4096
         system_prompts = get_attacker_system_prompts(goal, target_str)
         convs = [{"system": system_prompts[i % len(system_prompts)], "msgs": []}
                  for i in range(self.n_streams)]
@@ -530,7 +547,8 @@ class PAIR(NoAttack):
             if iteration > 1:
                 processed = [process_target_response(r, s, goal, target_str)
                              for r, s in zip(target_responses, judge_scores)]
-            attacks = self._get_attacks(convs, processed)
+            attacks = self._get_attacks(convs, processed,
+                                        seed=base_seed + iteration * 16)
             adv_prompts = [a["prompt"] for a in attacks]
             outs = (respond_batch(adv_prompts) if respond_batch is not None
                     else [respond(a) for a in adv_prompts])

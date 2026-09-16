@@ -18,7 +18,7 @@ Usage:
     # over-refusal: benign prompts under the same defense, then judge refusals
     CUDA_VISIBLE_DEVICES=1 python exp.py --attack none --defense ours --remask v3 \
         --source truthfulqa --n 200 --out outputs/TQA-none-v3-42.json
-    python steering/judge_refusal.py --in outputs/TQA-none-v3-42.json \
+    python -m steering.judge_refusal --in outputs/TQA-none-v3-42.json \
         --out outputs/TQA-none-v3-42_judged.json
 """
 
@@ -30,10 +30,10 @@ import traceback
 import torch
 
 from Attacker import ATTACKERS
-from common import (MODEL_NAME, MASK_ID, PROMPT_SOURCES, encode_prompt,
-                    enable_reproducibility, force_math_attention, load_llada,
-                    load_prompts, parse_gpu_ids, run_eval_shards, seed_all,
-                    write_json)
+from common import (ERROR_SENTINEL, MODEL_NAME, MASK_ID, PROMPT_SOURCES,
+                    encode_prompt, enable_reproducibility,
+                    force_math_attention, load_llada, load_prompts,
+                    plan_shards, run_eval_shards, seed_all, write_json)
 from Defender import DEFENDERS
 
 
@@ -79,8 +79,8 @@ def parse_args():
     return p.parse_args()
 
 
-def run_sharded(args):
-    """Launcher path for --gpus: one exp.py subprocess per GPU, then merge.
+def run_sharded(args, devices):
+    """Launcher path for --gpus: one exp.py subprocess per device group, merged.
 
     Each child reruns this file with its own --start/--n/--out slice and
     CUDA_VISIBLE_DEVICES set; per-prompt seeding (seed + row index) keeps
@@ -88,15 +88,7 @@ def run_sharded(args):
     second LLM (pap/pair) get a (target, attack) GPU pair per shard so the
     two models never share a card.
     """
-    devices = None
     if ATTACKERS[args.attack].needs_second_device:
-        ids = parse_gpu_ids(args.gpus)
-        if len(ids) < 2 or len(ids) % 2:
-            raise SystemExit(
-                f"--attack {args.attack} needs an even --gpus list: each "
-                "shard runs the target on one GPU and the attack LLM on "
-                "another (e.g. --gpus 0,1,2,3 -> 2 shards)")
-        devices = [f"{a},{b}" for a, b in zip(ids[::2], ids[1::2])]
         print(f"attack needs a second device per shard: {len(devices)} "
               f"shards over pairs {devices}")
     results, payload = run_eval_shards(__file__, args,
@@ -104,12 +96,23 @@ def run_sharded(args):
                                        devices=devices)
     write_json(args.out, {**payload, "results": results})
     print(f"merged {len(results)} results -> {args.out}")
+    # The children each summarised their own slice into their part log; the
+    # merged number is the one worth printing (and what script/run_gated.sh
+    # greps for).
+    summary = DEFENDERS[args.defense].summarize(results)
+    if summary:
+        print(summary)
 
 
 def main():
     args = parse_args()
     if args.gpus:
-        return run_sharded(args)
+        # [] means one shard: plan_shards pinned this process to that GPU and
+        # the run continues inline instead of spawning a single child.
+        devices = plan_shards(
+            args.gpus, pairs=ATTACKERS[args.attack].needs_second_device)
+        if devices:
+            return run_sharded(args, devices)
     if args.reproduct:
         enable_reproducibility(args.seed)
     else:
@@ -164,13 +167,17 @@ def main():
             return list(zip(outs, all_ids, cfgs, shown))
         return respond, respond_batch
 
+    def graded_fields(row):
+        """Answer key a graded source carries through to eval_utility.py."""
+        return {k: row[k] for k in ("task", "answer", "subject", "category")
+                if k in row}
+
     def record(result, row, elapsed, dfn):
         generation, extra = result.generation, result.extra
         if result.cfg != gen_config:
             extra = {**extra, "gen_overrides": {k: v for k, v in result.cfg.items()
                                                 if gen_config.get(k) != v}}
-        # Graded sources carry their answer key through to eval_utility.py.
-        graded = {k: row[k] for k in ("task", "answer", "subject", "category") if k in row}
+        graded = graded_fields(row)
         return {"index": row["index"], "prompt": row["prompt"], **graded,
                 "attack_prompt": result.attack_prompt, "generation": generation,
                 **extra, "num_prompt_tokens": int(result.prompt_ids.shape[1]),
@@ -181,7 +188,24 @@ def main():
     jobs = iter(rows)
     t_start = time.time()
 
+    def flush():
+        """Write the full results file. Sorted by index so the output is
+        identical regardless of completion order. Callers hold `lock`."""
+        write_json(args.out, {
+            "model": MODEL_NAME, "config": gen_config,
+            "attack": lanes[0][0].describe(),
+            "defense": lanes[0][1].describe(),
+            "results": sorted(results, key=lambda r: r["index"])})
+
+    # Crash-safety rewrites are spaced out as the payload grows instead of
+    # firing every N rows: each row carries a per-step gate trace, so a fixed
+    # cadence makes total write cost quadratic (817 rows x 128 steps = 31 MB,
+    # ~97s of json.dumps). Backing off by ~10% keeps that near linear while
+    # never risking more than a tenth of a run.
+    next_flush = 5
+
     def job_loop(att, dfn):
+        nonlocal next_flush
         for row in jobs:  # shared iterator: next() is atomic under the GIL
             # Per-prompt seed keeps generation identical under
             # --start/--gpus sharding; the per-row Generator keeps sampling
@@ -201,21 +225,21 @@ def main():
                 rec = record(result, row, time.time() - t0, dfn)
             except Exception:
                 traceback.print_exc()
+                # Every grader reads r["generation"] (eval_llamaguard,
+                # run_sr_eval, judge_refusal, eval_utility), so a failed row
+                # still carries one: the sentinel marks it as "nothing was
+                # generated" and keeps it out of their denominators.
                 rec = {"index": row["index"], "prompt": row["prompt"],
+                       **graded_fields(row), "attack_prompt": None,
+                       "generation": ERROR_SENTINEL,
                        "error": traceback.format_exc(limit=5)}
 
             with lock:
                 results.append(rec)
                 done = len(results)
-                # Rewrite the full results file periodically (crash safety)
-                # -- attack histories make the payload large. Sorted by index
-                # so the file is identical regardless of completion order.
-                if done % 5 == 0 or done == len(rows):
-                    write_json(args.out, {
-                        "model": MODEL_NAME, "config": gen_config,
-                        "attack": lanes[0][0].describe(),
-                        "defense": lanes[0][1].describe(),
-                        "results": sorted(results, key=lambda r: r["index"])})
+                if done >= next_flush or done == len(rows):
+                    flush()
+                    next_flush = done + max(5, done // 10)
             preview = str(rec.get("generation", "<row failed>"))
             print(f"[{done}/{len(rows)}] idx={row['index']} "
                   f"{rec.get('seconds', -1)}s :: "
@@ -230,10 +254,7 @@ def main():
             t.start()
         for t in threads:
             t.join()
-        write_json(args.out, {"model": MODEL_NAME, "config": gen_config,
-                              "attack": lanes[0][0].describe(),
-                              "defense": lanes[0][1].describe(),
-                              "results": sorted(results, key=lambda r: r["index"])})
+        flush()
 
     ordered = sorted(results, key=lambda r: r["index"])
     summary = lanes[0][1].summarize(ordered)
