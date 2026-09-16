@@ -11,6 +11,7 @@ model under attack is always the defended sampler.
 """
 
 import json
+import random
 import re
 import time
 from abc import ABC, abstractmethod
@@ -285,7 +286,7 @@ class PAP(NoAttack):
 
     def __init__(self, llm, judge, techniques, variant="taxonomy", trials=10,
                  taxonomy=None, better_templates=None, one_shot_kd=None,
-                 batch=8):
+                 batch=8, assign_one=False, seed=0):
         self.llm, self.judge = llm, judge
         self.techniques, self.variant, self.trials = techniques, variant, trials
         if batch <= 0:
@@ -294,6 +295,7 @@ class PAP(NoAttack):
         self.better_templates = better_templates or {}
         self.one_shot_kd = one_shot_kd
         self.batch = batch
+        self.assign_one, self.seed = assign_one, seed
 
     @classmethod
     def add_args(cls, parser):
@@ -328,6 +330,13 @@ class PAP(NoAttack):
                                  "(the scan still runs in order and stops at the "
                                  "first jailbreak; leftover chunk work is "
                                  "discarded). 1 = fully sequential.")
+        parser.add_argument("--pap-assign-one", action="store_true",
+                            help="Assign each row ONE technique, drawn "
+                                 "deterministically per row index via "
+                                 "Random(seed + index).choice(--pap-techniques) "
+                                 "-- shard/slice invariant, ~N/5 rows per "
+                                 "technique under top5 (e.g. 100 JBB rows -> "
+                                 "~20 each, total stays 100 results).")
         # Paper: the target model is sampled greedily.
         parser.set_defaults(temperature=0.0)
 
@@ -350,7 +359,8 @@ class PAP(NoAttack):
             pool = [t["ss_technique"] for t in taxonomy]
         techniques = cls._resolve_techniques(args.pap_techniques, pool)
         return cls(llm, judge, techniques, args.pap_variant, args.pap_trials,
-                   batch=args.pap_batch, **kw)
+                   batch=args.pap_batch, assign_one=args.pap_assign_one,
+                   seed=args.seed, **kw)
 
     @staticmethod
     def _resolve_techniques(spec, pool):
@@ -421,12 +431,17 @@ class PAP(NoAttack):
 
     def run(self, row, respond, tokenizer, vanilla_ids=None, respond_batch=None):
         goal = row["prompt"]
+        # --pap-assign-one: one technique per row, drawn by (seed + index) so
+        # the assignment is identical under any sharding/slicing.
+        techniques = ([random.Random(self.seed + int(row.get("index", 0)))
+                       .choice(self.techniques)]
+                      if self.assign_one else self.techniques)
         history, best, best_score = [], None, -1
         jb_score = getattr(self.judge, "jailbreak_score", 10)
         answer = respond_batch or (lambda msgs: [respond(m) for m in msgs])
         for trial in range(1, self.trials + 1):
-            for lo in range(0, len(self.techniques), self.batch):
-                chunk = self.techniques[lo:lo + self.batch]
+            for lo in range(0, len(techniques), self.batch):
+                chunk = techniques[lo:lo + self.batch]
                 paps = self._mutate_batch(goal, chunk)
                 outs = answer(paps)
                 resps = [_assistant_text(tokenizer, o, i) for o, i, _, _ in outs]
@@ -444,20 +459,25 @@ class PAP(NoAttack):
                         extra = {"assistant_text": resp,
                                  "pap": {"jailbroken": True, "technique": tech,
                                          "trial": trial, "queries_to_jailbreak":
-                                         (trial - 1) * len(self.techniques)
-                                         + self.techniques.index(tech) + 1,
+                                         (trial - 1) * len(techniques)
+                                         + techniques.index(tech) + 1,
                                          "history": history}}
+                        if self.assign_one:
+                            extra["pap"]["assigned_technique"] = techniques[0]
                         return AttackResult(shown, resp, extra, cfg, ids)
         shown, resp, ids, cfg, tech = best
         extra = {"assistant_text": resp,
                  "pap": {"jailbroken": False, "best_score": best_score,
                          "best_technique": tech, "trials_run": self.trials,
                          "history": history}}
+        if self.assign_one:
+            extra["pap"]["assigned_technique"] = techniques[0]
         return AttackResult(shown, resp, extra, cfg, ids)
 
     def describe(self):
         return {"attack": self.name, "variant": self.variant,
                 "techniques": self.techniques, "trials": self.trials,
+                "assign_one": self.assign_one,
                 "llm": self.llm.model_id, "judge": getattr(self.judge, "name", "?")}
 
 
