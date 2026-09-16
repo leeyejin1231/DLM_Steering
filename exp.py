@@ -23,7 +23,11 @@ Usage:
 """
 
 import argparse
+import threading
 import time
+import traceback
+
+import torch
 
 from Attacker import ATTACKERS
 from common import (MODEL_NAME, MASK_ID, PROMPT_SOURCES, encode_prompt,
@@ -65,6 +69,11 @@ def parse_args():
                    help="Comma-separated GPU ids (e.g. 0,1,2,3): shard the prompt "
                         "set into contiguous --start/--n slices, run one exp.py "
                         "subprocess per GPU, and merge the part JSONs into --out.")
+    p.add_argument("--row-workers", type=int, default=1,
+                   help="Interleave this many prompt rows per shard process: "
+                        "while one row's target response denoises, another "
+                        "row's attacker/judge calls fill the second GPU. "
+                        "Validated for --attack pap.")
     ATTACKERS[known.attack].add_args(p)
     DEFENDERS[known.defense].add_args(p)
     return p.parse_args()
@@ -101,7 +110,6 @@ def main():
     args = parse_args()
     if args.gpus:
         return run_sharded(args)
-    attacker = ATTACKERS[args.attack].from_args(args)
     if args.reproduct:
         enable_reproducibility(args.seed)
     else:
@@ -113,75 +121,122 @@ def main():
         force_math_attention()
     device = next(model.parameters()).device
 
-    defender = DEFENDERS[args.defense].from_args(args, model)
     rows = load_prompts(args.source)[args.start: args.start + args.n]
-    print(f"{len(rows)} prompts from {args.source}, attack={args.attack}, "
-          f"defense={args.defense}")
+    workers = max(1, args.row_workers)
 
     gen_config = {"steps": args.steps, "gen_length": args.gen_length,
                   "block_length": args.block_length, "temperature": args.temperature,
                   "remasking": args.remasking, "schedule": args.schedule}
 
-    def respond(user_message):
-        """One user turn through the defense -> (x, ids, cfg, shown)."""
-        shown = defender.transform_prompt(user_message)
-        ids = encode_prompt(tokenizer, shown, device)
-        cfg = {**gen_config, **attacker.gen_overrides(ids)}
-        return defender.defend(model, ids, **cfg), ids, cfg, shown
+    # One lane per row worker: attacker/defender instances hold per-response
+    # state (PAIR convs, V3 recovery/audit), so interleaved rows each get a
+    # private pair built on the shared (read-only) model.
+    lanes = [(ATTACKERS[args.attack].from_args(args),
+              DEFENDERS[args.defense].from_args(args, model))
+             for _ in range(workers)]
+    print(f"{len(rows)} prompts from {args.source}, attack={args.attack}, "
+          f"defense={args.defense}, row_workers={workers}")
 
-    def respond_batch(user_messages):
-        """A batch of user turns -> list of (x, ids, cfg, shown).
+    def make_respond(att, dfn, rng):
+        """Per-(lane, row) respond closures bound to that row's generator."""
+        def respond(user_message):
+            """One user turn through the defense -> (x, ids, cfg, shown)."""
+            shown = dfn.transform_prompt(user_message)
+            ids = encode_prompt(tokenizer, shown, device)
+            cfg = {**gen_config, **att.gen_overrides(ids)}
+            return dfn.defend(model, ids, rng=rng, **cfg), ids, cfg, shown
 
-        defender.defend_batch is a real batched denoising loop under
-        --defense none and a sequential fallback otherwise; per-prompt
-        gen_overrides that disagree also fall back to sequential calls.
-        """
-        shown = [defender.transform_prompt(m) for m in user_messages]
-        all_ids = [encode_prompt(tokenizer, s, device) for s in shown]
-        cfgs = [{**gen_config, **attacker.gen_overrides(i)} for i in all_ids]
-        if all(c == cfgs[0] for c in cfgs):
-            outs = defender.defend_batch(model, all_ids, **cfgs[0])
-        else:
-            outs = [defender.defend(model, i, **c)
-                    for i, c in zip(all_ids, cfgs)]
-        return list(zip(outs, all_ids, cfgs, shown))
+        def respond_batch(user_messages):
+            """A batch of user turns -> list of (x, ids, cfg, shown).
 
-    results = []
-    t_start = time.time()
-    for i, row in enumerate(rows):
-        # Per-prompt seed keeps generation identical under --start/--gpus sharding.
-        seed_all(args.seed + int(row["index"]))
-        vanilla_ids = (encode_prompt(tokenizer, defender.transform_prompt(row["prompt"]),
-                                     device) if attacker.needs_vanilla else None)
+            defender.defend_batch is a real batched denoising loop under
+            --defense none and a sequential fallback otherwise; per-prompt
+            gen_overrides that disagree also fall back to sequential calls.
+            """
+            shown = [dfn.transform_prompt(m) for m in user_messages]
+            all_ids = [encode_prompt(tokenizer, s, device) for s in shown]
+            cfgs = [{**gen_config, **att.gen_overrides(i)} for i in all_ids]
+            if all(c == cfgs[0] for c in cfgs):
+                outs = dfn.defend_batch(model, all_ids, rng=rng, **cfgs[0])
+            else:
+                outs = [dfn.defend(model, i, rng=rng, **c)
+                        for i, c in zip(all_ids, cfgs)]
+            return list(zip(outs, all_ids, cfgs, shown))
+        return respond, respond_batch
 
-        t0 = time.time()
-        result = attacker.run(row, respond, tokenizer, vanilla_ids,
-                              respond_batch=respond_batch)
-        elapsed = time.time() - t0
-
+    def record(result, row, elapsed, dfn):
         generation, extra = result.generation, result.extra
         if result.cfg != gen_config:
             extra = {**extra, "gen_overrides": {k: v for k, v in result.cfg.items()
                                                 if gen_config.get(k) != v}}
         # Graded sources carry their answer key through to eval_utility.py.
         graded = {k: row[k] for k in ("task", "answer", "subject", "category") if k in row}
-        results.append({"index": row["index"], "prompt": row["prompt"], **graded,
-                        "attack_prompt": result.attack_prompt, "generation": generation,
-                        **extra, "num_prompt_tokens": int(result.prompt_ids.shape[1]),
-                        "num_prompt_masks": int((result.prompt_ids == MASK_ID).sum()),
-                        "seconds": round(elapsed, 2), **defender.result_fields()})
+        return {"index": row["index"], "prompt": row["prompt"], **graded,
+                "attack_prompt": result.attack_prompt, "generation": generation,
+                **extra, "num_prompt_tokens": int(result.prompt_ids.shape[1]),
+                "num_prompt_masks": int((result.prompt_ids == MASK_ID).sum()),
+                "seconds": round(elapsed, 2), **dfn.result_fields()}
 
-        # Rewrite the full results file periodically (crash safety) -- attack
-        # histories make the payload large, so not every row.
-        if (i + 1) % 5 == 0 or i == len(rows) - 1:
-            write_json(args.out, {"model": MODEL_NAME, "config": gen_config,
-                                  "attack": attacker.describe(),
-                                  "defense": defender.describe(),
-                                  "results": results})
-        print(f"[{i + 1}/{len(rows)}] idx={row['index']} {elapsed:.1f}s :: "
-              f"{generation[:100].replace(chr(10), ' ')}...", flush=True)
+    results, lock = [], threading.Lock()
+    jobs = iter(rows)
+    t_start = time.time()
 
-    summary = defender.summarize(results)
+    def job_loop(att, dfn):
+        for row in jobs:  # shared iterator: next() is atomic under the GIL
+            # Per-prompt seed keeps generation identical under
+            # --start/--gpus sharding; the per-row Generator keeps sampling
+            # draws identical when rows interleave (--row-workers > 1).
+            seed_all(args.seed + int(row["index"]))
+            rng = torch.Generator(device=device)
+            rng.manual_seed(args.seed + int(row["index"]))
+            vanilla_ids = (encode_prompt(
+                tokenizer, dfn.transform_prompt(row["prompt"]), device)
+                if att.needs_vanilla else None)
+            respond, respond_batch = make_respond(att, dfn, rng)
+
+            t0 = time.time()
+            try:
+                result = att.run(row, respond, tokenizer, vanilla_ids,
+                                 respond_batch=respond_batch)
+                rec = record(result, row, time.time() - t0, dfn)
+            except Exception:
+                traceback.print_exc()
+                rec = {"index": row["index"], "prompt": row["prompt"],
+                       "error": traceback.format_exc(limit=5)}
+
+            with lock:
+                results.append(rec)
+                done = len(results)
+                # Rewrite the full results file periodically (crash safety)
+                # -- attack histories make the payload large. Sorted by index
+                # so the file is identical regardless of completion order.
+                if done % 5 == 0 or done == len(rows):
+                    write_json(args.out, {
+                        "model": MODEL_NAME, "config": gen_config,
+                        "attack": lanes[0][0].describe(),
+                        "defense": lanes[0][1].describe(),
+                        "results": sorted(results, key=lambda r: r["index"])})
+            preview = str(rec.get("generation", "<row failed>"))
+            print(f"[{done}/{len(rows)}] idx={row['index']} "
+                  f"{rec.get('seconds', -1)}s :: "
+                  f"{preview[:100].replace(chr(10), ' ')}...", flush=True)
+
+    if workers == 1:
+        job_loop(*lanes[0])
+    else:
+        threads = [threading.Thread(target=job_loop, args=lane, daemon=True)
+                   for lane in lanes]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        write_json(args.out, {"model": MODEL_NAME, "config": gen_config,
+                              "attack": lanes[0][0].describe(),
+                              "defense": lanes[0][1].describe(),
+                              "results": sorted(results, key=lambda r: r["index"])})
+
+    ordered = sorted(results, key=lambda r: r["index"])
+    summary = lanes[0][1].summarize(ordered)
     if summary:
         print(summary)
     print(f"\nDone in {time.time() - t_start:.1f}s -> {args.out}")

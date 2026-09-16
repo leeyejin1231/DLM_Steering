@@ -13,6 +13,7 @@ model under attack is always the defended sampler.
 import json
 import random
 import re
+import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import NamedTuple
@@ -315,7 +316,8 @@ class PAP(NoAttack):
     def from_args(cls, args):
         import attack_prompts
         from attack_llms import HFChat, make_loop_judge
-        llm = HFChat(args.pap_llm, device=args.pap_device or _default_attack_device())
+        llm = HFChat.shared(args.pap_llm,
+                            device=args.pap_device or _default_attack_device())
         judge = make_loop_judge(args.pap_judge, llm, kind="pap")
         taxonomy = {t["ss_technique"]: t for t in attack_prompts.load_pap_taxonomy(
             args.pap_taxonomy or attack_prompts.PAP_TAXONOMY_PATH)}
@@ -328,27 +330,57 @@ class PAP(NoAttack):
                    attack_prompts.load_one_shot_kd(),
                    trials=args.pap_trials, seed=args.seed)
 
-    def _mutate(self, goal, technique):
-        """one_shot_kd paraphrase for (goal, technique); returns the PAP text."""
+    def _mutate(self, goal, technique, seed):
+        """one_shot_kd paraphrase for (goal, technique); returns the PAP text.
+
+        `seed` feeds a per-call generator so the paraphrase is identical
+        regardless of call order or thread (speculative prefetch,
+        --row-workers)."""
         from attack_prompts import remove_quotes
         t = self.taxonomy[technique]
         raw = self.llm.generate(
             [{"role": "user", "content": self.one_shot_kd % (
                 t["ss_technique"], t["ss_definition"], t["ss_example"],
                 goal, t["ss_technique"], goal, goal)}],
-            temperature=1, top_p=1, max_new_tokens=2500)
+            temperature=1, top_p=1, max_new_tokens=2500, seed=seed)
         return remove_quotes([raw])[0]
 
     def run(self, row, respond, tokenizer, vanilla_ids=None, respond_batch=None):
         goal = row["prompt"]
+        idx = int(row.get("index", 0))
         # One technique per row, drawn by (seed + index): identical under any
         # sharding/slicing; ~N/5 rows per technique across the source.
-        tech = random.Random(self.seed + int(row.get("index", 0))).choice(
-            self.techniques)
+        tech = random.Random(self.seed + idx).choice(self.techniques)
         history, best, best_score = [], None, -1
         jb_score = getattr(self.judge, "jailbreak_score", 10)
+
+        def spawn_prefetch(trial):
+            """Speculatively mutate the next trial on a thread: it fills the
+            attacker GPU's idle window while this row's respond() runs on the
+            target card. Seeded mutate -> result is identical to a serial
+            call; discarded if the current trial already jailbreaks."""
+            box = {}
+            def job():
+                try:
+                    box["pap"] = self._mutate(goal, tech, self.seed + idx * 1024 + trial)
+                except Exception as e:
+                    box["err"] = e
+            t = threading.Thread(target=job, daemon=True)
+            t.start()
+            return t, box
+
+        pending = None
         for trial in range(1, self.trials + 1):
-            pap = self._mutate(goal, tech)
+            if pending is not None:
+                t, box = pending
+                t.join()
+                pap = box.get("pap") if "err" not in box else None
+                if pap is None:
+                    pap = self._mutate(goal, tech, self.seed + idx * 1024 + trial)
+            else:
+                pap = self._mutate(goal, tech, self.seed + idx * 1024 + trial)
+            pending = (spawn_prefetch(trial + 1) if trial < self.trials
+                       else None)
             out, ids, cfg, shown = respond(pap)
             resp = _assistant_text(tokenizer, out, ids)
             score = self.judge.score([pap], [resp], goal, None)[0]
@@ -445,8 +477,8 @@ class PAIR(NoAttack):
     @classmethod
     def from_args(cls, args):
         from attack_llms import HFChat, make_loop_judge
-        llm = HFChat(args.pair_llm,
-                     device=args.pair_device or _default_attack_device())
+        llm = HFChat.shared(args.pair_llm,
+                            device=args.pair_device or _default_attack_device())
         judge = make_loop_judge(args.pair_judge, llm, kind="pair")
         if hasattr(judge, "max_n_tokens"):
             judge.max_n_tokens = args.pair_judge_tokens
