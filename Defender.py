@@ -66,9 +66,11 @@ class Defender(ABC):
         """
 
     @abstractmethod
-    def forward(self, x, region, *, schedule_scale):
+    def forward(self, x, region, *, schedule_scale, logit_positions=None):
         """One model forward, optionally with in-forward detection + steering.
-        Must return the model output (with .logits)."""
+        Must return the model output (with .logits). logit_positions, when
+        given, restricts the vocab projection to those rows -- .logits is then
+        aligned to them. Implementations may ignore it (full logits)."""
 
     def after_block(self, x, region, *, block_index, block_positions,
                     prompt_length, temperature, remasking, last_block=False):
@@ -117,8 +119,16 @@ class NullDefender(Defender):
     def before_step(self, x, region, *, scope, steps_remaining):
         return None
 
-    def forward(self, x, region, *, schedule_scale):
-        return self.model(x)
+    def forward(self, x, region, *, schedule_scale, logit_positions=None):
+        if logit_positions is None:
+            return self.model(x)
+        ln_f = self.model.model.transformer.ln_f
+        handle = ln_f.register_forward_hook(
+            lambda m, i, o: o[:, logit_positions])
+        try:
+            return self.model(x)
+        finally:
+            handle.remove()
 
     def result_fields(self):
         return {}
@@ -185,6 +195,7 @@ class Ours(Defender):
         self.model = model
         self.gate_layer = gate_layer
         self.gate_block = blocks[gate_layer - 1]
+        self.ln_f = model.model.transformer.ln_f
         self.gate_vector = gate_vector.float()
         self.threshold, self.width = float(threshold), float(width)
         self.strength, self.transform = float(strength), transform
@@ -350,8 +361,13 @@ class Ours(Defender):
 
     # ---------------------------------------------------------------- forward
     @torch.no_grad()
-    def forward(self, x, region, *, schedule_scale=1.0):
-        """One model forward with in-forward detection and steering."""
+    def forward(self, x, region, *, schedule_scale=1.0, logit_positions=None):
+        """One model forward with in-forward detection and steering.
+
+        logit_positions: index tensor of positions the caller will read logits
+        for (the eligible set). Given, ln_f's output is sliced to those rows so
+        the vocab projection runs on n positions instead of the full sequence;
+        output.logits is then [1, n, vocab] aligned to logit_positions."""
         masks = (x == self.mask_id) & region
         committed = region & ~masks
         # Sync while the GPU queue is empty: one batched read feeds validate +
@@ -390,6 +406,9 @@ class Ours(Defender):
                         [_hidden(output)[0, p].to(torch.float32).mean(dim=0)
                          for p in audit_pools]))
                 handles.append(self.gate_block.register_forward_hook(capture))
+            if logit_positions is not None:
+                handles.append(self.ln_f.register_forward_hook(
+                    lambda m, i, o: o[:, logit_positions]))
             output = self.model(x)
         finally:
             for handle in handles:
@@ -419,7 +438,8 @@ class Ours(Defender):
             # The forward just consumed is stale post-recovery; redo it so the
             # sampler commits from post-recovery logits.
             self._pending = None
-            return self.forward(x, region, schedule_scale=schedule_scale)
+            return self.forward(x, region, schedule_scale=schedule_scale,
+                                logit_positions=logit_positions)
         self.trace.append({
             "step": self.step, "projection": proj_v if pend["fired"] else None,
             "strength": self.gate_strength, "schedule_scale": self._schedule_scale,
@@ -655,6 +675,7 @@ class V3(Ours):
         committed tokens and each chunk of the finished block."""
         pools = [(region[0] & (x[0] != self.mask_id)).nonzero().flatten(), *chunks]
         feats_out = []
+        empty = torch.empty(0, dtype=torch.long, device=x.device)
 
         def capture(module, inputs, output):
             hidden = _hidden(output)
@@ -662,10 +683,14 @@ class V3(Ours):
                 [hidden[0, p].to(torch.float32).mean(dim=0) for p in pools]))
 
         handle = self.gate_block.register_forward_hook(capture)
+        # Audits read only gate-layer features; slice ln_f to zero rows so the
+        # vocab projection is skipped entirely.
+        skip_logits = self.ln_f.register_forward_hook(lambda m, i, o: o[:, empty])
         try:
             self.model(x)
         finally:
             handle.remove()
+            skip_logits.remove()
         self.audit_forwards += 1
         if len(feats_out) != 1:
             raise RuntimeError("audit hook must execute exactly once per forward")
@@ -743,7 +768,8 @@ class V3(Ours):
                         break
                     if counts[i] == 0 and not final:
                         continue
-                    logits = self.forward(x, region, schedule_scale=1.0).logits
+                    logits = self.forward(x, region, schedule_scale=1.0,
+                                          logit_positions=eligible).logits
                     eligible = commit_sample(x, logits, eligible, counts[i],
                                              temperature, remasking, final=final)
             finally:
@@ -856,7 +882,7 @@ class ProposedDefense(Defender):
                            "done": self._policy.done})
         return commit_count
 
-    def forward(self, x, region, *, schedule_scale):
+    def forward(self, x, region, *, schedule_scale, logit_positions=None):
         self.step += 1
         return self._policy.forward(x, region)
 
@@ -916,7 +942,7 @@ class DiffuGuard(Defender):
     def before_step(self, x, region, *, scope, steps_remaining):
         return None
 
-    def forward(self, x, region, *, schedule_scale):
+    def forward(self, x, region, *, schedule_scale, logit_positions=None):
         raise NotImplementedError("DiffuGuard not implemented yet")
 
     def result_fields(self):

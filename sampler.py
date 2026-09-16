@@ -30,7 +30,9 @@ def commit_sample(x, logits, eligible, count, temperature, remasking, final=Fals
     k = n if final else min(int(count), n)
     if k <= 0:
         return eligible
-    sub = logits[0, eligible]
+    # logits may be full [1, seq, vocab] or pre-sliced to the eligible rows
+    # [1, n, vocab] (ln_f hook); identical when every position is eligible.
+    sub = logits[0, eligible] if logits.shape[1] == x.shape[1] else logits[0]
     predicted = add_gumbel_noise(sub, temperature).argmax(-1)
     if remasking == "low_confidence":
         sub64 = sub.to(torch.float64)
@@ -100,10 +102,17 @@ def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
                 break
 
             if defender is None:
-                logits = model(x).logits
+                ln_f = model.model.transformer.ln_f
+                handle = ln_f.register_forward_hook(
+                    lambda m, i, o: o[:, eligible])
+                try:
+                    logits = model(x).logits
+                finally:
+                    handle.remove()
             else:
                 logits = defender.forward(
-                    x, region, schedule_scale=step_scale(schedule, i, steps_per_block)).logits
+                    x, region, schedule_scale=step_scale(schedule, i, steps_per_block),
+                    logit_positions=eligible).logits
 
             eligible = commit_sample(x, logits, eligible, schedule_counts[i],
                                      temperature, remasking,
