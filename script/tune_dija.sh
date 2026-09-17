@@ -6,6 +6,7 @@
 #   PHASE=boundary  where v3 may trigger: checkpoints every 32 committed mask
 #                   slots (--infill-checkpoint 32), boundary k = after 32*(k+1)
 #                   slots, plus the old end-of-infilling audit as reference.
+#   PHASE=ref       steer-only and no-defense references for the same runs.
 #   PHASE=rest      temperature (3 seeds) and recovery steps x rounds, at the
 #                   boundary chosen from the first phase: BOUNDARY=<k|end>.
 set -uo pipefail
@@ -37,7 +38,15 @@ for S in jbb_harmful harmbench strongreject; do
     COMMON=(--attack dija --defense ours --steer adaptive --remask v3
             --source "$S" --n 600 --reproduct)
 
-    if [ "$PHASE" = boundary ]; then
+    if [ "$PHASE" = ref ]; then
+        # References for reading the boundary sweep: the same attack and
+        # sampling with no recovery at all (steer-only) and with no defense.
+        echo "== $P: references (T=0.2) =="
+        run "dija-$P-steeronly" --attack dija --defense ours --steer adaptive \
+            --remask none --source "$S" --n 600 --reproduct --temperature 0.2 --seed 42
+        run "dija-$P-nodef" --attack dija --defense none \
+            --source "$S" --n 600 --reproduct --temperature 0.2 --seed 42
+    elif [ "$PHASE" = boundary ]; then
         echo "== $P: audit boundary (T=0.2) =="
         for B in 0 1 2 3 end; do
             run "dija-$P-bnd$B" "${COMMON[@]}" $(audit_args "$B") \
