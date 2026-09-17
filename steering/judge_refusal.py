@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 from common import plan_shards, run_eval_shards
-from Evaluator import Refusal
+from Evaluator import LocalRefusal, Refusal
 
 def main():
     ap = argparse.ArgumentParser()
@@ -41,6 +41,14 @@ def main():
     ap.add_argument("--container", default=None,
                     help="podman container name (default 'ollama'; sharded runs "
                          "use ollama-<port> automatically)")
+    ap.add_argument("--judge", choices=["ollama", "local"], default="ollama",
+                    help="'ollama' is gpt-oss:20b through the podman container; "
+                         "'local' runs the same rubric on a local HF model "
+                         "(--judge-model) and needs no podman. The two judges "
+                         "do not agree on every borderline answer -- pick one "
+                         "and keep it for the whole comparison.")
+    ap.add_argument("--judge-model", default="Qwen/Qwen3-14B",
+                    help="HF model for --judge local.")
     ap.add_argument("--reasoning-effort", default="low")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--num-predict", type=int, default=512,
@@ -55,6 +63,10 @@ def main():
     devices = plan_shards(args.gpus) if args.gpus else []
     if devices:
         def extra(i, gpu):
+            # --judge local has no server to place, so only the ollama judge
+            # needs a port/container of its own per shard.
+            if args.judge == "local":
+                return []
             port = args.port + i
             return ["--port", port, "--gpu", gpu,
                     "--container", f"ollama-{port}"]
@@ -67,15 +79,21 @@ def main():
         items = items[args.start:
                       args.start + args.n if args.n is not None else None]
         jsonl = args.jsonl or str(Path(args.out).with_suffix(".jsonl"))
-        with Refusal(model=args.model, port=args.port, gpu=args.gpu,
-                     container=args.container,
-                     reasoning_effort=args.reasoning_effort,
-                     num_predict=args.num_predict, workers=args.workers) as judge:
+        if args.judge == "local":
+            judge = LocalRefusal(args.judge_model)
+        else:
+            judge = Refusal(model=args.model, port=args.port, gpu=args.gpu,
+                            container=args.container,
+                            reasoning_effort=args.reasoning_effort,
+                            num_predict=args.num_predict, workers=args.workers)
+        with judge:
             judged = judge.evaluate(items, output_path=jsonl)
             judged.sort(key=lambda r: r["index"])
             summary = judge.summarize(judged)
 
-    payload = {"judge": f"XSTest 3-way / {args.model}", "source": args.inp,
+    payload = {"judge": f"XSTest 3-way / "
+                        f"{args.judge_model if args.judge == 'local' else args.model}",
+               "source": args.inp,
                "source_set": data.get("source"), "steering": data.get("steering"),
                "summary": summary, "results": judged}
     Path(args.out).write_text(json.dumps(payload, ensure_ascii=False, indent=2))

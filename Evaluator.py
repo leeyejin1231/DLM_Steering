@@ -487,6 +487,68 @@ CLASSIFICATION:"""
         }
 
 
+class LocalRefusal(Evaluator):
+    """The XSTest refusal rubric on a local HF chat model instead of ollama.
+
+    Same rubric text, same parser and same summary as Refusal -- only the
+    transport differs, for machines without podman. Labels are therefore
+    comparable to Refusal's only up to the judge: gpt-oss:20b and a local model
+    will not agree on every borderline answer, so do not mix the two within one
+    comparison.
+    """
+
+    name = "xstest-refusal-local"
+    RUBRIC = Refusal.RUBRIC
+    LABELS = Refusal.LABELS
+    _parse_label = staticmethod(Refusal._parse_label)
+    summarize = staticmethod(Refusal.summarize)
+
+    def __init__(self, model_id="Qwen/Qwen3-14B", device=None, batch_size=8,
+                 max_new_tokens=64):
+        from attack_llms import HFChat
+        self.llm = HFChat.shared(model_id, device=device)
+        self.model_id = model_id
+        self.batch_size = batch_size
+        self.max_new_tokens = max_new_tokens
+
+    @staticmethod
+    def _length(item):
+        return len(item.get("prompt", "")) + len(item.get("response", ""))
+
+    def evaluate(self, items, output_path=None):
+        return _run_graded(items, output_path, self._grade,
+                           chunk=self.batch_size, order=self._length,
+                           desc=f"RefusalJudge ({self.model_id})")
+
+    def _grade(self, chunk):
+        graded, ask = [], []
+        for item in chunk:
+            if item["response"] == ERROR_SENTINEL:
+                graded.append({**item, "judge_raw": "(generation failed upstream)",
+                               "judge_label": None, "judge_sec": 0.0})
+            elif not item["response"].strip():
+                graded.append({**item, "judge_raw": "(empty generation)",
+                               "judge_label": "2_full_refusal", "judge_sec": 0.0})
+            else:
+                ask.append(item)
+        if ask:
+            t0 = time.time()
+            convs = [[{"role": "user", "content": self.RUBRIC.format(
+                question=i["prompt"], response=i["response"])}] for i in ask]
+            try:
+                raws = self.llm.generate_batch(
+                    convs, temperature=0, top_p=1,
+                    max_new_tokens=self.max_new_tokens)
+            except Exception as e:
+                raws = [f"LOCAL JUDGE ERROR: {e}"] * len(ask)
+            sec = round((time.time() - t0) / len(ask), 2)
+            for item, raw in zip(ask, raws):
+                graded.append({**item, "judge_raw": raw,
+                               "judge_label": self._parse_label(raw),
+                               "judge_sec": sec})
+        return graded
+
+
 # ---------------------------------------------------------------------------
 # Llama Guard
 # ---------------------------------------------------------------------------
