@@ -12,8 +12,24 @@
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 PY=.venv/bin/python
-GPUS=${GPUS:-0,1,2,3,4,5,6,7}
 PHASE=${PHASE:-boundary}
+
+# Batch-1 decoding leaves the GPU idle ~60% of each step waiting on Python to
+# launch kernels, so two processes per card fill that gap: measured on JBB
+# (100 rows, 8x A6000 40GB) one per card 172s, two per card 117s, identical
+# generations (per-row seeding makes the shard layout irrelevant). LLaDA-8B
+# takes ~16GB, so PROCS_PER_GPU=2 needs 40GB cards -- use 1 on 24GB ones.
+# Without an OMP cap each process spun 450 threads at ~830% CPU for no gain.
+PROCS_PER_GPU=${PROCS_PER_GPU:-2}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4} MKL_NUM_THREADS=${MKL_NUM_THREADS:-4} \
+       OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-4}
+if [ -z "${GPUS:-}" ]; then
+    CARDS=${CUDA_VISIBLE_DEVICES:-$(nvidia-smi --query-gpu=index --format=csv,noheader | paste -sd, -)}
+    GPUS=""
+    for g in ${CARDS//,/ }; do
+        for _ in $(seq "$PROCS_PER_GPU"); do GPUS="${GPUS:+$GPUS,}$g"; done
+    done
+fi
 OUT=outputs/tune
 LOG=$OUT/commands.log
 mkdir -p "$OUT"
