@@ -311,7 +311,8 @@ def load_eval_prompts(source, limit):
     """
     import pandas as pd
     if source.startswith("xstest"):
-        df = pd.read_parquet(hf_glob(XSTEST_GLOB)[0])
+        local = DATA_DIR / "xstest.parquet"
+        df = pd.read_parquet(local if local.exists() else hf_glob(XSTEST_GLOB)[0])
         # "xstest_unsafe".endswith("safe") is True, so match the suffix explicitly.
         want = "unsafe" if source.endswith("_unsafe") else "safe"
         df = df[df["label"] == want]

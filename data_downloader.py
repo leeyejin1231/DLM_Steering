@@ -4,6 +4,7 @@
     advbench      -> data/advbench.parquet    (walledai/AdvBench)
     harmbench     -> data/harmbench.parquet   (walledai/HarmBench)
     strongreject  -> data/strongreject.parquet (the authors' own CSV)
+    xstest         -> data/xstest.parquet      (the authors' own CSV)
 
 The walledeval repos ship several parquet shards/splits; they are
 concatenated and de-duplicated like common.load_eval_prompts does.
@@ -33,6 +34,10 @@ DATA_DIR = Path(__file__).parent / "data"
 WALLEDAI = {"advbench": "walledai/AdvBench", "harmbench": "walledai/HarmBench"}
 STRONGREJECT_CSV = ("https://raw.githubusercontent.com/alexandrasouly/strongreject"
                     "/main/strongreject_dataset/strongreject_dataset.csv")
+# Both halves live in one file; load_eval_prompts filters on the label column,
+# so xstest_safe and xstest_unsafe both read this.
+XSTEST_CSV = ("https://raw.githubusercontent.com/paul-rottger/xstest"
+              "/main/xstest_prompts.csv")
 
 
 def download_jbb_harmful():
@@ -63,14 +68,24 @@ def download_strongreject():
     print(f"strongreject: {len(df)} rows -> {out}")
 
 
+def download_xstest():
+    df = pd.read_csv(XSTEST_CSV)
+    out = DATA_DIR / "xstest.parquet"
+    df.to_parquet(out, index=False)
+    counts = df["label"].value_counts().to_dict()
+    print(f"xstest: {len(df)} rows {counts} -> {out}")
+
+
 def main():
     DATA_DIR.mkdir(exist_ok=True)
-    wanted = sys.argv[1:] or ["jbb_harmful", *WALLEDAI, "strongreject"]
+    wanted = sys.argv[1:] or ["jbb_harmful", *WALLEDAI, "strongreject", "xstest"]
     for source in wanted:
         if source == "jbb_harmful":
             download_jbb_harmful()
         elif source == "strongreject":
             download_strongreject()
+        elif source == "xstest":
+            download_xstest()
         elif source in WALLEDAI:
             download_walledeval(source)
         else:
