@@ -20,6 +20,17 @@ from common import MASK_ID, MODEL_LOCK, step_scale
 from llada import PAD_ID, add_gumbel_noise, get_num_transfer_tokens
 
 
+def take_true(mask_row, n):
+    """Positions of the `n` True entries of a 1-D bool tensor, ascending.
+
+    Identical to mask_row.nonzero().flatten() when mask_row holds exactly n
+    Trues, but the result size is the caller's n rather than a count read back
+    from the GPU, so it never waits on a device sync. A stable sort brings the
+    True positions to the front while keeping their order.
+    """
+    return torch.argsort((~mask_row).to(torch.int8), stable=True)[:n]
+
+
 def commit_sample(x, logits, eligible, count, temperature, remasking,
                   final=False, rng=None):
     """Commit the `count` highest-confidence eligible positions in place.
@@ -45,10 +56,20 @@ def commit_sample(x, logits, eligible, count, temperature, remasking,
     else:
         raise NotImplementedError(remasking)
     selected = confidence.topk(k).indices
-    x[0, eligible[selected]] = predicted[selected]
-    keep = torch.ones(n, dtype=torch.bool, device=x.device)
-    keep[selected] = False
-    return eligible[keep]
+    # No indexed writes below. Under torch.use_deterministic_algorithms (the
+    # --reproduct mode) every index_put_/scatter_/bool-index assignment costs
+    # two GPU->CPU syncs; masks built by broadcast comparison, a gather through
+    # searchsorted and torch.where commit the same tokens with none.
+    # `eligible` is ascending (it comes from nonzero/take_true), so searchsorted
+    # maps each sequence position back to its row in `predicted`.
+    length = x.shape[1]
+    positions = torch.arange(length, device=x.device)
+    chosen = (positions[:, None] == eligible[selected][None, :]).any(1)
+    rows = torch.searchsorted(eligible, positions).clamp_(max=n - 1)
+    x[0].copy_(torch.where(chosen, predicted[rows], x[0]))
+    keep = ~(torch.arange(n, device=x.device)[:, None] == selected[None, :]).any(1)
+    # Exactly n - k slots stay open; take_true cuts them at that known size.
+    return eligible[take_true(keep, n - k)]
 
 
 @torch.no_grad()
@@ -124,9 +145,13 @@ def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
                     finally:
                         handle.remove()
             else:
+                # Every open mask is either in this block's eligible set or in a
+                # later block, which is still fully masked, so the total is known
+                # on the CPU and the defender need not read it off the GPU.
                 logits = defender.forward(
                     x, region, schedule_scale=step_scale(schedule, i, steps_per_block),
-                    logit_positions=eligible).logits
+                    logit_positions=eligible,
+                    n_masks=eligible.numel() + x.shape[1] - block_end).logits
 
             eligible = commit_sample(x, logits, eligible, schedule_counts[i],
                                      temperature, remasking,

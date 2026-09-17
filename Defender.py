@@ -22,6 +22,7 @@ from typing import Any
 import torch
 
 from common import MASK_ID, MODEL_LOCK, block_index, load_detector
+from sampler import take_true
 
 
 def _hidden(output):
@@ -69,7 +70,7 @@ class _ForwardPlan:
     read_gate: bool
     steer: bool
     gate_pool: Any = None        # index tensor for the gate, or None
-    steer_positions: Any = None  # masked slots the steering hook pushes
+    steer_mask: Any = None       # bool [seq]: masked slots the steering hook pushes
     audit: Any = None            # _PendingAudit riding this forward, or None
     audit_pools: Any = None      # index tensors the audit hook pools over
 
@@ -146,11 +147,14 @@ class Defender(ABC):
         """
 
     @abstractmethod
-    def forward(self, x, region, *, schedule_scale, logit_positions=None):
+    def forward(self, x, region, *, schedule_scale, logit_positions=None,
+                n_masks=None):
         """One model forward, optionally with in-forward detection + steering.
         Must return the model output (with .logits). logit_positions, when
         given, restricts the vocab projection to those rows -- .logits is then
-        aligned to them. Implementations may ignore it (full logits)."""
+        aligned to them. Implementations may ignore it (full logits).
+        n_masks, when given, is the number of still-masked region slots, which
+        the sampler knows without asking the GPU."""
 
     def after_block(self, x, region, *, block_number, block_positions,
                     prompt_length, temperature, remasking, last_block=False,
@@ -219,7 +223,8 @@ class NullDefender(Defender):
     def before_step(self, x, region, *, scope, steps_remaining):
         return None
 
-    def forward(self, x, region, *, schedule_scale, logit_positions=None):
+    def forward(self, x, region, *, schedule_scale, logit_positions=None,
+                n_masks=None):
         if logit_positions is None:
             return self.model(x)
         ln_f = self.model.model.transformer.ln_f
@@ -408,6 +413,8 @@ class Ours(Defender):
         self.monitoring = True
         self.step = 0
         self.trace = []
+        self._trace_raw = []     # per-step rows whose numbers are still on the GPU
+        self._n_region = None    # region size, read once per response
         self._pending = None
         self._schedule_scale = 1.0
         self._steer_boost = 1.0   # V3 recovery rounds may escalate strength
@@ -468,7 +475,12 @@ class Ours(Defender):
                  for p in pools]))
         return capture
 
-    def _steer_hook(self, unit, ref_norm, positions):
+    def _steer_hook(self, unit, ref_norm, mask):
+        """mask: bool [seq], the slots to push. The update is computed for every
+        position and kept only where mask is set -- an indexed write would cost
+        two GPU syncs per call under --reproduct's deterministic mode. The
+        additive update is pointwise, so masked slots get exactly the values the
+        indexed version produced."""
         def steer(module, inputs, output):
             pending = self._pending
             live = pending is not None and pending.fired
@@ -477,7 +489,7 @@ class Ours(Defender):
             if self.strength == 0.0 and self.transform == "additive":
                 return output
             hidden = _hidden(output)
-            values = hidden[0, positions].to(torch.float32)
+            values = hidden[0].to(torch.float32)
             g = (self._gate_t if live else self.gate_strength)
             g = torch.as_tensor(g * self._schedule_scale * self._steer_boost,
                                 dtype=torch.float32, device=values.device)
@@ -488,8 +500,7 @@ class Ours(Defender):
                 harmful = -u
                 projection = (values * harmful).sum(dim=-1, keepdim=True).clamp(min=0)
                 updated = values - g * (projection + self.strength * ref_norm) * harmful
-            out = hidden.clone()
-            out[0, positions] = updated.to(hidden.dtype)
+            out = torch.where(mask[:, None], updated.to(hidden.dtype), hidden[0])[None]
             if pending is not None:
                 pending.alpha = g * self.strength
             return _replace(output, out)
@@ -500,18 +511,26 @@ class Ours(Defender):
     # effective alpha, then the audit vector when an audit rides this forward.
     _N_STEP_SCALARS = 3
 
-    def _plan_forward(self, x, region):
+    def _plan_forward(self, x, region, n_masks=None):
         """Decide what this forward reads, steers and audits.
 
-        One batched .tolist() covers every count the decisions need, and all
-        index tensors are resolved here -- a nonzero() inside a hook would sync
-        the GPU in the middle of the model call.
+        All index tensors are resolved here -- a nonzero() inside a hook would
+        sync the GPU in the middle of the model call. Given the open-mask count
+        (the sampler passes it), nothing here waits on the GPU: the region size
+        is read once per response and index sets are cut to their known size
+        with take_true instead of nonzero().
         """
         masks = (x == self.mask_id) & region
         committed = region & ~masks
-        n_region, n_masks, n_committed = torch.stack(
-            [region.sum(), masks.sum(), committed.sum()]).tolist()
-        self._validate(x, region, n_region)
+        if n_masks is None:
+            n_region, n_masks, n_committed = torch.stack(
+                [region.sum(), masks.sum(), committed.sum()]).tolist()
+            self._validate(x, region, n_region)
+        else:
+            if self._n_region is None:
+                self._n_region = int(region.sum())
+                self._validate(x, region, self._n_region)
+            n_committed = self._n_region - n_masks
 
         read_gate = self.monitoring and (not self.gate_once or self.step == 0)
         steer = bool(self.steer_enabled and self.monitoring and n_masks
@@ -521,8 +540,8 @@ class Ours(Defender):
         # themselves; after that it reads what the model actually wrote.
         gate_pool = None
         if read_gate:
-            gate_pool = (committed[0] if n_committed
-                         else masks[0]).nonzero().flatten()
+            gate_pool = (take_true(committed[0], n_committed) if n_committed
+                         else take_true(masks[0], n_masks))
 
         audit, audit_pools = self._pending_audit, None
         self._pending_audit = None
@@ -535,7 +554,7 @@ class Ours(Defender):
             source="generated" if n_committed else "masked",
             n_committed=n_committed, read_gate=read_gate, steer=steer,
             gate_pool=gate_pool,
-            steer_positions=masks[0].nonzero().flatten() if steer else None,
+            steer_mask=masks[0] if steer else None,
             audit=audit, audit_pools=audit_pools)
 
     def _run_hooked_forward(self, x, plan, logit_positions):
@@ -554,8 +573,7 @@ class Ours(Defender):
                 if plan.steer:
                     for block, unit, ref_norm in self.sites:
                         handles.append(block.register_forward_hook(
-                            self._steer_hook(unit, ref_norm,
-                                             plan.steer_positions)))
+                            self._steer_hook(unit, ref_norm, plan.steer_mask)))
                 if plan.audit_pools is not None:
                     handles.append(self.gate_block.register_forward_hook(
                         self._audit_capture_hook(plan.audit_pools, feats)))
@@ -574,19 +592,23 @@ class Ours(Defender):
             raise RuntimeError("audit hook must execute exactly once per forward")
         return output, feats
 
-    def _read_scalars(self, x, plan, feats):
-        """Sync every scalar this step needs in ONE .tolist().
+    # V2 decides its repair from the gate strength on every step, so it reads
+    # the scalars back each step; everything else only needs them at audits.
+    _read_scalars_every_step = False
 
-        Each .item()/.tolist() is a GPU sync, so the trace values and the audit
-        vector are stacked into one tensor and read back together.
-        """
+    def _step_tensor(self, x):
+        """This step's projection, gate strength and effective alpha, on the GPU."""
         pending = self._pending
         zero = torch.zeros((), dtype=torch.float32, device=x.device)
-        scalars = torch.stack([
+        return torch.stack([
             pending.projection if pending.fired else zero,
             self._gate_t if pending.fired else zero,
             torch.as_tensor(pending.alpha, dtype=torch.float32,
                             device=x.device)])
+
+    def _read_scalars(self, plan, feats, step_t):
+        """Sync the step scalars (and the audit vector, if any) in ONE .tolist()."""
+        scalars = step_t
         if plan.audit is not None:
             scalars = torch.cat([scalars, self._audit_vector(feats[0])])
         values = scalars.tolist()
@@ -594,22 +616,49 @@ class Ours(Defender):
         return _StepScalars(projection, gate_strength, alpha,
                             values[self._N_STEP_SCALARS:])
 
-    def _trace_step(self, plan, scalars):
-        """Append this step's row to the per-response gate trace."""
-        self.trace.append({
-            "step": self.step,
-            "projection": scalars.projection if self._pending.fired else None,
-            "strength": self.gate_strength,
-            "schedule_scale": self._schedule_scale,
-            "effective_alpha": scalars.effective_alpha,
-            "source": plan.source,
-            "num_generated_tokens": plan.n_committed,
-            "phase": "block_recovery" if self.in_recovery else "base",
-            "steer_armed": plan.steer,
-        })
+    def _apply_scalars(self, scalars):
+        if not math.isfinite(scalars.projection):
+            raise ValueError("detector returned a non-finite projection")
+        self.gate_strength = scalars.gate_strength
+        self.last_projection = scalars.projection
+
+    def _trace_step(self, plan, step_t):
+        """Queue this step's trace row; its numbers stay on the GPU until
+        result_fields reads the whole response back at once."""
+        self._trace_raw.append((
+            {"step": self.step, "schedule_scale": self._schedule_scale,
+             "source": plan.source, "num_generated_tokens": plan.n_committed,
+             "phase": "block_recovery" if self.in_recovery else "base",
+             "steer_armed": plan.steer},
+            self._pending.fired, self.gate_strength, step_t))
+
+    def _materialize_trace(self):
+        """Turn queued trace rows into dicts with a single GPU read."""
+        if not self._trace_raw:
+            return
+        values = torch.stack([t for *_, t in self._trace_raw]).tolist()
+        for (fields, fired, latched, _), (proj, gate, alpha) in zip(
+                self._trace_raw, values):
+            if fired:
+                if not math.isfinite(proj):
+                    raise ValueError("detector returned a non-finite projection")
+                self.gate_strength, self.last_projection = gate, proj
+            self.trace.append({
+                "step": fields["step"],
+                "projection": proj if fired else None,
+                "strength": gate if fired else latched,
+                "schedule_scale": fields["schedule_scale"],
+                "effective_alpha": alpha,
+                "source": fields["source"],
+                "num_generated_tokens": fields["num_generated_tokens"],
+                "phase": fields["phase"],
+                "steer_armed": fields["steer_armed"],
+            })
+        self._trace_raw = []
 
     @torch.no_grad()
-    def forward(self, x, region, *, schedule_scale=1.0, logit_positions=None):
+    def forward(self, x, region, *, schedule_scale=1.0, logit_positions=None,
+                n_masks=None):
         """One model forward with in-forward detection and steering.
 
         Detection, steering and (for V3) the deferred boundary audit all ride
@@ -621,16 +670,21 @@ class Ours(Defender):
         the vocab projection runs on n positions instead of the full sequence;
         output.logits is then [1, n, vocab] aligned to logit_positions."""
         self._schedule_scale = float(schedule_scale)
-        plan = self._plan_forward(x, region)
+        plan = self._plan_forward(x, region, n_masks)
         self._pending = _GatePass(pool=plan.gate_pool)
         output, feats = self._run_hooked_forward(x, plan, logit_positions)
-        scalars = self._read_scalars(x, plan, feats)
+        step_t = self._step_tensor(x)
 
-        if self._pending.fired:
-            if not math.isfinite(scalars.projection):
-                raise ValueError("detector returned a non-finite projection")
-            self.gate_strength = scalars.gate_strength
-            self.last_projection = scalars.projection
+        # Python only needs these numbers when it has to branch on them: an
+        # audit decides whether to recover, a step-0 binary gate latches the
+        # strength later steps read, and V2 checks its trigger every step. Any
+        # other step leaves them on the GPU, so it never waits on the device.
+        scalars = None
+        if (plan.audit is not None or self._read_scalars_every_step
+                or (self.gate_once and self.step == 0)):
+            scalars = self._read_scalars(plan, feats, step_t)
+            if self._pending.fired:
+                self._apply_scalars(scalars)
 
         if plan.audit is not None and self._apply_audit(
                 x, region,
@@ -640,9 +694,10 @@ class Ours(Defender):
             # sampler commits from post-recovery logits.
             self._pending = None
             return self.forward(x, region, schedule_scale=schedule_scale,
-                                logit_positions=logit_positions)
+                                logit_positions=logit_positions,
+                                n_masks=n_masks)
 
-        self._trace_step(plan, scalars)
+        self._trace_step(plan, step_t)
         self._pending = None
         self.step += 1
         return output
@@ -651,6 +706,7 @@ class Ours(Defender):
         return False
 
     def result_fields(self):
+        self._materialize_trace()
         if not self.trace:
             return {}
         return {"gate_projection": self.trace[0]["projection"],
@@ -684,6 +740,7 @@ class V2(Ours):
     """
 
     name = "v2"
+    _read_scalars_every_step = True
 
     def __init__(self, model, *, remask=False, max_remask_tokens=16,
                  max_parallel_commit=2, remask_trigger=1.0, **kw):
@@ -1009,6 +1066,9 @@ class V3(Ours):
             # Re-detected rounds steer harder: strength *= growth ** round_i.
             self._steer_boost = self.recovery_alpha_growth ** round_i
             old_tokens = x[0, positions].clone()
+            # Masks outside the recovered positions stay open throughout; read
+            # that once per round so the recovery steps themselves need no sync.
+            outside = int(((x[0] == self.mask_id) & region[0]).sum())
             x[0, positions] = self.mask_id
             eligible = positions
             self.in_recovery = True
@@ -1020,7 +1080,8 @@ class V3(Ours):
                     if counts[i] == 0 and not final:
                         continue
                     logits = self.forward(x, region, schedule_scale=1.0,
-                                          logit_positions=eligible).logits
+                                          logit_positions=eligible,
+                                          n_masks=outside + eligible.numel()).logits
                     eligible = commit_sample(x, logits, eligible, counts[i],
                                              temperature, remasking, final=final,
                                              rng=audit.rng)
@@ -1111,7 +1172,8 @@ class DiffuGuard(Defender):
     def before_step(self, x, region, *, scope, steps_remaining):
         return None
 
-    def forward(self, x, region, *, schedule_scale, logit_positions=None):
+    def forward(self, x, region, *, schedule_scale, logit_positions=None,
+                n_masks=None):
         raise NotImplementedError("DiffuGuard not implemented yet")
 
     def result_fields(self):
