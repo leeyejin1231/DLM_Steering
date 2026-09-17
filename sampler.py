@@ -89,6 +89,16 @@ def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
         schedule_counts = get_num_transfer_tokens(
             (x == MASK_ID) & scope, steps_per_block)[0].tolist()
         eligible = ((x == MASK_ID) & scope)[0].nonzero().flatten()
+        # Infilling checkpoints. With gen_length 0 the prompt's mask slots are
+        # one block, exactly like DIJA's own loop, so there is no block boundary
+        # to audit part-way through. A defender that wants one sets
+        # infill_checkpoint = N and gets an audit after every N committed slots
+        # (checkpoint k after N*(k+1)). The denoising order is untouched: only
+        # when the audit happens changes.
+        every = (defender.infill_checkpoint
+                 if defender is not None and gen_length == 0 else 0)
+        total = eligible.numel()
+        checkpoints = 0
 
         for i in range(steps_per_block):
             commit_count = None
@@ -122,9 +132,27 @@ def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
                                      temperature, remasking,
                                      final=(i == steps_per_block - 1), rng=rng)
 
+            # A checkpoint reached with slots still open audits what has been
+            # committed so far; the audit rides the next forward, so it costs
+            # nothing unless it triggers a recovery.
+            while every and eligible.numel() and total - eligible.numel() >= every * (checkpoints + 1):
+                defender.after_block(
+                    x, region, block_number=checkpoints,
+                    block_positions=region & (x != MASK_ID),
+                    prompt_length=prompt_length, temperature=temperature,
+                    remasking=remasking, last_block=False, rng=rng)
+                checkpoints += 1
+
         if defender is not None:
+            number = num_block
+            if every:
+                # The end of infilling is checkpoint k only when it lands exactly
+                # on one; otherwise it is an extra audit that no --audit-boundary
+                # can select (-1), so a row that never reaches checkpoint k gets
+                # no recovery at k.
+                number = total // every - 1 if total and total % every == 0 else -1
             defender.after_block(
-                x, region, block_number=num_block, block_positions=block_positions,
+                x, region, block_number=number, block_positions=block_positions,
                 prompt_length=prompt_length,
                 temperature=temperature, remasking=remasking,
                 last_block=num_block == num_blocks - 1, rng=rng)

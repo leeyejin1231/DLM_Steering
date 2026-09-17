@@ -113,6 +113,9 @@ class Defender(ABC):
     """Per-run defense policy; the sampler owns token sampling."""
 
     name: str
+    # gen_length 0 only: ask the sampler for an after_block audit every this
+    # many committed mask slots (0 = only at the end). See sampler.generate.
+    infill_checkpoint = 0
 
     @classmethod
     def add_args(cls, parser):
@@ -346,7 +349,21 @@ class Ours(Defender):
                                  "up to this many rounds per trigger.")
         parser.add_argument("--audit-all-boundaries", action="store_true",
                             help="v3: let the response detector trigger at every "
-                                 "block boundary, not only the first.")
+                                 "block boundary, not only --audit-boundary.")
+        parser.add_argument("--infill-checkpoint", type=int, default=0,
+                            help="v3, gen_length 0 (DIJA): audit after every N "
+                                 "committed mask slots, so --audit-boundary k "
+                                 "means after N*(k+1) slots. The fill order is "
+                                 "unchanged. A row with fewer slots never reaches "
+                                 "the later checkpoints and gets no recovery there. "
+                                 "0 (default) audits once, when infilling ends.")
+        parser.add_argument("--audit-boundary", type=int, default=0,
+                            help="v3: the block boundary (0-based: 0 = after the "
+                                 "first block) at which the response detector may "
+                                 "trigger. Every boundary is still audited and "
+                                 "recorded. Needs that many blocks to exist: with "
+                                 "gen_length 0 (DIJA infilling) there is only "
+                                 "boundary 0. Ignored under --audit-all-boundaries.")
         parser.add_argument("--recovery-alpha-growth", type=float, default=1.0,
                             help="v3: steering strength multiplier per re-detected "
                                  "recovery round (round i steers at alpha*growth^i).")
@@ -381,6 +398,8 @@ class Ours(Defender):
                   recovery_steps=args.recovery_steps,
                   recovery_rounds=args.recovery_rounds,
                   audit_all_boundaries=args.audit_all_boundaries,
+                  audit_boundary=args.audit_boundary,
+                  infill_checkpoint=args.infill_checkpoint,
                   recovery_alpha_growth=args.recovery_alpha_growth)
 
     def reset(self):
@@ -825,11 +844,16 @@ class V3(Ours):
 
     def __init__(self, model, *, response_detector, recovery_steps=32,
                  recovery_rounds=1, audit_all_boundaries=False,
+                 audit_boundary=0, infill_checkpoint=0,
                  recovery_alpha_growth=1.0, **kw):
         if recovery_steps <= 0:
             raise ValueError("recovery_steps must be positive")
         if recovery_rounds <= 0:
             raise ValueError("recovery_rounds must be positive")
+        if audit_boundary < 0:
+            raise ValueError("audit_boundary must be >= 0")
+        if infill_checkpoint < 0:
+            raise ValueError("infill_checkpoint must be >= 0")
         if not math.isfinite(recovery_alpha_growth) or recovery_alpha_growth <= 0:
             raise ValueError("recovery_alpha_growth must be finite and positive")
         if response_detector is None:
@@ -841,6 +865,8 @@ class V3(Ours):
         self.recovery_steps = int(recovery_steps)
         self.recovery_rounds = int(recovery_rounds)
         self.audit_all_boundaries = bool(audit_all_boundaries)
+        self.audit_boundary = int(audit_boundary)
+        self.infill_checkpoint = int(infill_checkpoint)
         self.recovery_alpha_growth = float(recovery_alpha_growth)
         super().__init__(model, remask_enabled=True, **kw)
         if int(response_detector["layer"]) != self.gate_layer:
@@ -942,13 +968,18 @@ class V3(Ours):
         """Record the audit; run recovery when the block still reads as a
         response. Returns True when recovery ran."""
         block_number = audit.block_number
-        trigger = ((self.audit_all_boundaries or block_number == 0)
+        trigger = ((self.audit_all_boundaries
+                    or block_number == self.audit_boundary)
                    and reading.response_probability >= self._det_threshold)
+        if self.audit_all_boundaries:
+            rule = "response_probability_cutoff_each_boundary"
+        elif self.audit_boundary == 0:
+            rule = "response_probability_cutoff_first_boundary"
+        else:
+            rule = f"response_probability_cutoff_boundary_{self.audit_boundary}"
         self.boundary_audits.append({
             "boundary": block_number, **asdict(reading), "trigger": trigger,
-            "trigger_rule": ("response_probability_cutoff_each_boundary"
-                             if self.audit_all_boundaries else
-                             "response_probability_cutoff_first_boundary")})
+            "trigger_rule": rule})
         if not trigger:
             return False
         self.triggered = True
@@ -1031,6 +1062,8 @@ class V3(Ours):
         d.update(remask="v3", recovery_steps=self.recovery_steps,
                  recovery_rounds=self.recovery_rounds,
                  audit_all_boundaries=self.audit_all_boundaries,
+                 audit_boundary=self.audit_boundary,
+                 infill_checkpoint=self.infill_checkpoint,
                  recovery_alpha_growth=self.recovery_alpha_growth)
         return d
 
