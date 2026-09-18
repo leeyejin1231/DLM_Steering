@@ -1,13 +1,9 @@
 """The single diffusion sampler, driven by an optional Defender.
 
-Semi-autoregressive block decoding: per step the defender may reopen committed
-tokens (before_step), one forward runs detection + steering (forward), then
-the sampler commits the top-confidence masked tokens. After a repair the
-transfer schedule for the rest of the block is recomputed as an even split of
-everything masked before block_end; the last step of every block fills
-whatever is still masked there, so reopened slots from earlier blocks can
-never be left open. Between blocks the defender gets a boundary hook
-(after_block) that may audit the finished block or remask and regenerate it.
+Semi-autoregressive block decoding: each forward runs detection + steering,
+then the sampler commits the top-confidence masked tokens. The last step of
+all blocks fills their remaining masks. Between blocks the defender gets a
+boundary hook (after_block) that may audit, remask and regenerate the block.
 
 CFG is not supported. Answer slots are every mask in the sequence, so masks
 planted inside the prompt (DIJA) are filled, steered, and eligible for repair
@@ -17,7 +13,13 @@ like the rest.
 import torch
 
 from common import MASK_ID, MODEL_LOCK, step_scale
-from llada import PAD_ID, add_gumbel_noise, get_num_transfer_tokens
+from llada import PAD_ID, add_gumbel_noise
+
+
+def transfer_counts(n, steps):
+    """Even schedule from an index tensor's known size, without a GPU read."""
+    base, remainder = divmod(n, steps)
+    return [base + (i < remainder) for i in range(steps)]
 
 
 def take_true(mask_row, n):
@@ -93,7 +95,7 @@ def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
                    device=model.device)
     x[:, :prompt_length] = prompt_ids.clone()
     region = x == MASK_ID
-    if not region.any():
+    if gen_length == 0 and not region.any():
         return x
     if defender is not None:
         defender.reset()
@@ -107,9 +109,8 @@ def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
         scope[:, block_end:] = False
         block_positions = scope.clone()
         block_positions[:, :block_start] = False
-        schedule_counts = get_num_transfer_tokens(
-            (x == MASK_ID) & scope, steps_per_block)[0].tolist()
         eligible = ((x == MASK_ID) & scope)[0].nonzero().flatten()
+        schedule_counts = transfer_counts(eligible.numel(), steps_per_block)
         # Infilling checkpoints. With gen_length 0 the prompt's mask slots are
         # one block, exactly like DIJA's own loop, so there is no block boundary
         # to audit part-way through. A defender that wants one sets
@@ -122,16 +123,6 @@ def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
         checkpoints = 0
 
         for i in range(steps_per_block):
-            commit_count = None
-            if defender is not None:
-                commit_count = defender.before_step(
-                    x, region, scope=scope, steps_remaining=steps_per_block - i)
-            if commit_count is not None:
-                # Reopened slots: spread everything still masked before block_end
-                # evenly over the remaining steps of this block.
-                schedule_counts = schedule_counts[:i] + get_num_transfer_tokens(
-                    (x == MASK_ID) & scope, steps_per_block - i)[0].tolist()
-                eligible = ((x == MASK_ID) & scope)[0].nonzero().flatten()
             if eligible.numel() == 0:
                 break
 
@@ -236,7 +227,7 @@ def generate_batch(model, prompts, *, steps=128, gen_length=128,
         x[r, pad:pad + p.shape[1]] = p[0]
         attention_mask[r, pad:] = 1
     region = x == MASK_ID
-    if not region.any():
+    if gen_length == 0 and not region.any():
         return [x[r:r + 1, prompt_len - p.shape[1]:]
                 for r, p in enumerate(prompts)]
 
@@ -248,10 +239,13 @@ def generate_batch(model, prompts, *, steps=128, gen_length=128,
                      if gen_length else width)
         scope = region.clone()
         scope[:, block_end:] = False
-        schedule_counts = get_num_transfer_tokens(
-            (x == MASK_ID) & scope, steps_per_block)
-        eligible = [((x[r] == MASK_ID) & scope[r]).nonzero().flatten()
-                    for r in range(batch)]
+        active = (x == MASK_ID) & scope
+        # Read every row's size together instead of synchronizing once per
+        # row through nonzero. Index extraction itself stays on the GPU.
+        active_counts = active.sum(dim=1).tolist()
+        eligible = [take_true(active[r], active_counts[r]) for r in range(batch)]
+        schedule_counts = [transfer_counts(e.numel(), steps_per_block)
+                           for e in eligible]
 
         for i in range(steps_per_block):
             if not any(e.numel() for e in eligible):
@@ -275,7 +269,7 @@ def generate_batch(model, prompts, *, steps=128, gen_length=128,
                     continue
                 eligible[r] = commit_sample(
                     x[r:r + 1], logits[:, offset:offset + n], eligible[r],
-                    int(schedule_counts[r, i]), temperature, remasking,
+                    schedule_counts[r][i], temperature, remasking,
                     final=(i == steps_per_block - 1), rng=rng)
                 offset += n
 

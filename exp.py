@@ -6,7 +6,7 @@ Attack/defense-specific flags are registered by the selected class.
 
 Usage:
     # DIJA with the paper's refined prompts (DIJA/run_*/refine_prompt); the
-    # attack sets gen_length 0, temperature 0.2 and one mask per step.
+    # default appends 128 assistant tokens; pass --gen-length 0 for infilling.
     CUDA_VISIBLE_DEVICES=1 python exp.py --attack dija --defense ours \
         --source jbb_harmful --n 100 --out outputs/dija_ours.json
 
@@ -23,27 +23,28 @@ Usage:
 """
 
 import argparse
+import json
+import sys
 import threading
 import time
-import traceback
-
-import torch
+from pathlib import Path
 
 from Attacker import ATTACKERS
-from common import (ERROR_SENTINEL, MODEL_NAME, MASK_ID, PROMPT_SOURCES,
-                    encode_prompt, enable_reproducibility,
+from common import (MODEL_NAME, PROMPT_SOURCES, enable_reproducibility,
                     force_math_attention, load_llada, load_prompts,
-                    plan_shards, run_eval_shards, seed_all, write_json)
+                    plan_shards, read_jobs, run_eval_shards, run_persistent_jobs,
+                    seed_all, strip_argv_flag, write_json)
 from Defender import DEFENDERS
+from experiment_row import RowExecution
 
 
-def parse_args():
+def parse_args(argv=None):
     # The attack/defense choice decides which extra flags exist, so it is
     # parsed first and the selected class registers its own arguments.
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--attack", choices=sorted(ATTACKERS), default="none")
     pre.add_argument("--defense", choices=sorted(DEFENDERS), default="none")
-    known, _ = pre.parse_known_args()
+    known, _ = pre.parse_known_args(argv)
 
     p = argparse.ArgumentParser(parents=[pre])
     p.add_argument("--source", choices=list(PROMPT_SOURCES), default="jbb_harmful",
@@ -55,20 +56,26 @@ def parse_args():
     p.add_argument("--start", type=int, default=0)
     p.add_argument("--steps", type=int, default=128)
     p.add_argument("--gen-length", type=int, default=128,
-                   help="assistant tokens to append; DIJA attacks default this to 0 "
-                        "(prompt-span infilling only)")
+                   help="assistant tokens to append (default 128); "
+                        "use 0 for DIJA prompt-span infilling only")
     p.add_argument("--block-length", type=int, default=32)
     p.add_argument("--temperature", type=float, default=0.7)
-    p.add_argument("--remasking", default="low_confidence")
+    p.add_argument("--remasking", default="low_confidence",
+                   help="Token selection strategy: DiffuGuard defaults to adaptive_step "
+                        "(SAR); other defenses default to low_confidence.")
     p.add_argument("--schedule", default="const", choices=["const", "linear", "cosine"])
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--reproduct", action="store_true",
                    help="Bitwise-deterministic generation: fixed seeds, deterministic "
                         "kernels, math SDPA backend. Slower but identical across GPUs.")
     p.add_argument("--gpus", default=None,
-                   help="Comma-separated GPU ids (e.g. 0,1,2,3): shard the prompt "
-                        "set into contiguous --start/--n slices, run one exp.py "
-                        "subprocess per GPU, and merge the part JSONs into --out.")
+                   help="Comma-separated GPU ids: keep a model on each GPU and "
+                        "distribute row chunks as workers finish.")
+    p.add_argument("--jobs", help="JSON list of experiment CLI argument lists; "
+                   "reuse models across conditions (each job supplies --out)")
+    p.add_argument("--chunk-size", type=int, default=2,
+                   help="Rows per GPU task (default 2); 0 uses static sharding "
+                        "for a single experiment, or whole-condition jobs")
     p.add_argument("--row-workers", type=int, default=1,
                    help="Interleave this many prompt rows per shard process: "
                         "while one row's target response denoises, another "
@@ -76,25 +83,42 @@ def parse_args():
                         "Validated for --attack pap.")
     ATTACKERS[known.attack].add_args(p)
     DEFENDERS[known.defense].add_args(p)
-    return p.parse_args()
+    args = p.parse_args(argv)
+    return args
 
 
-def run_sharded(args, devices):
-    """Launcher path for --gpus: one exp.py subprocess per device group, merged.
+def run_sharded(args, devices, argv=None):
+    """Distribute row chunks to persistent GPU workers and merge results.
 
-    Each child reruns this file with its own --start/--n/--out slice and
-    CUDA_VISIBLE_DEVICES set; per-prompt seeding (seed + row index) keeps
-    rows identical no matter how they are partitioned. Attacks that drive a
-    second LLM (pap/pair) get a (target, attack) GPU pair per shard so the
-    two models never share a card.
+    Paired-model attacks and --chunk-size 0 retain the static shard launcher.
+    Per-row seeds preserve generation across task assignments.
     """
+    if args.chunk_size and not ATTACKERS[args.attack].needs_second_device:
+        job = strip_argv_flag(sys.argv[1:] if argv is None else argv, "--gpus")
+        # --out may have been left at its normal CLI default.
+        job = [*strip_argv_flag(job, "--out"), "--out", args.out]
+        report = run_persistent_jobs("generate", [job], ",".join(devices),
+                                     chunk_size=args.chunk_size)
+        payload = json.loads(Path(args.out).read_text())
+        results = payload["results"]
+    else:
+        return run_static_sharded(args, devices)
+    _summarize_shards(args, results)
+    print(f"Done in {report['seconds']:.2f}s")
+
+
+def run_static_sharded(args, devices):
     if ATTACKERS[args.attack].needs_second_device:
         print(f"attack needs a second device per shard: {len(devices)} "
               f"shards over pairs {devices}")
     results, payload = run_eval_shards(__file__, args,
                                        len(load_prompts(args.source)),
                                        devices=devices)
-    write_json(args.out, {**payload, "results": results})
+    write_json(args.out, {**payload, "results": results}, compact=True)
+    _summarize_shards(args, results)
+
+
+def _summarize_shards(args, results):
     print(f"merged {len(results)} results -> {args.out}")
     # The children each summarised their own slice into their part log; the
     # merged number is the one worth printing (and what script/run_gated.sh
@@ -104,27 +128,46 @@ def run_sharded(args, devices):
         print(summary)
 
 
-def main():
-    args = parse_args()
+def main(argv=None, loaded=None):
+    args = parse_args(argv)
+    if args.chunk_size < 0:
+        raise ValueError("chunk-size must be nonnegative")
+    if args.jobs:
+        if loaded is not None:
+            raise ValueError("a worker cannot launch nested jobs")
+        report = run_persistent_jobs("generate", read_jobs(args.jobs), args.gpus,
+                                     chunk_size=args.chunk_size)
+        write_json(args.jobs + ".timing.json", report)
+        print(f"Done in {report['seconds']:.2f}s")
+        return
+    try:
+        ATTACKERS[args.attack].validate_inputs(args)
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc)) from None
+    if loaded is not None and args.gpus:
+        raise ValueError("a reused model must run on its worker's GPU")
     if args.gpus:
         # [] means one shard: plan_shards pinned this process to that GPU and
         # the run continues inline instead of spawning a single child.
         devices = plan_shards(
             args.gpus, pairs=ATTACKERS[args.attack].needs_second_device)
         if devices:
-            return run_sharded(args, devices)
+            return run_sharded(args, devices, argv)
     if args.reproduct:
         enable_reproducibility(args.seed)
     else:
         seed_all(args.seed)
 
-    print(f"loading {MODEL_NAME} ...")
-    tokenizer, model = load_llada()
+    if loaded is None:
+        print(f"loading {MODEL_NAME} ...")
+        tokenizer, model = load_llada()
+    else:
+        tokenizer, model = loaded
     if args.reproduct:
         force_math_attention()
-    device = next(model.parameters()).device
 
-    rows = load_prompts(args.source)[args.start: args.start + args.n]
+    all_rows = load_prompts(args.source)
+    rows = all_rows[args.start: args.start + args.n]
     workers = max(1, args.row_workers)
 
     gen_config = {"steps": args.steps, "gen_length": args.gen_length,
@@ -137,52 +180,15 @@ def main():
     lanes = [(ATTACKERS[args.attack].from_args(args),
               DEFENDERS[args.defense].from_args(args, model))
              for _ in range(workers)]
+    for att, _ in lanes:
+        att.prepare_rows(all_rows)
+    # Load before any row threads: model initialization can touch global RNG.
+    if ATTACKERS[args.attack].needs_second_device:
+        lanes[0][0].llm.load()
+        if args.reproduct:
+            force_math_attention()
     print(f"{len(rows)} prompts from {args.source}, attack={args.attack}, "
           f"defense={args.defense}, row_workers={workers}")
-
-    def make_respond(att, dfn, rng):
-        """Per-(lane, row) respond closures bound to that row's generator."""
-        def respond(user_message):
-            """One user turn through the defense -> (x, ids, cfg, shown)."""
-            shown = dfn.transform_prompt(user_message)
-            ids = encode_prompt(tokenizer, shown, device)
-            cfg = {**gen_config, **att.gen_overrides(ids)}
-            return dfn.defend(model, ids, rng=rng, **cfg), ids, cfg, shown
-
-        def respond_batch(user_messages):
-            """A batch of user turns -> list of (x, ids, cfg, shown).
-
-            defender.defend_batch is a real batched denoising loop under
-            --defense none and a sequential fallback otherwise; per-prompt
-            gen_overrides that disagree also fall back to sequential calls.
-            """
-            shown = [dfn.transform_prompt(m) for m in user_messages]
-            all_ids = [encode_prompt(tokenizer, s, device) for s in shown]
-            cfgs = [{**gen_config, **att.gen_overrides(i)} for i in all_ids]
-            if all(c == cfgs[0] for c in cfgs):
-                outs = dfn.defend_batch(model, all_ids, rng=rng, **cfgs[0])
-            else:
-                outs = [dfn.defend(model, i, rng=rng, **c)
-                        for i, c in zip(all_ids, cfgs)]
-            return list(zip(outs, all_ids, cfgs, shown))
-        return respond, respond_batch
-
-    def graded_fields(row):
-        """Answer key a graded source carries through to eval_utility.py."""
-        return {k: row[k] for k in ("task", "answer", "subject", "category")
-                if k in row}
-
-    def record(result, row, elapsed, dfn):
-        generation, extra = result.generation, result.extra
-        if result.cfg != gen_config:
-            extra = {**extra, "gen_overrides": {k: v for k, v in result.cfg.items()
-                                                if gen_config.get(k) != v}}
-        graded = graded_fields(row)
-        return {"index": row["index"], "prompt": row["prompt"], **graded,
-                "attack_prompt": result.attack_prompt, "generation": generation,
-                **extra, "num_prompt_tokens": int(result.prompt_ids.shape[1]),
-                "num_prompt_masks": int((result.prompt_ids == MASK_ID).sum()),
-                "seconds": round(elapsed, 2), **dfn.result_fields()}
 
     results, lock = [], threading.Lock()
     jobs = iter(rows)
@@ -195,7 +201,7 @@ def main():
             "model": MODEL_NAME, "config": gen_config,
             "attack": lanes[0][0].describe(),
             "defense": lanes[0][1].describe(),
-            "results": sorted(results, key=lambda r: r["index"])})
+            "results": sorted(results, key=lambda r: r["index"])}, compact=True)
 
     # Crash-safety rewrites are spaced out as the payload grows instead of
     # firing every N rows: each row carries a per-step gate trace, so a fixed
@@ -207,32 +213,8 @@ def main():
     def job_loop(att, dfn):
         nonlocal next_flush
         for row in jobs:  # shared iterator: next() is atomic under the GIL
-            # Per-prompt seed keeps generation identical under
-            # --start/--gpus sharding; the per-row Generator keeps sampling
-            # draws identical when rows interleave (--row-workers > 1).
-            seed_all(args.seed + int(row["index"]))
-            rng = torch.Generator(device=device)
-            rng.manual_seed(args.seed + int(row["index"]))
-            vanilla_ids = (encode_prompt(
-                tokenizer, dfn.transform_prompt(row["prompt"]), device)
-                if att.needs_vanilla else None)
-            respond, respond_batch = make_respond(att, dfn, rng)
-
-            t0 = time.time()
-            try:
-                result = att.run(row, respond, tokenizer, vanilla_ids,
-                                 respond_batch=respond_batch)
-                rec = record(result, row, time.time() - t0, dfn)
-            except Exception:
-                traceback.print_exc()
-                # Every grader reads r["generation"] (eval_llamaguard,
-                # run_sr_eval, judge_refusal, eval_utility), so a failed row
-                # still carries one: the sentinel marks it as "nothing was
-                # generated" and keeps it out of their denominators.
-                rec = {"index": row["index"], "prompt": row["prompt"],
-                       **graded_fields(row), "attack_prompt": None,
-                       "generation": ERROR_SENTINEL,
-                       "error": traceback.format_exc(limit=5)}
+            rec = RowExecution(row, att, dfn, model, tokenizer,
+                               gen_config, args.seed).run()
 
             with lock:
                 results.append(rec)

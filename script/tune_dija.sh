@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # v3 tuning with the real DIJA attack (the paper's refined prompts, gen_length 0)
-# on each dataset DIJA ships prompts for. v3 only -- v2 is not part of the
-# experiments. Every command is appended to outputs/tune/commands.log.
+# on each dataset DIJA ships prompts for, using v3 recovery. Every command is appended to outputs/tune/commands.log.
 #
 #   PHASE=boundary  where v3 may trigger: checkpoints every 32 committed mask
 #                   slots (--infill-checkpoint 32), boundary k = after 32*(k+1)
@@ -33,6 +32,8 @@ fi
 OUT=outputs/tune
 LOG=$OUT/commands.log
 mkdir -p "$OUT"
+GEN_JOBS="$OUT/jobs-dija-$PHASE.json"
+printf '[]\n' > "$GEN_JOBS"
 declare -A PFX=( [jbb_harmful]=JBB [harmbench]=HarmBench [strongreject]=SR )
 
 run() { # stem, args...
@@ -40,8 +41,14 @@ run() { # stem, args...
     local f="$OUT/$stem.json"
     printf '%s exp.py %s --gpus %s --out %s\n' "$PY" "$*" "$GPUS" "$f" >> "$LOG"
     [ -s "$f" ] && { echo "  skip $stem"; return 0; }
-    $PY exp.py "$@" --gpus "$GPUS" --out "$f" > "$OUT/$stem.log" 2>&1 \
-        && echo "  ok   $stem" || { echo "  FAIL $stem"; tail -3 "$OUT/$stem.log"; }
+    "$PY" - "$GEN_JOBS" "$@" --out "$f" <<'PY'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+jobs = json.loads(path.read_text())
+jobs.append(sys.argv[2:])
+path.write_text(json.dumps(jobs))
+PY
 }
 
 audit_args() { # k|end -> v3 audit placement flags
@@ -87,12 +94,30 @@ for S in jbb_harmful harmbench strongreject; do
     fi
 done
 
+printf '%s exp.py --jobs %s --gpus %s\n' "$PY" "$GEN_JOBS" "$GPUS" >> "$LOG"
+"$PY" exp.py --jobs "$GEN_JOBS" --gpus "$GPUS" \
+    || { echo "generation failed; see $OUT/.parts/ logs"; exit 1; }
+
 echo "== grading =="
-for f in "$OUT"/dija-*.json; do
-    case "$f" in *_lg4.json|*.part*) continue;; esac
-    g="${f%.json}_lg4.json"; [ -s "$g" ] && continue
-    printf 'CUDA_VISIBLE_DEVICES=0 %s eval_llamaguard.py --in %s --out %s\n' "$PY" "$f" "$g" >> "$LOG"
-    CUDA_VISIBLE_DEVICES=0 $PY eval_llamaguard.py --in "$f" --out "$g" > "${f%.json}_lg4.log" 2>&1 \
-        && echo "  ok   $(basename "${f%.json}")" || echo "  FAIL $(basename "${f%.json}")"
-done
+GRADE_JOBS="$OUT/jobs-dija-grade.json"
+"$PY" - "$OUT" "$GRADE_JOBS" <<'PY'
+import json, sys
+from pathlib import Path
+jobs = []
+for source in sorted(Path(sys.argv[1]).glob("dija-*.json")):
+    if source.name.endswith("_lg4.json") or ".part" in source.name:
+        continue
+    output = source.with_name(source.stem + "_lg4.json")
+    if output.exists() and output.stat().st_size:
+        continue
+    jobs.append(["--in", str(source), "--out", str(output)])
+Path(sys.argv[2]).write_text(json.dumps(jobs))
+PY
+# Reuse the grader across files. One GPU was faster for the small-file
+# benchmark; GRADE_GPUS can assign whole files to additional distinct cards.
+GRADE_GPUS=${GRADE_GPUS:-${GPUS%%,*}}
+printf '%s eval_llamaguard.py --jobs %s --gpus %s\n' \
+    "$PY" "$GRADE_JOBS" "$GRADE_GPUS" >> "$LOG"
+"$PY" eval_llamaguard.py --jobs "$GRADE_JOBS" --gpus "$GRADE_GPUS" \
+    || { echo "grading failed; see $OUT/*_lg4.log"; exit 1; }
 echo "== done =="

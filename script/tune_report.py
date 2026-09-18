@@ -4,7 +4,7 @@ ASR alone cannot pick a steering strength: pushed hard enough the denoiser
 stops producing English at all, which drives ASR to zero without defending
 anything. So every row also carries the fluency guards the old alpha sweep
 used -- unique-word fraction, letter/space share and answer length -- plus the
-refusal-prefix rate, and for the remask sweeps the extra work each setting cost.
+refusal-prefix rate.
 
 Section E sets the alpha sweep's ASR beside over-refusal on XSTest-safe and
 a TruthfulQA slice (script/tune_overrefusal.sh). "refuse" counts full plus
@@ -49,10 +49,6 @@ def load(stem, root):
         "uniq": statistics.mean(x["uniq"] for x in f),
         "alpha_char": statistics.mean(x["alpha"] for x in f),
         "words": statistics.mean(x["words"] for x in f),
-        "sec": statistics.mean(r.get("seconds", 0) for r in rows),
-        "recovered": sum(bool(r.get("recovery_events")) for r in rows),
-        "remasked": sum(bool(r.get("remasked")) for r in rows),
-        "audits": sum(r.get("audit_forwards", 0) for r in rows),
     }
 
 
@@ -106,38 +102,6 @@ def main(root):
     if rows:
         table("A. steering strength (attack none, T=0)",
               ["ASR", "refusal", "uniq-word", "letter-share", "words"], rows)
-
-    rows = []
-    for t in ("0", "0.2", "0.5", "1.0"):
-        ds = [load(f"temp-{t}-seed{s}", root) for s in (42, 43, 44)
-              if have(f"temp-{t}-seed{s}")]
-        if not ds:
-            continue
-        asr = [d["asr"] for d in ds if d["asr"] is not None]
-        rows.append((f"T={t}", (
-            statistics.mean(asr) if asr else None,
-            (max(asr) - min(asr)) if len(asr) > 1 else 0.0,
-            statistics.mean(d["refusal"] for d in ds),
-            statistics.mean(d["uniq"] for d in ds),
-            statistics.mean(d["recovered"] for d in ds))))
-    if rows:
-        table("B. temperature (dija_template + v3, mean of seeds 42/43/44)",
-              ["ASR mean", "ASR spread", "refusal", "uniq-word", "recovered"], rows)
-
-    rows = [(f"steps={r} rounds={n}",
-             (d["asr"], d["refusal"], d["recovered"], d["uniq"], d["sec"]))
-            for r in (16, 32, 64) for n in (1, 2, 3)
-            if have(f"rec-s{r}-n{n}") for d in [load(f"rec-s{r}-n{n}", root)]]
-    if rows:
-        table("C. v3 recovery budget (dija_template, T=0.2)",
-              ["ASR", "refusal", "recovered", "uniq-word", "s/row"], rows)
-
-    rows = [(f"max-remask={k}", (d["asr"], d["refusal"], d["remasked"], d["uniq"], d["sec"]))
-            for k in (8, 16, 32)
-            if have(f"v2tok-{k}") for d in [load(f"v2tok-{k}", root)]]
-    if rows:
-        table("D. v2 remask budget (dija_template, T=0.2)",
-              ["ASR", "refusal", "remasked", "uniq-word", "s/row"], rows)
 
 
 if __name__ == "__main__":

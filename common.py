@@ -22,9 +22,6 @@ from llada import MODEL_NAME, MASK_ID  # noqa: F401  (re-exported)
 # anyway; the lock only excludes hook cross-talk.
 MODEL_LOCK = threading.Lock()
 
-EOT_ID = 126348   # <|eot_id|>, closes the user turn in LLaDA's chat template
-NEWLINE_ID = 198  # '\n'; used to locate the DIJA template inside the prompt
-
 
 def block_index(layer):
     """transformer.blocks[] index of a 1-based hidden-state layer.
@@ -168,9 +165,14 @@ def encode_prompt(tokenizer, user_message, device):
                         device=device).unsqueeze(0)
 
 
-def write_json(path, payload):
+def write_json(path, payload, *, compact=False):
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+        if compact:
+            # dumps uses the C encoder for compact JSON. A single write also
+            # avoids streaming thousands of tiny fragments for gate traces.
+            f.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        else:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
 def step_scale(schedule, i, n_steps):
@@ -540,3 +542,139 @@ def run_eval_shards(script, args, n_items, extra_args=None, devices=None):
                          shard_slices(total, len(gpu_ids), args.start),
                          args.out, extra_args)
     return wait_merge_shards(procs)
+
+
+_persistent_model = None
+
+
+def _init_persistent_worker(gpus):
+    # No CUDA operations run before pinning this spawned worker.
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpus.get()
+
+
+def _run_persistent_job(kind, argv):
+    from contextlib import redirect_stderr, redirect_stdout
+    import time
+    global _persistent_model
+    started = time.perf_counter()
+    if kind == "generate":
+        import exp as entry
+    else:
+        import eval_llamaguard as entry
+    args = entry.parse_args(argv)
+    log = Path(args.out).with_suffix(".log")
+    with log.open("w") as stream, redirect_stdout(stream), redirect_stderr(stream):
+        if _persistent_model is None:
+            if kind == "generate":
+                if args.reproduct:
+                    enable_reproducibility(args.seed)
+                else:
+                    seed_all(args.seed)
+                _persistent_model = load_llada()
+            else:
+                from Evaluator import LlamaGuard4
+                _persistent_model = LlamaGuard4(
+                    max_new_tokens=args.max_new_tokens,
+                    with_reference=args.with_reference,
+                    batch_size=args.batch_size)
+        if kind == "generate":
+            entry.main(argv, loaded=_persistent_model)
+        else:
+            entry.main(argv, grader=_persistent_model)
+    return {"out": args.out, "seconds": time.perf_counter() - started,
+            "gpu": os.environ["CUDA_VISIBLE_DEVICES"]}
+
+
+def read_jobs(path):
+    """Read CLI argument lists shared by generation and grading entry points."""
+    jobs = json.loads(Path(path).read_text())
+    if not isinstance(jobs, list) or any(
+            not isinstance(job, list) or not all(isinstance(a, str) for a in job)
+            for job in jobs):
+        raise ValueError("jobs must be a JSON list of string argument lists")
+    return jobs
+
+
+def run_persistent_jobs(kind, jobs, gpus, *, chunk_size=0):
+    """Reuse one model per GPU worker across CLI jobs; optionally chunk rows."""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    import multiprocessing as mp
+    import time
+    if kind not in ("generate", "grade") or chunk_size < 0:
+        raise ValueError("invalid job kind or chunk size")
+    gpus = parse_gpu_ids(gpus or os.environ.get("CUDA_VISIBLE_DEVICES") or "0")
+    if kind == "grade" and (chunk_size or len(set(gpus)) != len(gpus)):
+        raise ValueError("grading uses whole files and one worker per distinct GPU")
+    if not jobs:
+        return {"kind": kind, "seconds": 0.0, "workers": 0, "tasks": []}
+    if kind == "generate":
+        import exp as entry
+        from Attacker import ATTACKERS
+    else:
+        import eval_llamaguard as entry
+    tasks, merges, outputs, reproducibility = [], [], set(), set()
+    for argv in jobs:
+        cfg = entry.parse_args(argv)
+        if cfg.gpus or cfg.jobs or not any(a == "--out" or a.startswith("--out=") for a in argv):
+            raise ValueError("each job needs an explicit --out and must omit --gpus/--jobs")
+        out = Path(cfg.out).resolve()
+        if out in outputs:
+            raise ValueError(f"duplicate output: {out}")
+        outputs.add(out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if kind == "generate":
+            ATTACKERS[cfg.attack].validate_inputs(cfg)
+            if ATTACKERS[cfg.attack].needs_second_device:
+                raise ValueError("persistent generation currently supports single-model attacks")
+            reproducibility.add(cfg.reproduct)
+        if kind == "generate" and chunk_size:
+            count = min(cfg.n, len(load_prompts(cfg.source)) - cfg.start)
+            if count <= 0:
+                raise ValueError(f"empty input range for {out}")
+            base = argv
+            for flag in ("--out", "--start", "--n"):
+                base = strip_argv_flag(base, flag)
+            parts = []
+            part_dir = out.parent / ".parts" / out.stem
+            part_dir.mkdir(parents=True, exist_ok=True)
+            for i, offset in enumerate(range(0, count, chunk_size)):
+                part = part_dir / f"chunk{i}.json"
+                parts.append(part)
+                tasks.append([*base, "--start", str(cfg.start + offset),
+                              "--n", str(min(chunk_size, count - offset)),
+                              "--out", str(part)])
+            merges.append((out, parts))
+        else:
+            tasks.append(argv)
+    if len(reproducibility) > 1:
+        raise ValueError("all generation jobs must use the same --reproduct setting")
+
+    started = time.perf_counter()
+    context = mp.get_context("spawn")
+    devices = context.Queue()
+    workers = min(len(gpus), len(tasks))
+    for gpu in gpus[:workers]:
+        devices.put(gpu)
+    records = []
+    owners = {str(part): (out, parts) for out, parts in merges for part in parts}
+    pending = {out: len(parts) for out, parts in merges}
+    with ProcessPoolExecutor(max_workers=workers, mp_context=context,
+                             initializer=_init_persistent_worker, initargs=(devices,)) as pool:
+        futures = [pool.submit(_run_persistent_job, kind, argv) for argv in tasks]
+        for future in as_completed(futures):
+            record = future.result()
+            records.append(record)
+            print(f"done {record['out']} on GPU {record['gpu']}", flush=True)
+            if record["out"] in owners:
+                out, parts = owners[record["out"]]
+                pending[out] -= 1
+                if pending[out] == 0:
+                    # Save completed conditions while other conditions run.
+                    payloads = [json.loads(part.read_text()) for part in parts]
+                    results = sorted((r for p in payloads for r in p["results"]),
+                                     key=lambda r: r["index"])
+                    write_json(out, {**payloads[0], "results": results}, compact=True)
+    devices.close()
+    report = {"kind": kind, "seconds": time.perf_counter() - started,
+              "workers": workers, "tasks": records}
+    return report

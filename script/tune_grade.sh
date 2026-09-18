@@ -6,13 +6,25 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 PY=.venv/bin/python
 GPU=${GPU:-0}
 OUT=outputs/tune
-for f in "$OUT"/*.json; do
-    case "$f" in *_lg4.json|*.part*) continue;; esac
-    g="${f%.json}_lg4.json"
-    [ -s "$g" ] && continue
-    printf 'CUDA_VISIBLE_DEVICES=%s %s eval_llamaguard.py --in %s --out %s\n' \
-        "$GPU" "$PY" "$f" "$g" >> "$OUT/commands.log"
-    CUDA_VISIBLE_DEVICES=$GPU $PY eval_llamaguard.py --in "$f" --out "$g" \
-        > "${f%.json}_lg4.log" 2>&1 \
-        && echo "  ok   $(basename "${f%.json}")" || echo "  FAIL $(basename "${f%.json}")"
-done
+JOBS="$OUT/jobs-grade.json"
+"$PY" - "$OUT" "$JOBS" <<'PY'
+import json, sys
+from pathlib import Path
+jobs = []
+for source in sorted(Path(sys.argv[1]).glob("*.json")):
+    if source.name.endswith(("_lg4.json", "_judged.json")) or ".part" in source.name:
+        continue
+    data = json.loads(source.read_text())
+    # Job manifests, timing files and run status are not generations.
+    if not isinstance(data, dict) or not {"model", "config", "results"} <= data.keys():
+        continue
+    output = source.with_name(source.stem + "_lg4.json")
+    if output.exists() and output.stat().st_size:
+        continue
+    jobs.append(["--in", str(source), "--out", str(output)])
+Path(sys.argv[2]).write_text(json.dumps(jobs))
+PY
+GRADE_GPUS=${GRADE_GPUS:-$GPU}
+printf '%s eval_llamaguard.py --jobs %s --gpus %s\n' \
+    "$PY" "$JOBS" "$GRADE_GPUS" >> "$OUT/commands.log"
+"$PY" eval_llamaguard.py --jobs "$JOBS" --gpus "$GRADE_GPUS"

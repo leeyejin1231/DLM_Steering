@@ -43,12 +43,9 @@ def get_num_transfer_tokens(mask_index, steps):
     mask_num = mask_index.sum(dim=1, keepdim=True)
     base = mask_num // steps
     remainder = mask_num % steps
-    num_transfer_tokens = torch.zeros(
-        mask_num.size(0), steps, device=mask_index.device, dtype=torch.int64
-    ) + base
-    for i in range(mask_num.size(0)):
-        num_transfer_tokens[i, : int(remainder[i])] += 1
-    return num_transfer_tokens
+    # Broadcast on device; int(remainder[i]) would synchronize each row.
+    offsets = torch.arange(steps, device=mask_index.device)
+    return base + (offsets < remainder).to(torch.int64)
 
 
 @torch.no_grad()

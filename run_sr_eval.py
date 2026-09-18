@@ -14,6 +14,7 @@ from pathlib import Path
 
 from common import plan_shards, run_eval_shards
 from Evaluator import GptOss20b
+from attack_evaluation import generation_items, is_iterative, summarize_attack
 
 
 def parse_args():
@@ -46,8 +47,9 @@ def parse_args():
 def main():
     args = parse_args()
     data = json.loads(Path(args.inp).read_text())
-    items = [{"index": r["index"], "prompt": r["prompt"],
-              "response": r["generation"]} for r in data["results"]]
+    rows = data["results"][args.start:
+                           args.start + args.n if args.n is not None else None]
+    items = generation_items(data, rows)
     print(f"Grading {len(items)} items from {args.inp}")
 
     devices = plan_shards(args.gpus) if args.gpus else []
@@ -56,13 +58,11 @@ def main():
             port = args.port + i
             return ["--port", port, "--gpu", gpu,
                     "--container", f"ollama-{port}"]
-        graded, head = run_eval_shards(__file__, args, len(items),
+        graded, head = run_eval_shards(__file__, args, len(data["results"]),
                                        extra_args=extra, devices=devices)
         summary = GptOss20b.summarize(graded)
         grader_name = head.get("grader")
     else:
-        items = items[args.start:
-                      args.start + args.n if args.n is not None else None]
         jsonl = args.jsonl or str(Path(args.out).with_suffix(".jsonl"))
         with GptOss20b(model=args.model, port=args.port, gpu=args.gpu,
                        container=args.container, workers=args.workers,
@@ -81,6 +81,10 @@ def main():
         "summary": summary,
         "results": graded,
     }
+    if is_iterative(data):
+        payload["attempt_summary"] = summary
+        summary, outcomes = summarize_attack(rows, graded, "gpt-oss-20b")
+        payload.update(summary=summary, row_results=outcomes)
     Path(args.out).write_text(json.dumps(payload, ensure_ascii=False, indent=2))
 
     print(f"\n-> {args.out}")

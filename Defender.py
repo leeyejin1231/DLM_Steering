@@ -5,7 +5,6 @@ through Defender.defend(); internally sampler.generate calls the policy
 protocol once per denoising step:
 
     reset()          per response
-    before_step()    may reopen committed answer tokens back to MASK_ID
     forward()        detection + steering inside a single model call
     after_block()    block-boundary hook: audit, remask, or budget extra steps
     result_fields()  per-response record fields
@@ -17,12 +16,31 @@ edit the user message.
 import math
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 import torch
 
 from common import MASK_ID, MODEL_LOCK, block_index, load_detector
 from sampler import take_true
+
+
+def _prompt_text_mask(tokenizer, prompt_ids):
+    """Editable user text; retain the chat headers even when HF omits their
+    IDs from all_special_ids (as LLaDA's tokenizer does)."""
+    marker = "__PROMPT_CONTENT_BOUNDARY__"
+    template = tokenizer.apply_chat_template(
+        [{"role": "user", "content": marker}], tokenize=False,
+        add_generation_prompt=True)
+    prefix, suffix = template.split(marker)
+    prefix_len = len(tokenizer(prefix, add_special_tokens=False).input_ids)
+    suffix_len = len(tokenizer(suffix, add_special_tokens=False).input_ids)
+    special = torch.tensor(tokenizer.all_special_ids, device=prompt_ids.device)
+    editable = ~torch.isin(prompt_ids[0], special)
+    editable[:prefix_len] = False
+    if suffix_len:
+        editable[-suffix_len:] = False
+    return editable
 
 
 def _hidden(output):
@@ -127,6 +145,11 @@ class Defender(ABC):
     def from_args(cls, args, model):
         """Build the policy: load bundles, construct, return the instance."""
 
+    def prepare(self, tokenizer, vanilla_ids):
+        """Provide token metadata and the clean reference for this row."""
+        self.tokenizer = tokenizer
+        self.vanilla_ids = vanilla_ids
+
     def transform_prompt(self, user_message):
         """Prompt-side hook; identity for activation-level defenses."""
         return user_message
@@ -134,17 +157,6 @@ class Defender(ABC):
     @abstractmethod
     def reset(self):
         """Reset per-response state."""
-
-    @abstractmethod
-    def before_step(self, x, region, *, scope, steps_remaining):
-        """May rewrite committed answer tokens in x back to MASK_ID, in place.
-
-        region: all original answer slots (bool [1, seq]). scope: slots that can
-        still be filled in the current block (positions < block_end).
-        steps_remaining: denoising steps left in this block.
-        Returns the commit count for this step if masks were reopened (the
-        sampler rebalances its schedule), else None.
-        """
 
     @abstractmethod
     def forward(self, x, region, *, schedule_scale, logit_positions=None,
@@ -220,9 +232,6 @@ class NullDefender(Defender):
     def reset(self):
         pass
 
-    def before_step(self, x, region, *, scope, steps_remaining):
-        return None
-
     def forward(self, x, region, *, schedule_scale, logit_positions=None,
                 n_masks=None):
         if logit_positions is None:
@@ -245,7 +254,7 @@ class NullDefender(Defender):
         return {}
 
 class Ours(Defender):
-    """Shared gated-steering machinery for the v2/v3 remask policies.
+    """Gated steering, optionally extended by V3 boundary recovery.
 
     A detector hook on blocks[gate-1] reads the current answer and sets a
     continuous gate strength g = clamp((projection - threshold) / width, 0, 1);
@@ -253,9 +262,8 @@ class Ours(Defender):
     currently masked answer slots toward refusal.
 
     --defense ours selects this family and --remask picks the concrete
-    policy, built by from_args: V2 (one-shot committed-window repair, the
-    llada_steering_remasking_v2 method) or V3 (response-detector boundary
-    audit + block recovery). --steer {none,fixed,adaptive} is a separate
+    policy, built by from_args: Ours (steering without remasking) or V3
+    (response-detector boundary audit + block recovery). --steer {none,fixed,adaptive} is a separate
     axis: no steering, a step-0 binary gate, or the continuous per-step
     gate. fixed steering is the steer-only configuration (gate read once,
     never remask) that the earlier standalone steering scripts measured.
@@ -338,14 +346,15 @@ class Ours(Defender):
                                  "boundary, then the adaptive gate for the recovery and the "
                                  "rest of the response (requires --remask v3).")
         parser.add_argument("--remask",
-                            choices=["none", "v2", "v3"],
-                            default="v2",
-                            help="none: never remask; v2: one-shot committed-token window "
-                                 "repair; v3: response-detector trigger reopens the first "
+                            choices=["none", "v3"],
+                            default="v3",
+                            help="none: never remask; v3: response-detector trigger reopens the first "
                                  "block and regenerates it over --recovery-steps steps.")
         parser.add_argument("--response-detector", default="outputs/response_detector.pt",
                             help="Logistic-regression response checkpoint; required by "
                                  "--remask v3*. Its layer must match --detector-layer.")
+        parser.add_argument("--remask-prompt", action="store_true",
+                            help="v3: recover all prompt text, preserving special tokens.")
         parser.add_argument("--recovery-steps", type=int, default=32,
                             help="Steps spent regenerating a triggered block (v3).")
         parser.add_argument("--recovery-rounds", type=int, default=1,
@@ -372,13 +381,11 @@ class Ours(Defender):
         parser.add_argument("--recovery-alpha-growth", type=float, default=1.0,
                             help="v3: steering strength multiplier per re-detected "
                                  "recovery round (round i steers at alpha*growth^i).")
-        parser.add_argument("--max-remask-tokens", type=int, default=16)
-        parser.add_argument("--max-parallel-commit", type=int, default=2)
-        parser.add_argument("--remask-trigger", type=float, default=1.0,
-                            help="Gate strength needed to attempt the v2 one-shot repair.")
 
     @classmethod
     def from_args(cls, args, model):
+        if args.remask_prompt and args.remask != "v3":
+            raise ValueError("--remask-prompt requires --remask v3")
         device = next(model.parameters()).device
         sites = []
         if args.steer != "none":
@@ -392,14 +399,12 @@ class Ours(Defender):
                       threshold=threshold, width=args.gate_width, sites=sites,
                       strength=args.alpha, transform=args.transform,
                       steer=args.steer)
-        if args.remask in ("none", "v2"):
-            return V2(**shared, remask=args.remask == "v2",
-                      max_remask_tokens=args.max_remask_tokens,
-                      max_parallel_commit=args.max_parallel_commit,
-                      remask_trigger=args.remask_trigger)
+        if args.remask == "none":
+            return cls(**shared)
         response_detector = torch.load(args.response_detector, map_location="cpu",
                                        weights_only=False)
         return V3(**shared, response_detector=response_detector,
+                  remask_prompt=args.remask_prompt,
                   recovery_steps=args.recovery_steps,
                   recovery_rounds=args.recovery_rounds,
                   audit_all_boundaries=args.audit_all_boundaries,
@@ -435,16 +440,6 @@ class Ours(Defender):
                 or region.shape != x.shape or region.dtype != torch.bool
                 or region.device != x.device or not nonempty):
             raise ValueError("expected long x and nonempty bool region shaped [1, seq]")
-
-    def _projection(self, hidden, pool):
-        h = hidden[0, pool].to(torch.float32).mean(dim=0)
-        value = float(h @ self.gate_vector.to(h.device))
-        if not math.isfinite(value):
-            raise ValueError("detector returned a non-finite projection")
-        return value
-
-    def before_step(self, x, region, *, scope, steps_remaining):
-        return None
 
     # ------------------------------------------------------------------ hooks
     def _gate_hook(self, module, inputs, output):
@@ -548,7 +543,7 @@ class Ours(Defender):
         if audit is not None:
             audit.chunks = self._chunk_positions(
                 audit.block_row.nonzero().flatten())
-            audit_pools = [committed[0].nonzero().flatten(), *audit.chunks]
+            audit_pools = [take_true(committed[0], n_committed), *audit.chunks]
 
         return _ForwardPlan(
             source="generated" if n_committed else "masked",
@@ -591,10 +586,6 @@ class Ours(Defender):
         if plan.audit_pools is not None and len(feats) != 1:
             raise RuntimeError("audit hook must execute exactly once per forward")
         return output, feats
-
-    # V2 decides its repair from the gate strength on every step, so it reads
-    # the scalars back each step; everything else only needs them at audits.
-    _read_scalars_every_step = False
 
     def _step_tensor(self, x):
         """This step's projection, gate strength and effective alpha, on the GPU."""
@@ -677,11 +668,10 @@ class Ours(Defender):
 
         # Python only needs these numbers when it has to branch on them: an
         # audit decides whether to recover, a step-0 binary gate latches the
-        # strength later steps read, and V2 checks its trigger every step. Any
+        # strength later steps read. Any
         # other step leaves them on the GPU, so it never waits on the device.
         scalars = None
-        if (plan.audit is not None or self._read_scalars_every_step
-                or (self.gate_once and self.step == 0)):
+        if plan.audit is not None or (self.gate_once and self.step == 0):
             scalars = self._read_scalars(plan, feats, step_t)
             if self._pending.fired:
                 self._apply_scalars(scalars)
@@ -727,163 +717,7 @@ class Ours(Defender):
         return {"defense": self.name, "steer": self.steer_mode,
                 "transform": self.transform, "strength": self.strength,
                 "threshold": self.threshold, "width": self.width,
-                "layers": self.steer_layers}
-
-
-class V2(Ours):
-    """--remask v2: one-shot committed-window repair.
-
-    Once committed answer tokens exist and the gate strength reaches
-    --remask-trigger, a single remasking attempt probes candidate windows
-    of committed tokens with detector-only forwards and reopens the window
-    whose removal lowers the projection the most.
-    """
-
-    name = "v2"
-    _read_scalars_every_step = True
-
-    def __init__(self, model, *, remask=False, max_remask_tokens=16,
-                 max_parallel_commit=2, remask_trigger=1.0, **kw):
-        if max_remask_tokens <= 0 or max_parallel_commit <= 0:
-            raise ValueError("token budgets must be positive")
-        if not 0 < remask_trigger <= 1:
-            raise ValueError("remask_trigger must be in (0, 1]")
-        if kw.get("steer") == "triggered":
-            raise ValueError("--steer triggered needs the v3 boundary detector (--remask v3); "
-                             "v2 never raises the trigger, so steering would never start")
-        self.remask_enabled = bool(remask)
-        self.max_remask_tokens = max_remask_tokens
-        self.max_parallel_commit = max_parallel_commit
-        self.remask_trigger = float(remask_trigger)
-        super().__init__(model, remask_enabled=self.remask_enabled, **kw)
-
-    def reset(self):
-        super().reset()
-        self.remasked = False
-        self.remask_event = None
-
-    # ---------------------------------------------------------------- probes
-    @torch.no_grad()
-    def score(self, x, pool):
-        """Detector-only forward (no steering). pool: bool [seq] positions to average.
-
-        Stops at the gate block -- see _GateReached. One repair runs this once
-        per candidate window plus a baseline, so the saving is the whole probe.
-        """
-        captured = []
-
-        def capture(module, inputs, output):
-            captured.append(self._projection(_hidden(output), pool))
-            raise _GateReached
-
-        with MODEL_LOCK:
-            handle = self.gate_block.register_forward_hook(capture)
-            try:
-                self.model(x)
-            except _GateReached:
-                pass
-            finally:
-                handle.remove()
-        if len(captured) != 1:
-            raise RuntimeError("gate block must execute exactly once per forward")
-        return captured[0]
-
-    # Each candidate window costs one detector-only forward, so the probe set
-    # is capped and evenly sampled rather than exhaustive.
-    MAX_PROBE_WINDOWS = 8
-
-    @staticmethod
-    def _committed_runs(region, committed):
-        """Maximal stretches of committed answer positions.
-
-        A run is broken only by a position OUTSIDE the answer region: a slot
-        that is inside the region but still masked does NOT split it, so a
-        half-filled stretch stays a single candidate window.
-        """
-        runs, run = [], []
-        for index in range(len(region)):
-            if region[index]:
-                if committed[index]:
-                    run.append(index)
-            elif run:
-                runs.append(run)
-                run = []
-        if run:
-            runs.append(run)
-        return runs
-
-    @classmethod
-    def _candidates(cls, region, committed, count):
-        """Up to MAX_PROBE_WINDOWS windows of at most `count` committed tokens.
-
-        Windows tile each run end to end; if that yields more than the cap, an
-        evenly spaced subset spanning the first and last window is kept.
-        """
-        runs = cls._committed_runs(region, committed)
-        if not runs or count <= 0:
-            return []
-        size = min(count, max(map(len, runs)))
-        windows = [run[i:i + size] for run in runs
-                   for i in range(0, len(run) - size + 1, size)]
-        if len(windows) > cls.MAX_PROBE_WINDOWS:
-            last = cls.MAX_PROBE_WINDOWS - 1
-            windows = [windows[round(i * (len(windows) - 1) / last)]
-                       for i in range(cls.MAX_PROBE_WINDOWS)]
-        return windows
-
-    def before_step(self, x, region, *, scope, steps_remaining):
-        """One-shot repair using the previous forward's gate reading."""
-        self._validate(x, region)
-        if scope.shape != x.shape or scope.dtype != torch.bool or steps_remaining <= 0:
-            raise ValueError("scope must be an aligned bool mask and steps_remaining positive")
-        masks = (x == self.mask_id) & region
-        commit_count = None
-        if (self.remask_enabled and self.monitoring and not self.remasked
-                and self.step > 0 and self.gate_strength >= self.remask_trigger):
-            committed = region & ~masks & scope
-            budget = max(0, steps_remaining * self.max_parallel_commit - int((masks & scope).sum()))
-            candidates = self._candidates(region[0].tolist(), committed[0].tolist(),
-                                          min(self.max_remask_tokens, budget))
-            if candidates:
-                self.remasked = True
-                pool = committed[0].clone()  # fixed across probes so scores are comparable
-                base = self.score(x, pool)
-                scores = []
-                for positions in candidates:
-                    probe = x.clone()
-                    probe[0, positions] = self.mask_id
-                    scores.append(self.score(probe, pool))
-                best = min(range(len(scores)), key=scores.__getitem__)
-                applied = scores[best] < base
-                event = {"step": self.step, "gate_strength": self.gate_strength,
-                         "base_projection": base, "candidate_projections": scores,
-                         "candidates": candidates, "applied": applied,
-                         "selected": candidates[best] if applied else None}
-                if applied:
-                    x[0, candidates[best]] = self.mask_id
-                    masks = (x == self.mask_id) & region
-                    remaining = int((masks & scope).sum())
-                    commit_count = min(max(1, -(-remaining // steps_remaining)), remaining)
-                    event["commit_count"] = commit_count
-                self.remask_event = event
-        return commit_count
-
-    def _remasked(self):
-        return bool(self.remask_event and self.remask_event["applied"])
-
-    def result_fields(self):
-        fields = super().result_fields()
-        if fields:
-            fields["remask_event"] = self.remask_event
-        return fields
-
-    def describe(self):
-        d = super().describe()
-        d.update(remask="v2" if self.remask_enabled else "none",
-                 max_remask_tokens=self.max_remask_tokens,
-                 max_parallel_commit=self.max_parallel_commit,
-                 remask_trigger=self.remask_trigger)
-        return d
+                "layers": self.steer_layers, "remask": "none"}
 
 
 class V3(Ours):
@@ -902,7 +736,7 @@ class V3(Ours):
     def __init__(self, model, *, response_detector, recovery_steps=32,
                  recovery_rounds=1, audit_all_boundaries=False,
                  audit_boundary=0, infill_checkpoint=0,
-                 recovery_alpha_growth=1.0, **kw):
+                 recovery_alpha_growth=1.0, remask_prompt=False, **kw):
         if recovery_steps <= 0:
             raise ValueError("recovery_steps must be positive")
         if recovery_rounds <= 0:
@@ -919,6 +753,8 @@ class V3(Ours):
         missing = {"weight", "bias", "threshold", "layer"} - response_detector.keys()
         if missing:
             raise ValueError(f"response detector missing keys: {sorted(missing)}")
+        self.remask_prompt = remask_prompt
+        self._prompt_text_slots = None
         self.recovery_steps = int(recovery_steps)
         self.recovery_rounds = int(recovery_rounds)
         self.audit_all_boundaries = bool(audit_all_boundaries)
@@ -934,6 +770,11 @@ class V3(Ours):
         self._det_bias = float(response_detector["bias"])
         self._det_threshold = float(response_detector["threshold"])
         self.response_detector = response_detector
+
+    def defend(self, model, prompt_ids, rng=None, **gen_config):
+        if self.remask_prompt:
+            self._prompt_text_slots = _prompt_text_mask(self.tokenizer, prompt_ids)
+        return super().defend(model, prompt_ids, rng=rng, **gen_config)
 
     def reset(self):
         super().reset()
@@ -1043,7 +884,7 @@ class V3(Ours):
 
         event = {"boundary": block_number,
                  "pre_audit": asdict(reading),
-                 "pre_recovery_token_ids": x[0].tolist(),
+                 "pre_recovery_token_ids": x[0].clone(),
                  "rounds": [], "applied": True,
                  "extra_sampling_steps": self.recovery_steps}
         self.recovery_events.append(event)
@@ -1056,20 +897,31 @@ class V3(Ours):
         remasking = audit.remasking
         span_slots = region[0] & (x[0] != self.mask_id)
         span_slots[prompt_length:] = False
+        if self.remask_prompt:
+            span_slots[:prompt_length] |= self._prompt_text_slots
         targets = audit.block_row | span_slots
-        positions = targets.nonzero().flatten()
-        from llada import get_num_transfer_tokens
-        from sampler import commit_sample
-        counts = get_num_transfer_tokens(
-            targets.unsqueeze(0), self.recovery_steps)[0].tolist()
+        # Recovery may reopen fixed prompt text. Include it in recovery pools
+        # only; subsequent ordinary audits still use the original answer region.
+        original_region_count = self._n_region
+        region = region | targets[None]
+        # Read all counts together; avoid an extra synchronization for the
+        # temporary recovery region and nonzero's separate size sync.
+        target_count, outside, self._n_region = torch.stack([
+            targets.sum(), ((x[0] == self.mask_id) & region[0] & ~targets).sum(),
+            region.sum()]).tolist()
+        positions = take_true(targets, target_count)
+        from sampler import commit_sample, transfer_counts
+        counts = transfer_counts(positions.numel(), self.recovery_steps)
+        num_span_positions = span_slots.sum()
         for round_i in range(self.recovery_rounds):
             # Re-detected rounds steer harder: strength *= growth ** round_i.
             self._steer_boost = self.recovery_alpha_growth ** round_i
             old_tokens = x[0, positions].clone()
-            # Masks outside the recovered positions stay open throughout; read
-            # that once per round so the recovery steps themselves need no sync.
-            outside = int(((x[0] == self.mask_id) & region[0]).sum())
-            x[0, positions] = self.mask_id
+            # Reuse the initial count for round zero. Later rounds still read
+            # it in case the model itself predicted MASK_ID during recovery.
+            if round_i:
+                outside = int(((x[0] == self.mask_id) & region[0] & ~targets).sum())
+            x.copy_(torch.where(targets[None], self.mask_id, x))
             eligible = positions
             self.in_recovery = True
             try:
@@ -1090,12 +942,12 @@ class V3(Ours):
             event["rounds"].append({
                 "round": round_i,
                 "steer_boost": self._steer_boost,
-                "selected": positions.tolist(),
-                "num_span_positions": int(span_slots.sum()),
-                "old_token_ids": old_tokens.tolist(),
-                "new_token_ids": x[0, positions].tolist(),
+                "selected": positions,
+                "num_span_positions": num_span_positions,
+                "old_token_ids": old_tokens,
+                "new_token_ids": x[0, positions].clone(),
                 "round_sampling_forwards": self.recovery_steps,
-                "post_trial_token_ids": x[0].tolist()})
+                "post_trial_token_ids": x[0].clone()})
             if round_i + 1 >= self.recovery_rounds:
                 break
             post = self._audit(x, region, self._chunk_positions(positions))
@@ -1105,6 +957,7 @@ class V3(Ours):
             if post.response_probability < self._det_threshold:
                 break
         self._steer_boost = 1.0
+        self._n_region = original_region_count
         return True
 
     def _remasked(self):
@@ -1113,6 +966,36 @@ class V3(Ours):
     def result_fields(self):
         fields = super().result_fields()
         if fields and self.boundary_audits:
+            # Recovery snapshots are diagnostic only. Transfer them together
+            # after sampling, preserving scalar/list shapes in the JSON schema.
+            tensors = []
+
+            def collect(value):
+                if isinstance(value, torch.Tensor):
+                    tensors.append(value)
+                elif isinstance(value, dict):
+                    for item in value.values():
+                        collect(item)
+                elif isinstance(value, list):
+                    for item in value:
+                        collect(item)
+
+            collect(self.recovery_events)
+            if tensors:
+                values = iter(torch.cat([t.reshape(-1) for t in tensors]).tolist())
+
+                def materialize(value):
+                    if isinstance(value, torch.Tensor):
+                        if value.ndim == 0:
+                            return next(values)
+                        return [next(values) for _ in range(value.numel())]
+                    if isinstance(value, dict):
+                        return {k: materialize(v) for k, v in value.items()}
+                    if isinstance(value, list):
+                        return [materialize(v) for v in value]
+                    return value
+
+                self.recovery_events = materialize(self.recovery_events)
             fields.update(boundary_audits=self.boundary_audits,
                           recovery_events=self.recovery_events,
                           audit_forwards=self.audit_forwards)
@@ -1120,7 +1003,7 @@ class V3(Ours):
 
     def describe(self):
         d = super().describe()
-        d.update(remask="v3", recovery_steps=self.recovery_steps,
+        d.update(remask="v3", remask_prompt=self.remask_prompt, recovery_steps=self.recovery_steps,
                  recovery_rounds=self.recovery_rounds,
                  audit_all_boundaries=self.audit_all_boundaries,
                  audit_boundary=self.audit_boundary,
@@ -1157,27 +1040,81 @@ class SelfReminder(NullDefender):
         return {"defense": self.name, "reminder": self.reminder}
 
 
-class DiffuGuard(Defender):
-    """Diffusion-time defense baseline; not implemented yet."""
+class DiffuGuard(NullDefender):
+    """Adapter to the included author's LLaDA generator."""
 
     name = "diffuguard"
+    needs_vanilla = True
+
+    @classmethod
+    def add_args(cls, parser):
+        parser.set_defaults(remasking="adaptive_step")
+        parser.add_argument("--sp-threshold", type=float, default=0.2)
+        parser.add_argument("--refinement-steps", type=int, default=8)
+        parser.add_argument("--remask-ratio", type=float, default=0.9)
+        parser.add_argument("--repair-scope", choices=["all", "first"], default="all",
+                            help="DiffuGuard repair eligibility: all answer blocks "
+                                 "(default), or only the first block. Prompt text "
+                                 "is eligible in the first block in both modes.")
 
     @classmethod
     def from_args(cls, args, model):
-        raise NotImplementedError("DiffuGuard not implemented yet")
+        if not math.isfinite(args.sp_threshold) or not 0 <= args.remask_ratio <= 1:
+            raise ValueError("DiffuGuard needs a finite threshold and remask ratio in [0, 1]")
+        if args.refinement_steps <= 0:
+            raise ValueError("--refinement-steps must be positive")
+        obj = cls(model)
+        obj.options = dict(sp_threshold=args.sp_threshold,
+                           refinement_steps=args.refinement_steps,
+                           remask_ratio=args.remask_ratio,
+                           correct_only_first_block=args.repair_scope == "first")
+        if args.row_workers != 1:
+            raise ValueError("DiffuGuard uses global RNG; use --row-workers 1")
+        return obj
 
-    def reset(self):
-        pass
+    @torch.no_grad()
+    def defend(self, model, prompt_ids, rng=None, **gen_config):
+        from third_party import diffuguard as backend
+        generate = backend.generate
+        if self.vanilla_ids is None:
+            raise ValueError("DiffuGuard hidden detection requires a clean reference")
+        length, block, steps = (gen_config[k] for k in ("gen_length", "block_length", "steps"))
+        if length < 0 or block <= 0 or steps <= 0:
+            raise ValueError("invalid DiffuGuard length/step settings")
+        if length and (length % block or steps % (length // block)):
+            raise ValueError("gen_length must divide into blocks and steps into block steps")
+        if length > block and getattr(backend, "BLOCK_SCHEDULE_VERSION", None) != "prompt_then_answer_blocks_v1":
+            raise RuntimeError("Incompatible bundled DiffuGuard block schedule")
+        with MODEL_LOCK, torch.random.fork_rng(devices=[prompt_ids.device]):
+            if rng is not None:
+                # Advance the row generator across iterative attack candidates.
+                # Reusing initial_seed() restarted the same stream each time.
+                torch.cuda.set_rng_state(rng.get_state(), prompt_ids.device)
+            baseline = model(self.vanilla_ids, output_hidden_states=True,
+                             return_dict=True).hidden_states[-1].mean(dim=1).squeeze(0)
+            protected = ~_prompt_text_mask(self.tokenizer, prompt_ids)[None]
+            protected &= prompt_ids != MASK_ID
+            output = generate(model, self.tokenizer, prompt_ids,
+                            steps=gen_config["steps"], gen_length=gen_config["gen_length"],
+                            block_length=gen_config["block_length"],
+                            temperature=gen_config["temperature"],
+                            remasking=gen_config["remasking"], cfg_scale=0.0,
+                            sp_mode="hidden", baseline_hidden=baseline,
+                            fill_all_masks=True, protected_index=protected,
+                            attack_method="DIJA", **self.options)
+            if rng is not None:
+                rng.set_state(torch.cuda.get_rng_state(prompt_ids.device))
+            return output
 
-    def before_step(self, x, region, *, scope, steps_remaining):
-        return None
+    def defend_batch(self, model, prompt_ids_list, rng=None, **gen_config):
+        return Defender.defend_batch(self, model, prompt_ids_list, rng=rng, **gen_config)
 
-    def forward(self, x, region, *, schedule_scale, logit_positions=None,
-                n_masks=None):
-        raise NotImplementedError("DiffuGuard not implemented yet")
-
-    def result_fields(self):
-        return {}
+    def describe(self):
+        return {"defense": self.name, "implementation": "author generator",
+                "sp_mode": "hidden", "fill_all_masks": True,
+                "protect_special_tokens": True,
+                "repair_scope": "first" if self.options["correct_only_first_block"] else "all",
+                "block_schedule": "prompt_then_answer_blocks_v1", **self.options}
 
 
 DEFENDERS = {d.name: d for d in (NullDefender, Ours, SelfReminder, DiffuGuard)}

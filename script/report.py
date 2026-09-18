@@ -47,6 +47,11 @@ GRADERS = [
 
 def classify(summary):
     """(grader name, columns) for a summary block, or None if unrecognised."""
+    if "grader_kind" in summary:
+        return (f"{summary['grader_kind']} (attack rows)",
+                [("n", "total"), ("success", "successful"), ("ASR", "asr"),
+                 ("ASR upper", "asr_upper_bound"), ("unresolved", "unresolved"),
+                 ("search errors", "n_search_errors")])
     for name, marker, columns in GRADERS:
         if marker in summary:
             return name, columns
