@@ -14,6 +14,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from model_loading import load_pretrained
+
 from llada import MODEL_NAME, MASK_ID  # noqa: F401  (re-exported)
 
 # Serializes hook-registration -> model(x) -> hook-removal sections. Forward
@@ -115,7 +117,7 @@ def load_llada(device=None):
     from transformers import AutoModel, AutoTokenizer
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    model = AutoModel.from_pretrained(MODEL_NAME, trust_remote_code=True,
+    model = load_pretrained(AutoModel, MODEL_NAME, trust_remote_code=True,
                                       torch_dtype=torch.bfloat16,
                                       device_map={"": device}).eval()
     return tokenizer, model
@@ -547,11 +549,6 @@ def run_eval_shards(script, args, n_items, extra_args=None, devices=None):
 _persistent_model = None
 
 
-def _init_persistent_worker(gpus):
-    # No CUDA operations run before pinning this spawned worker.
-    os.environ["CUDA_VISIBLE_DEVICES"] = gpus.get()
-
-
 def _run_persistent_job(kind, argv):
     from contextlib import redirect_stderr, redirect_stdout
     import time
@@ -597,8 +594,8 @@ def read_jobs(path):
 
 def run_persistent_jobs(kind, jobs, gpus, *, chunk_size=0):
     """Reuse one model per GPU worker across CLI jobs; optionally chunk rows."""
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-    import multiprocessing as mp
+    from concurrent.futures import as_completed
+    from gpu_worker import GPUJobPool
     import time
     if kind not in ("generate", "grade") or chunk_size < 0:
         raise ValueError("invalid job kind or chunk size")
@@ -650,17 +647,12 @@ def run_persistent_jobs(kind, jobs, gpus, *, chunk_size=0):
         raise ValueError("all generation jobs must use the same --reproduct setting")
 
     started = time.perf_counter()
-    context = mp.get_context("spawn")
-    devices = context.Queue()
     workers = min(len(gpus), len(tasks))
-    for gpu in gpus[:workers]:
-        devices.put(gpu)
     records = []
     owners = {str(part): (out, parts) for out, parts in merges for part in parts}
     pending = {out: len(parts) for out, parts in merges}
-    with ProcessPoolExecutor(max_workers=workers, mp_context=context,
-                             initializer=_init_persistent_worker, initargs=(devices,)) as pool:
-        futures = [pool.submit(_run_persistent_job, kind, argv) for argv in tasks]
+    with GPUJobPool(gpus[:workers]) as pool:
+        futures = [pool.submit(kind, argv) for argv in tasks]
         for future in as_completed(futures):
             record = future.result()
             records.append(record)
@@ -674,7 +666,6 @@ def run_persistent_jobs(kind, jobs, gpus, *, chunk_size=0):
                     results = sorted((r for p in payloads for r in p["results"]),
                                      key=lambda r: r["index"])
                     write_json(out, {**payloads[0], "results": results}, compact=True)
-    devices.close()
     report = {"kind": kind, "seconds": time.perf_counter() - started,
               "workers": workers, "tasks": records}
     return report

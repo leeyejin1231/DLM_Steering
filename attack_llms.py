@@ -16,6 +16,8 @@ import threading
 
 import torch
 
+from model_loading import load_pretrained
+
 
 
 class DeterministicTopP:
@@ -94,8 +96,8 @@ class HFChat:
             # Generation padding is always left; set once so concurrent
             # generate_batch calls never race a per-call toggle.
             self.tokenizer.padding_side = "left"
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_id, torch_dtype=self.dtype,
+            self.model = load_pretrained(
+                AutoModelForCausalLM, self.model_id, torch_dtype=self.dtype,
                 device_map={"": device}).eval()
             self.device = device
 

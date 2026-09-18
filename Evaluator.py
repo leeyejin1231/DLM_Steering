@@ -34,6 +34,7 @@ from threading import Lock
 import torch
 from tqdm import tqdm
 
+from model_loading import load_pretrained
 from common import ERROR_SENTINEL
 
 SR_PROMPT_PATH = (Path(__file__).parent / "ollama_setting"
@@ -641,8 +642,8 @@ class LlamaGuard4(ASR):
         if config.text_config.attention_chunk_size is None:
             config.text_config.attention_chunk_size = 8192
 
-        model = Llama4ForConditionalGeneration.from_pretrained(
-            model_id, config=config, device_map=device, torch_dtype=torch.bfloat16
+        model = load_pretrained(
+            Llama4ForConditionalGeneration, model_id, config=config, device_map=device, torch_dtype=torch.bfloat16
         ).eval()
         # The shipped generation_config asks for a static cache, but the config
         # has no sliding_window and max_position_embeddings=10M, so StaticCache
