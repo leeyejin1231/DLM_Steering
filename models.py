@@ -25,6 +25,12 @@ Per-model fields:
     steer_layers    default steering layers (None = vector bundle's best_layer)
     shift_logits    lm_head predicts the NEXT position (AR-style); realign
                     logits so logits[:, p] scores slot p (Dream)
+    user_header_id  control token after which the user turn's role name and
+                    newline(s) precede the user text; with eot_id it bounds
+                    the user content (v3 --remask-prompt)
+    newline_id      newline token id ending the header
+    turn_breakers   ids that cannot occur inside a user turn (end-of-text,
+                    turn/header control); banned at rewritten prompt slots
 """
 
 import os
@@ -36,14 +42,16 @@ MODELS = {
         mask_id=126336, mask_token="<|mdm_mask|>", eot_id=126348,
         n_layers=32, chat_control=(),
         out_dir="outputs", detector_layer=18, steer_layers="25",
-        shift_logits=False,
+        shift_logits=False, user_header_id=126347, newline_id=198,   # <|end_header_id|>
+        turn_breakers=(126080, 126081, 126346, 126347, 126348),
     ),
     "dream": dict(
         name="Dream-org/Dream-v0-Instruct-7B",
         mask_id=151666, mask_token="<|mask|>", eot_id=151645,   # <|im_end|>
         n_layers=28, chat_control=("<|im_start|>", "<|im_end|>"),
         out_dir="outputs/dream", detector_layer=None, steer_layers=None,
-        shift_logits=True,
+        shift_logits=True, user_header_id=151644, newline_id=198,    # <|im_start|>
+        turn_breakers=(151643, 151644, 151645),   # <|endoftext|>, <|im_start|>, <|im_end|>
     ),
 }
 

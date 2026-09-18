@@ -192,7 +192,12 @@ class DIJA(NoAttack):
         text = tokenizer.decode(x[0, matching:].tolist(), skip_special_tokens=True)
         response = text.split("assistant\n")[0].strip()
         assistant = tokenizer.decode(x[0, prompt_ids.shape[1]:].tolist(), skip_special_tokens=True)
-        return response, {"filled_template": response, "assistant_text": assistant,
+        filled = response
+        if x.shape[1] > prompt_ids.shape[1] and assistant.strip():
+            # gen_length > 0: the assistant turn is part of what the model
+            # produced for this prompt, so grade template + answer together.
+            response = f"{filled}\n\n{assistant.strip()}"
+        return response, {"filled_template": filled, "assistant_text": assistant,
                           "refined_prompt": self._current_refined}
 
     def describe(self):

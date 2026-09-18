@@ -31,11 +31,12 @@ import argparse
 import time
 
 from Attacker import ATTACKERS
-from common import (MODEL_NAME, MASK_ID, PROMPT_SOURCES, add_model_arg,
+from common import (MODEL_KEY, MODEL_NAME, MASK_ID, PROMPT_SOURCES, add_model_arg,
                     encode_prompt, enable_reproducibility, force_math_attention,
                     load_model, load_prompts, parse_gpu_ids, run_eval_shards,
                     seed_all, write_json)
 from Defender import DEFENDERS
+from sampler import DECODERS, DREAM_ALGS
 
 
 def parse_args():
@@ -63,6 +64,25 @@ def parse_args():
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--remasking", default="low_confidence")
     p.add_argument("--schedule", default="const", choices=["const", "linear", "cosine"])
+    p.add_argument("--decoder", choices=list(DECODERS),
+                   default="dream" if MODEL_KEY == "dream" else "block",
+                   help="block: LLaDA semi-AR blocks with --remasking (default for "
+                        "llada). dream: Dream's own diffusion_generate rule (default "
+                        "for --model dream); --block-length is then the audit "
+                        "granularity in committed tokens.")
+    p.add_argument("--alg", choices=list(DREAM_ALGS), default="origin",
+                   help="decoder=dream: position order (Dream's alg). origin = "
+                        "random order, diffusion_generate's config default and what "
+                        "the DIJA and DiffuGuard authors run on Dream; entropy is "
+                        "Dream's README recommendation.")
+    p.add_argument("--alg-temp", type=float, default=None,
+                   help="decoder=dream: soften the confidence ordering (Dream alg_temp)")
+    p.add_argument("--top-p", type=float, default=None,
+                   help="decoder=dream: nucleus sampling (default 0.95 as in Dream's "
+                        "and the DIJA authors' Dream runs; 1 disables)")
+    p.add_argument("--top-k", type=int, default=None,
+                   help="decoder=dream: top-k truncation (default 50, which is what "
+                        "diffusion_generate applies when top_k is not given; 0 disables)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--reproduct", action="store_true",
                    help="Bitwise-deterministic generation: fixed seeds, deterministic "
@@ -126,7 +146,14 @@ def main():
 
     gen_config = {"steps": args.steps, "gen_length": args.gen_length,
                   "block_length": args.block_length, "temperature": args.temperature,
-                  "remasking": args.remasking, "schedule": args.schedule}
+                  "decoder": args.decoder}
+    if args.decoder == "dream":
+        top_k = 50 if args.top_k is None else args.top_k
+        gen_config.update(alg=args.alg, alg_temp=args.alg_temp,
+                          top_p=0.95 if args.top_p is None else args.top_p,
+                          top_k=top_k if top_k > 0 else None)
+    else:
+        gen_config.update(remasking=args.remasking, schedule=args.schedule)
 
     def respond(user_message):
         """One user turn through the defense -> (x, ids, cfg, shown)."""

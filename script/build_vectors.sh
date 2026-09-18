@@ -48,7 +48,7 @@ skip "$OUT_DIR/gate_threshold.json" || \
 say "5/5 fit_response_detector -- boundary response detector for --remask v3"
 if [ "$GPU_A" = "$GPU_B" ]; then VIS=$GPU_A; GUARD=cuda:0; else VIS=$GPU_A,$GPU_B; GUARD=cuda:1; fi
 skip "$OUT_DIR/response_detector.pt" || \
-    CUDA_VISIBLE_DEVICES=$VIS $PY steering/fit_response_detector.py $MODEL_ARGS $LAYER_ARG \
+    CUDA_VISIBLE_DEVICES=$VIS $PY steering/fit_response_detector.py $MODEL_ARGS $LAYER_ARG --attack dija \
         --device cuda:0 --guard-device "$GUARD" 2>&1 | tee "log/fit_response_detector$LOG_TAG.log"
 
 say "done"

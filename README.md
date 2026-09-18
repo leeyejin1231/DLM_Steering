@@ -75,7 +75,7 @@ python exp.py --attack dija --defense ours --remask v3 --source jbb_harmful --n 
 | `--attack` | `none`, `prefix`, `dija`(논문 refined 프롬프트), `dija_template`(구 합성 템플릿), `pap`, `pair` |
 | `--defense` | `none`, `ours`, `proposed`, `selfreminder`(미구현). DiffuGuard는 `--defense`가 아니라 저자 코드로 돌린다 ("Baseline: DiffuGuard") |
 | `--source` | 유해: `jbb_harmful`, `advbench`, `harmbench`, `strongreject`, `xstest_unsafe` / 무해(over-refusal): `truthfulqa`, `xstest_safe`, `jbb_benign`, `wj_benign` / 일반화(accuracy): `mmlu`, `gsm8k`, `truthfulqa_mc` |
-| 공통 | `--model {llada,dream}`(기본 llada, "Dream-v0-Instruct-7B" 절 참고), `--n`, `--start`, `--steps`, `--gen-length`, `--block-length`, `--temperature`, `--remasking`, `--schedule {const,linear,cosine}`, `--seed`, `--reproduct`, `--gpus` |
+| 공통 | `--model {llada,dream}`(기본 llada, "Dream-v0-Instruct-7B" 절 참고), `--n`, `--start`, `--steps`, `--gen-length`, `--block-length`, `--temperature`, `--decoder {block,dream}`(llada 기본 block, dream 기본 dream), block 전용 `--remasking`, `--schedule {const,linear,cosine}`, dream 전용 `--alg {origin,entropy,maskgit_plus,topk_margin}`(기본 origin), `--alg-temp`, `--top-p`(0.95), `--top-k`(50), `--seed`, `--reproduct`, `--gpus` |
 
 `--gen-length` 기본값은 128, dija/dija_template는 0.
 
@@ -195,6 +195,16 @@ LLaDA-8B DIJA 줄 그대로다 (hidden 자가검사 임계값 0.2, 90% 재마스
 
 주의: 저자 코드는 `--fill_all_masks`일 때 복구 단계에서 프롬프트 토큰까지 포함한 전체 시퀀스의 90%를 되돌림.
 
+**Dream (`DiffuGuard/models/jailbreakbench_dream.py`).** 저자 Dream 러너는 두 가지 이유로 그대로는 못 돌린다.
+`@torch.no_grad__()` 오타로 import에서 죽고, 커스텀 디코딩(`dream_adaptive_generate`, `apply_self_correction`)이 `model(x).logits`를
+정렬 없이 argmax해서 Dream의 AR 시프트 때문에 "a a a a" 같은 출력이 나온다. 그래서 저자 파일은 손대지 않고 래퍼에서
+`torch.no_grad__ = torch.no_grad`, 그리고 `AutoModel.from_pretrained`가 `common.ShiftedLogits`로 감싼 모델을 돌려주게 해 실행한다
+(Dream 자체 샘플러와 같은 정렬). 실행 조건은 v3 Dream 실험과 동일(gen_length 0, temperature 0.2, steps 200, top_p 1.0)이고 방어 설정은
+저자 test.sh의 Dream DIJA 줄(`--sp_mode hidden --sp_threshold 0.1 --refinement_steps 8 --remask_ratio 0.9`, scope block_all)이다.
+`script/convert_diffuguard.py --model dream`이 Dream 채팅 제어 토큰을 지우고 exp.py 형식으로 바꾼다.
+결과는 `outputs/dream/JBB-dija-dgm-{hidden,full}-42{,_lg4,_sr}.json`. Dream에서는 hidden 감지 점수가 0.06~0.56(평균 0.23)이라
+94/100에서 자기보정이 걸리고(LLaDA는 최대 0.19로 0/100), 전체 시퀀스 90% remask 탓에 출력의 12~18%가 퇴화한다.
+
 HarmBench refined 파일에는 같은 behavior가 7건 중복되어 러너는 400건을 돌리지만 변환 시 첫 건만 남겨
 `common.load_prompts`의 393건과 맞춘다. 프롬프트당 약 35초라 JBB 약 1시간, StrongREJECT 약 3시간, HarmBench 약 4시간이 걸림.
 
@@ -222,6 +232,7 @@ python exp.py --defense ours \
 ```
 
 - `--steer {none,fixed,adaptive,triggered}` — `none`: 스티어링 없음, `fixed`: non-adaptive, `adaptive`: 매 스텝 연속 게이트
+- `--remask-prompt` (v3) — 트리거 시 사용자 턴 텍스트 전체(요청문, DIJA 앵커, 채워진 span; 채팅 헤더·시스템 턴 제외)도 remask하고 답변 영역에 편입해 조향·감사·채점 대상으로 삼는다. 재작성 위치에는 end-of-text·턴 제어 토큰을 금지한다(없으면 빈 턴으로 붕괴). Dream JBB DIJA에서 gen 0 트리거 62건 중 51건이 퇴화 텍스트였다(`outputs/dream/JBB-dija*-nat-v3rp-42*`).
 - `--remask {none,v2,v3}` — `v2`: 기본값, llada_steering_remasking_v2 방식, `none`: 리마스킹 없음
   - `--steer triggered`(v3 전용): v3 응답 검출기가 트리거되기 전에는 steering을 걸지 않고, 트리거 뒤 복구와 남은 블록에서만 adaptive 게이트로 건다. 무해 프롬프트에서 게이트가 거의 항상 열려 생기는 over-refusal을 피하려는 옵션
   - `v3`: 블록 경계마다 로지스틱 회귀 응답 검출기(`--response-detector`, 기본 `outputs/response_detector.pt`)가 커밋된 토큰을 채점하고, 첫 경계에서 트리거되면 해당 블록 + 프롬프트 안의 채워진 스팬(DIJA)을 전부 remask한 뒤 `--recovery-steps`(기본 32)만큼 재생성
@@ -303,11 +314,17 @@ python steering/judge_refusal.py --in outputs/base.json --out outputs/base_judge
 python steering/fit_vector.py             # steering 벡터 추출 → outputs/steer_vector.pt
 python steering/fit_detector.py           # 디텍터 벡터 학습 → outputs/steer_detector.pt
 python steering/pick_threshold.py         # 게이트 threshold 선택 → outputs/gate_threshold.json
-python steering/fit_response_detector.py  # v3 응답 검출기 → outputs/response_detector.pt (Llama Guard 4 라벨, GPU 2장)
+python steering/fit_response_detector.py --attack dija  # v3 응답 검출기 → outputs/response_detector.pt (Llama Guard 4 라벨, GPU 2장)
 python steering/check_detector.py         # 디텍터 AUROC 확인
 ```
 
 `script/build_vectors.sh`가 위 다섯 단계를 순서대로 돌린다 (이미 있는 산출물은 건너뜀, `--force`로 재생성).
+
+응답 검출기(`fit_response_detector.py`)는 WildJailbreak 프롬프트 384개를 실제로 생성해 Llama Guard 4로 unsafe/safe 라벨을 달고,
+게이트 층의 커밋 토큰 평균 특징으로 로지스틱 회귀를 학습한다. `--attack dija`(합성 DIJA 템플릿, gen_length 0)가 기본 레시피다.
+`--attack none`(일반 답변)은 모델이 거의 다 거절해 unsafe 표본이 수십 개뿐이라 검출기가 트리거되지 않는다 (Dream에서 18/384).
+프롬프트 그룹 25%를 검증용으로 떼어 v3 트리거 컷오프를 Youden's J로 고르고(`--threshold auto`; 기준 LLaDA 체크포인트의 컷오프도 0.09였다),
+생성 샘플은 `outputs/<model>/response_samples_<attack>.pt`에 캐시되므로 `--from-samples`로 C/컷오프/분할만 바꿔 재피팅할 수 있다.
 
 ## Dream-v0-Instruct-7B
 
@@ -339,6 +356,20 @@ Dream에서는 `--detector-layer`/`--layer`를 생략하면 각 번들의 `best_
 벡터 `best_layer`가 디텍터 층보다 앞이면 `--defense ours`가 거부하므로 `--layer`를 직접 지정한다
 (`outputs/dream/steer_vector_report.json`의 층별 AUROC 참고). `DETECTOR_LAYER=16 MODEL=dream script/build_vectors.sh`처럼 고정할 수도 있다.
 
+**Dream 산출물 (2026-09-16, `data/steer_pairs.json` 재사용, 28층 중 1~27 탐색).**
+
+| 산출물 | 층 | 근거 |
+|---|---|---|
+| `steer_vector.pt` | **20** (alpha sweep) | 검증 AUROC는 17이 최고(0.997)지만 LLaDA처럼 `steering/sweep_alpha.py`로 고름: 층 17은 alpha 1.5부터 고유 단어 비율 0.59로 붕괴, 22/25는 거절률이 안 오르고, 층 20은 alpha 1에서 거절 100%·alpha 2까지 유창(0.72). `--layer 20` 필요 (기본값은 best_layer 17) |
+| `steer_detector.pt` | 14 | OOD 평균 AUROC 0.970 (XSTest 1.00 / TruthfulQA 0.995 / JBB-benign 0.915); 15~19는 0.90~0.94 |
+| `gate_threshold.json` | 14 | fit-split 유해 15퍼센타일 2.706 (유해 85% / 무해 12% 개방; Youden 2.837과 근접) |
+| `response_detector.pt` | 14 | DIJA 템플릿 384건(unsafe 143 / safe 241), C=0.01, 컷오프 0.364(검증 Youden). 검증 AUROC 0.71, 5-fold CV 0.712±0.033 |
+
+응답 검출기 층별 5-fold CV(`response_detector_cv.json`)는 전 층 0.69~0.75로 평평하고 후반 층(20~27)이 0.02~0.03 높지만
+표준편차 이내다. 게이트 층을 20 이상으로 올리면 프롬프트 디텍터가 0.970→0.904, 스티어링 층도 21 이후로 밀려 벡터 AUROC가 <0.96으로
+떨어지므로 게이트 14 / 스티어링 17을 유지했다. `--attack none` 샘플로는 Dream이 거의 다 거절해(unsafe 18/384) 검출기가 트리거되지
+않았다 (`response_detector_none_c0.5.pt`로 보관). 응답 검출기는 LLaDA보다 약할 수 있으니 v3 트리거율(`boundary_audits`)을 확인할 것.
+
 **LLaDA와 다른 점 (구현).**
 
 - Dream의 `lm_head`는 다음 위치를 예측하도록(AR shift) 학습되어 있어 Dream 자체 샘플러가 `cat([logits[:, :1], logits[:, :-1]])`로
@@ -346,15 +377,29 @@ Dream에서는 `--detector-layer`/`--layer`를 생략하면 각 번들의 `best_
   하므로 `sampler.py`/`Defender.py`는 수정 없이 동작한다. hidden state는 위치별 residual stream 그대로라 훅/디텍터도 그대로다.
 - Dream 토크나이저는 `<|im_start|>`/`<|im_end|>`를 special로 취급하지 않아 `skip_special_tokens` 디코딩에 남는다. `load_model`이
   둘을 special로 등록해(id 불변) 생성문에서 지워지게 한다. DIJA의 `split("assistant\n")` 컷은 그대로 유효하다.
-- 샘플링은 LLaDA와 같은 우리 샘플러(semi-AR 블록, low-confidence remask, Gumbel)를 쓴다. DIJA 원저자 Dream 러너는
-  `diffusion_generate(steps=64, max_new_tokens=64, temperature=0.2, top_p=0.95, alg=origin)`이라 프롬프트 마스크 뒤에 64토큰을 더 붙이고
-  무작위 순서로 채운다. 원저 설정에 가깝게 보려면 `--gen-length 64 --block-length 64 --dija-steps 64`를 준다.
+- 디코딩은 Dream 자체 `diffusion_generate` 규칙을 그대로 쓴다 (`--decoder dream`, `--model dream`의 기본값; `sampler.py`의
+  `_generate_dream`은 `generation_utils._sample`의 축자 이식이라 방어 없이 같은 seed로 돌리면 네이티브 출력과 토큰 단위로 일치한다.
+  alg 4종 × T 0/0.2 × 평문/DIJA 16조합 확인). 블록 없이 전체 시퀀스를 `steps` 타임스텝(`linspace(1, eps)`)으로 채우고, 스텝마다
+  `n_mask·(1−s/t)`개를 `--alg`(origin: 무작위 순서, Dream config 기본값이자 DIJA·DiffuGuard 원저자의 Dream 설정, 기본값;
+  entropy: Dream README 권장; maskgit_plus, topk_margin)로 고른 뒤 softmax(logits/T)에서 top_p·top_k 컷으로 샘플링한다. 기본 `--top-p 0.95 --top-k 50`은
+  `diffusion_generate`가 인자 없이 적용하는 값이다(top_k 50은 HF 기본값이 숨어 들어간 것). LLaDA식 `--remasking/--schedule`은
+  이 디코더에서 무시된다.
+- 방어 훅은 디코더와 무관하다. 게이트는 첫 forward(step 0)에서 프롬프트 hidden으로 읽고, 스티어링은 매 forward의 마스크 슬롯에
+  더한다. v3의 "블록 경계"는 Dream에서는 위치가 아니라 시간 단위다: 답변 슬롯이 `--block-length`(기본 32)개 새로 확정될 때마다
+  그 토큰들(위치 무관)을 한 블록으로 감사하고, 첫 블록이 응답으로 판정되면 그 토큰들 + 채워진 DIJA span을 remask해 Dream 규칙으로
+  `--recovery-steps` 타임스텝 동안 스티어링하며 재생성한다(`sampler.dream_denoise`). 마지막 확정 직후 한 번 더 감사한다.
+- 2026-09-17 이전의 Dream 결과(`outputs/dream/JBB-dija-*`, `JBB-dija128-*`, `TQA-*`)는 LLaDA 블록 디코더(`--decoder block`,
+  semi-AR 32블록, low-confidence, Gumbel)로 만든 것이다. 같은 조건을 다시 쓰려면 `--decoder block`을 명시한다.
+  DIJA 원저자 Dream 러너는 `diffusion_generate(steps=64, max_new_tokens=64, temperature=0.2, top_p=0.95)`(alg origin)이므로
+  원저 설정은 `--alg origin --gen-length 64 --dija-steps 64`다.
 - 스티어링은 LLaDA와 동일하게 "현재 마스크된 슬롯"의 hidden state에 더한다. Dream에서는 슬롯 p의 로짓이 위치 p-1의 hidden에서
   나오므로 마스크 슬롯에 넣은 벡터는 한 칸 뒤 슬롯의 예측에 작용하는 셈이다 (양방향 attention이라 블록 전체에는 같은 방향으로 작용).
   `fit_vector.py`도 같은 마스크 위치에서 방향을 뽑으므로 학습/적용 위치는 일치한다.
 - `data/steer_pairs.json`의 compliant 응답은 LLaDA 생성문이지만 텍스트 대조(refusal vs compliant)로만 쓰이므로 Dream에도 그대로 쓴다.
   Dream 자체 생성문으로 바꾸려면 `data/llada8b_wild_unsafe_only.csv`의 `response` 열만 교체하면 된다.
-- 구버전 스크립트(`llada_steering_v2.py`, `steering/sweep_alpha.py`, `steering/run_overrefusal.py`)는 LLaDA 전용으로 남아 있다.
+- `steering/sweep_alpha.py`는 현재 Defender 경로(게이트 강제 개방, remask 없음)로 옮겨 `--model`/`--layers`를 받는다.
+  Dream 결과: `outputs/dream/alpha_sweep_l17_20.json`, `alpha_sweep_l22_25.json` (WildJailbreak fit 20~29행, greedy 128토큰).
+- 구버전 스크립트(`llada_steering_v2.py`, `steering/run_overrefusal.py`)는 LLaDA 전용으로 남아 있다.
 
 ## 이전 버전대비 명령어 전환
 - `llada.py` -> `python exp.py --attack none --defense none`

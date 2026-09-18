@@ -20,8 +20,8 @@ from abc import ABC, abstractmethod
 
 import torch
 
-from common import (DETECTOR_LAYER, MASK_ID, OUT_DIR, STEER_LAYERS, load_detector,
-                    model_blocks)
+from common import (DETECTOR_LAYER, EOT_ID, MASK_ID, NEWLINE_ID, OUT_DIR, STEER_LAYERS,
+                    TURN_BREAKERS, USER_HEADER_ID, load_detector, model_blocks)
 from proposed import Proposed
 
 
@@ -72,7 +72,8 @@ class Defender(ABC):
         Must return the model output (with .logits)."""
 
     def after_block(self, x, region, *, block_index, block_positions,
-                    prompt_length, temperature, remasking, last_block=False):
+                    prompt_length, temperature, remasking, last_block=False,
+                    sampling=None):
         """Called once after each block's denoising loop completes.
 
         block_positions: answer slots of the just-finished block. prompt_length
@@ -80,6 +81,10 @@ class Defender(ABC):
         (e.g. filled DIJA spans) are also remaskable. last_block marks the
         final block (no later forward exists to piggyback an audit on). May
         audit the block or rewrite committed tokens back to MASK_ID.
+        sampling: the decoder's rule (sampler.generate: {"decoder": "block",
+        temperature, remasking} or {"decoder": "dream", temperature, alg,
+        alg_temp, top_p, top_k, eps}) so regeneration matches the base
+        decoding; None falls back to block/temperature/remasking.
         """
 
     @abstractmethod
@@ -145,8 +150,14 @@ class Ours(Defender):
 
     def __init__(self, model, *, gate_layer, gate_vector, threshold, width=1.0,
                  sites, strength=1.0, transform="additive", steer="adaptive",
-                 remask_enabled=False, mask_id=MASK_ID):
-        """sites: sequence of (layer 1-based, refusal vector [hidden], ref_norm)."""
+                 remask_enabled=False, mask_id=MASK_ID, steer_shift=False):
+        """sites: sequence of (layer 1-based, refusal vector [hidden], ref_norm).
+
+        steer_shift: also steer the position just before each masked slot.
+        Dream's lm_head predicts the NEXT position, so a slot's token is read
+        from the hidden state of the token before it; without the shift the
+        first token of every span (predicted from an unsteered anchor token)
+        never sees the steering vector. No-op in spirit for LLaDA."""
         if model.training:
             raise ValueError("call model.eval() before constructing the policy")
         if steer not in ("none", "fixed", "adaptive", "triggered"):
@@ -190,6 +201,7 @@ class Ours(Defender):
         self.threshold, self.width = float(threshold), float(width)
         self.strength, self.transform = float(strength), transform
         self.mask_id = mask_id
+        self.steer_shift = bool(steer_shift)
         self.reset()
 
     @classmethod
@@ -214,6 +226,9 @@ class Ours(Defender):
         parser.add_argument("--alpha", type=float, default=1.0,
                             help="Steering strength in units of the layer's mean activation norm.")
         parser.add_argument("--transform", choices=["additive", "project"], default="additive")
+        parser.add_argument("--steer-shift", action="store_true",
+                            help="Also steer the position before each masked slot (Dream: "
+                                 "the hidden state that predicts the slot's token).")
         parser.add_argument("--steer", choices=["none", "fixed", "adaptive", "triggered"],
                             default="adaptive",
                             help="none: no steering; fixed: step-0 binary gate; "
@@ -231,8 +246,9 @@ class Ours(Defender):
                             default=f"{OUT_DIR}/response_detector.pt",
                             help="Logistic-regression response checkpoint; required by "
                                  "--remask v3*. Its layer must match --detector-layer.")
-        parser.add_argument("--recovery-steps", type=int, default=32,
-                            help="Steps spent regenerating a triggered block (v3).")
+        parser.add_argument("--recovery-steps", default="32",
+                            help="Steps spent regenerating a triggered block (v3); 'auto' = "
+                                 "one step per remasked token, like the base decoding.")
         parser.add_argument("--recovery-rounds", type=int, default=1,
                             help="v3: re-audit after each recovery round and remask "
                                  "again while the block still reads as a response, "
@@ -240,6 +256,11 @@ class Ours(Defender):
         parser.add_argument("--audit-all-boundaries", action="store_true",
                             help="v3: let the response detector trigger at every "
                                  "block boundary, not only the first.")
+        parser.add_argument("--remask-prompt", action="store_true",
+                            help="v3: on a trigger also remask the whole user-turn text "
+                                 "(request, DIJA anchors, filled spans; chat headers and "
+                                 "system turn kept). The rewritten prompt tokens become "
+                                 "answer slots: steered, audited and graded like the rest.")
         parser.add_argument("--recovery-alpha-growth", type=float, default=1.0,
                             help="v3: steering strength multiplier per re-detected "
                                  "recovery round (round i steers at alpha*growth^i).")
@@ -264,7 +285,7 @@ class Ours(Defender):
         shared = dict(model=model, gate_layer=det_layer, gate_vector=det_vec,
                       threshold=threshold, width=args.gate_width, sites=sites,
                       strength=args.alpha, transform=args.transform,
-                      steer=args.steer)
+                      steer=args.steer, steer_shift=args.steer_shift)
         if args.remask in ("none", "v2"):
             return V2(**shared, remask=args.remask == "v2",
                       max_remask_tokens=args.max_remask_tokens,
@@ -273,10 +294,12 @@ class Ours(Defender):
         response_detector = torch.load(args.response_detector, map_location="cpu",
                                        weights_only=False)
         return V3(**shared, response_detector=response_detector,
-                  recovery_steps=args.recovery_steps,
+                  recovery_steps=("auto" if args.recovery_steps == "auto"
+                                  else int(args.recovery_steps)),
                   recovery_rounds=args.recovery_rounds,
                   audit_all_boundaries=args.audit_all_boundaries,
-                  recovery_alpha_growth=args.recovery_alpha_growth)
+                  recovery_alpha_growth=args.recovery_alpha_growth,
+                  remask_prompt=args.remask_prompt)
 
     def reset(self):
         self.gate_strength = 0.0
@@ -378,6 +401,9 @@ class Ours(Defender):
         pool = (committed[0] if n_committed else masks[0]).nonzero().flatten() \
             if read_gate else None
         positions = masks[0].nonzero().flatten() if steer else None
+        if steer and self.steer_shift and positions.numel():
+            # slot p is read from hidden[p-1]: steer that position too
+            positions = torch.unique(torch.cat([positions, (positions - 1).clamp(min=0)]))
         audit = self._pending_audit     # V3 only: ride this forward's features
         self._pending_audit = None
         audit_pools = None
@@ -463,7 +489,7 @@ class Ours(Defender):
         return {"defense": self.name, "steer": self.steer_mode,
                 "transform": self.transform, "strength": self.strength,
                 "threshold": self.threshold, "width": self.width,
-                "layers": self.steer_layers}
+                "layers": self.steer_layers, "steer_shift": self.steer_shift}
 
 
 class V2(Ours):
@@ -605,9 +631,9 @@ class V3(Ours):
 
     def __init__(self, model, *, response_detector, recovery_steps=32,
                  recovery_rounds=1, audit_all_boundaries=False,
-                 recovery_alpha_growth=1.0, **kw):
-        if recovery_steps <= 0:
-            raise ValueError("recovery_steps must be positive")
+                 recovery_alpha_growth=1.0, remask_prompt=False, **kw):
+        if recovery_steps != "auto" and recovery_steps <= 0:
+            raise ValueError("recovery_steps must be positive or 'auto'")
         if recovery_rounds <= 0:
             raise ValueError("recovery_rounds must be positive")
         if not math.isfinite(recovery_alpha_growth) or recovery_alpha_growth <= 0:
@@ -618,10 +644,11 @@ class V3(Ours):
         missing = {"weight", "bias", "threshold", "layer"} - response_detector.keys()
         if missing:
             raise ValueError(f"response detector missing keys: {sorted(missing)}")
-        self.recovery_steps = int(recovery_steps)
+        self.recovery_steps = recovery_steps if recovery_steps == "auto" else int(recovery_steps)
         self.recovery_rounds = int(recovery_rounds)
         self.audit_all_boundaries = bool(audit_all_boundaries)
         self.recovery_alpha_growth = float(recovery_alpha_growth)
+        self.remask_prompt = bool(remask_prompt)
         super().__init__(model, remask_enabled=True, **kw)
         if int(response_detector["layer"]) != self.gate_layer:
             raise ValueError("response detector layer must match the gate layer")
@@ -639,6 +666,28 @@ class V3(Ours):
         self.audit_forwards = 0
 
     # --------------------------------------------------- boundary audit/remask
+    @staticmethod
+    def _user_content(x, prompt_length):
+        """bool [seq]: the user turn's text inside the prompt, i.e. the tokens
+        after the last user header (control token + role name + newlines) and
+        before the EOT that closes the turn. Empty if the layout is not found."""
+        ids = x[0, :prompt_length].tolist()
+        span = torch.zeros(x.shape[1], dtype=torch.bool, device=x.device)
+        eots = [i for i, t in enumerate(ids) if t == EOT_ID]
+        if not eots:
+            return span
+        end = eots[-1]
+        heads = [i for i, t in enumerate(ids[:end]) if t == USER_HEADER_ID]
+        if not heads:
+            return span
+        i = heads[-1] + 1
+        while i < end and ids[i] != NEWLINE_ID:     # role name ("user")
+            i += 1
+        while i < end and ids[i] == NEWLINE_ID:     # header newline(s)
+            i += 1
+        span[i:end] = True
+        return span
+
     @staticmethod
     def _chunk_positions(positions, size=32):
         return [positions[i:i + size] for i in range(0, positions.numel(), size)]
@@ -683,7 +732,8 @@ class V3(Ours):
 
     @torch.no_grad()
     def after_block(self, x, region, *, block_index, block_positions,
-                    prompt_length, temperature, remasking, last_block=False):
+                    prompt_length, temperature, remasking, last_block=False,
+                    sampling=None):
         if self._pending_audit is not None:
             # A deferred audit whose next forward never arrived still runs.
             pending = self._pending_audit
@@ -691,9 +741,12 @@ class V3(Ours):
             reading = self._audit(x, region, self._chunk_positions(
                 pending["block_row"].nonzero().flatten()))
             self._apply_audit(x, region, reading, audit=pending)
+        if sampling is None:
+            sampling = {"decoder": "block", "temperature": temperature,
+                        "remasking": remasking}
         audit = {"block_index": block_index, "block_row": block_positions[0],
                  "prompt_length": prompt_length, "temperature": temperature,
-                 "remasking": remasking}
+                 "remasking": remasking, "sampling": sampling}
         if last_block:
             # No later forward to piggyback on; audit with a dedicated pass.
             reading = self._audit(x, region, self._chunk_positions(
@@ -731,14 +784,40 @@ class V3(Ours):
         # and remasked again while it still reads as a response.
         prompt_length, temperature = audit["prompt_length"], audit["temperature"]
         remasking = audit["remasking"]
+        sampling = audit.get("sampling") or {"decoder": "block"}
         span_slots = region[0] & (x[0] != self.mask_id)
         span_slots[prompt_length:] = False
         targets = audit["block_row"] | span_slots
+        n_prompt_tokens = 0
+        if self.remask_prompt:
+            user = self._user_content(x, prompt_length) & ~region[0]
+            n_prompt_tokens = int(user.sum())
+            targets = targets | user
+            # The rewritten prompt text joins the answer region in place (the
+            # sampler's own tensor): it is steered while regenerated, pooled by
+            # later audits, and counted as generated from here on.
+            region[0] |= user
+            user_positions = user.nonzero().flatten()
+        event["num_prompt_positions"] = n_prompt_tokens
+
+        banned = torch.tensor(TURN_BREAKERS + (self.mask_id,), device=x.device)
+
+        def recovery_logits(cur):
+            logits = self.forward(cur, region, schedule_scale=1.0).logits
+            if n_prompt_tokens:
+                # A user turn cannot end or open a new turn midway: without this
+                # the context-free rewrite collapses to end-of-text padding.
+                idx = user_positions[:, None]
+                logits[0, idx, banned[None, :]] = torch.finfo(logits.dtype).min
+            return logits
         positions = targets.nonzero().flatten()
         from llada import get_num_transfer_tokens
-        from sampler import commit_sample
-        counts = get_num_transfer_tokens(
-            targets.unsqueeze(0), self.recovery_steps)[0].tolist()
+        from sampler import commit_sample, dream_denoise
+        # 'auto': one token per step, the pace of the base decoding
+        n_steps = int(positions.numel()) if self.recovery_steps == "auto" else self.recovery_steps
+        n_steps = max(1, n_steps)
+        event["extra_sampling_steps"] = n_steps
+        counts = get_num_transfer_tokens(targets.unsqueeze(0), n_steps)[0].tolist()
         for round_i in range(self.recovery_rounds):
             # Re-detected rounds steer harder: strength *= growth ** round_i.
             self._steer_boost = self.recovery_alpha_growth ** round_i
@@ -747,15 +826,24 @@ class V3(Ours):
             eligible = positions
             self.in_recovery = True
             try:
-                for i in range(self.recovery_steps):
-                    final = i == self.recovery_steps - 1
-                    if eligible.numel() == 0:
-                        break
-                    if counts[i] == 0 and not final:
-                        continue
-                    logits = self.forward(x, region, schedule_scale=1.0).logits
-                    eligible = commit_sample(x, logits, eligible, counts[i],
-                                             temperature, remasking, final=final)
+                if sampling["decoder"] == "dream":
+                    # Regenerate with Dream's own rule (same alg/temperature/
+                    # top_p as the base decoding), steered like any forward.
+                    rule = {k: sampling[k] for k in ("alg", "alg_temp", "temperature",
+                                                     "top_p", "top_k")}
+                    dream_denoise(
+                        x, targets.unsqueeze(0), n_steps, recovery_logits,
+                        eps=sampling.get("eps", 1e-3), mask_id=self.mask_id, **rule)
+                else:
+                    for i in range(n_steps):
+                        final = i == n_steps - 1
+                        if eligible.numel() == 0:
+                            break
+                        if counts[i] == 0 and not final:
+                            continue
+                        logits = recovery_logits(x)
+                        eligible = commit_sample(x, logits, eligible, counts[i],
+                                                 temperature, remasking, final=final)
             finally:
                 self.in_recovery = False
             event["rounds"].append({
@@ -765,7 +853,7 @@ class V3(Ours):
                 "num_span_positions": int(span_slots.sum()),
                 "old_token_ids": old_tokens.tolist(),
                 "new_token_ids": x[0, positions].tolist(),
-                "round_sampling_forwards": self.recovery_steps,
+                "round_sampling_forwards": n_steps,
                 "post_trial_token_ids": x[0].tolist()})
             if round_i + 1 >= self.recovery_rounds:
                 break
@@ -794,7 +882,8 @@ class V3(Ours):
         d.update(remask="v3", recovery_steps=self.recovery_steps,
                  recovery_rounds=self.recovery_rounds,
                  audit_all_boundaries=self.audit_all_boundaries,
-                 recovery_alpha_growth=self.recovery_alpha_growth)
+                 recovery_alpha_growth=self.recovery_alpha_growth,
+                 remask_prompt=self.remask_prompt)
         return d
 
 
