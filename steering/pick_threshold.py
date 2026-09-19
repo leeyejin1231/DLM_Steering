@@ -14,6 +14,8 @@ Usage:
     CUDA_VISIBLE_DEVICES=1 python -m steering.pick_threshold --layer 18
 """
 
+from common import OUT_DIR, DETECTOR_LAYER, MODEL_KEY, add_model_arg
+
 import argparse
 import json
 from pathlib import Path
@@ -28,17 +30,20 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--detector", default=str(ROOT / "outputs/steer_detector.pt"))
+    add_model_arg(ap)
+    ap.add_argument("--detector", default=str(ROOT / OUT_DIR / "steer_detector.pt"))
     ap.add_argument("--pairs", default=str(ROOT / "data/steer_pairs.json"))
-    ap.add_argument("--layer", type=int, default=18)
+    ap.add_argument("--layer", type=int, default=DETECTOR_LAYER)
     ap.add_argument("--percentile", type=float, default=15.0,
                     help="Gate opens for (100-p)%% of fit-split harmful prompts.")
-    ap.add_argument("--out", default=str(ROOT / "outputs/gate_threshold.json"))
+    ap.add_argument("--out", default=str(ROOT / OUT_DIR / "gate_threshold.json"))
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     b = load_detector_bundle(args.detector)
     layers, gen_length = b["layers"], b["gen_length"]
+    if args.layer is None:
+        args.layer = int(b["best_layer"])
     li = layers.index(args.layer)
     v = b["vector"][li]
 

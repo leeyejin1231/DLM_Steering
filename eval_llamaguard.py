@@ -101,6 +101,7 @@ def main(argv=None, grader=None):
         "source": args.inp,
         "source_model": data.get("model"),
         "source_config": data.get("config"),
+        "evaluation_scope": data.get("evaluation_scope"),
         "summary": summary,
         "results": scored,
     }

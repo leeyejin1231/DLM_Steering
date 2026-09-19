@@ -18,6 +18,8 @@ Usage:
     CUDA_VISIBLE_DEVICES=1 python -m steering.fit_vector
 """
 
+from common import OUT_DIR, DETECTOR_LAYER, MODEL_KEY, add_model_arg
+
 import argparse
 import json
 from pathlib import Path
@@ -72,9 +74,10 @@ def collect(model, tokenizer, pairs, t_list, max_resp, layers, seed, device):
 
 def main():
     ap = argparse.ArgumentParser()
+    add_model_arg(ap)
     ap.add_argument("--pairs", default=str(ROOT / "data/steer_pairs.json"))
-    ap.add_argument("--out", default=str(ROOT / "outputs/steer_vector.pt"))
-    ap.add_argument("--report", default=str(ROOT / "outputs/steer_vector_report.json"))
+    ap.add_argument("--out", default=str(ROOT / OUT_DIR / "steer_vector.pt"))
+    ap.add_argument("--report", default=str(ROOT / OUT_DIR / "steer_vector_report.json"))
     ap.add_argument("--max-pairs", type=int, default=0, help="0 = all fit pairs.")
     ap.add_argument("--max-resp", type=int, default=192, help="Max response tokens.")
     ap.add_argument("--t-list", default="0.3,0.5,0.7,0.9")

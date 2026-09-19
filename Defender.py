@@ -21,7 +21,8 @@ from typing import Any
 
 import torch
 
-from common import MASK_ID, MODEL_LOCK, block_index, load_detector
+from common import (MASK_ID, MODEL_LOCK, MODEL_KEY, MODEL, OUT_DIR, DETECTOR_LAYER,
+                    STEER_LAYERS, TURN_BREAKERS, block_index, load_detector, model_blocks)
 from sampler import take_true
 
 
@@ -115,6 +116,7 @@ class _PendingAudit:
     temperature: float
     remasking: str
     rng: Any = None
+    sampling: Any = None
     chunks: list = field(default_factory=list)
 
 
@@ -170,7 +172,7 @@ class Defender(ABC):
 
     def after_block(self, x, region, *, block_number, block_positions,
                     prompt_length, temperature, remasking, last_block=False,
-                    rng=None):
+                    rng=None, sampling=None):
         """Called once after each block's denoising loop completes.
 
         block_number: which block just finished, 0-based (not to be confused
@@ -234,7 +236,7 @@ class NullDefender(Defender):
 
     def forward(self, x, region, *, schedule_scale, logit_positions=None,
                 n_masks=None):
-        if logit_positions is None:
+        if logit_positions is None or MODEL["shift_logits"]:
             return self.model(x)
         ln_f = self.model.model.transformer.ln_f
         with MODEL_LOCK:
@@ -273,7 +275,7 @@ class Ours(Defender):
 
     def __init__(self, model, *, gate_layer, gate_vector, threshold, width=1.0,
                  sites, strength=1.0, transform="additive", steer="adaptive",
-                 remask_enabled=False, mask_id=MASK_ID):
+                 remask_enabled=False, mask_id=MASK_ID, steer_shift=False):
         """sites: sequence of (layer 1-based, refusal vector [hidden], ref_norm)."""
         if model.training:
             raise ValueError("call model.eval() before constructing the policy")
@@ -292,7 +294,7 @@ class Ours(Defender):
         # remask decision needs fresh gate readings
         self.gate_once = steer == "fixed" and not remask_enabled
         self.steer_mode = steer
-        blocks = model.model.transformer.blocks
+        blocks = model_blocks(model)
         if not 1 <= gate_layer <= len(blocks):
             raise ValueError(f"gate layer must be in 1..{len(blocks)}")
         if gate_vector.ndim != 1 or not torch.isfinite(gate_vector).all() or gate_vector.norm() == 0:
@@ -315,29 +317,32 @@ class Ours(Defender):
         self.model = model
         self.gate_layer = gate_layer
         self.gate_block = blocks[block_index(gate_layer)]
-        self.ln_f = model.model.transformer.ln_f
+        self.ln_f = None if MODEL["shift_logits"] else model.model.transformer.ln_f
         self.gate_vector = gate_vector.float()
         self.threshold, self.width = float(threshold), float(width)
         self.strength, self.transform = float(strength), transform
         self.mask_id = mask_id
+        self.steer_shift = steer_shift
         self.reset()
 
     @classmethod
     def add_args(cls, parser):
-        parser.add_argument("--vector", default="outputs/steer_vector.pt")
-        parser.add_argument("--detector", default="outputs/steer_detector.pt")
-        parser.add_argument("--detector-layer", type=int, default=18)
+        parser.add_argument("--vector", default=f"{OUT_DIR}/steer_vector.pt")
+        parser.add_argument("--detector", default=f"{OUT_DIR}/steer_detector.pt")
+        parser.add_argument("--detector-layer", type=int, default=DETECTOR_LAYER)
         parser.add_argument("--gate-threshold", type=float, default=None,
                             help="Projection threshold; defaults to gate_threshold.json "
                                  "next to the detector bundle.")
         parser.add_argument("--gate-width", type=float, default=1.0,
                             help="Projection margin above threshold for full steering.")
-        parser.add_argument("--layer", default="25",
+        parser.add_argument("--layer", default=STEER_LAYERS,
                             help="Comma-separated steering layers (hidden-state numbering; "
                                  "25 = blocks[24]). All must be after --detector-layer.")
         parser.add_argument("--alpha", type=float, default=1.0,
                             help="Steering strength in units of the layer's mean activation norm.")
         parser.add_argument("--transform", choices=["additive", "project"], default="additive")
+        parser.add_argument("--steer-shift", action="store_true",
+                            help="Also steer the position before masked slots (Dream).")
         parser.add_argument("--steer", choices=["none", "fixed", "adaptive", "triggered"],
                             default="adaptive",
                             help="none: no steering; fixed: step-0 binary gate; "
@@ -350,12 +355,12 @@ class Ours(Defender):
                             default="v3",
                             help="none: never remask; v3: response-detector trigger reopens the first "
                                  "block and regenerates it over --recovery-steps steps.")
-        parser.add_argument("--response-detector", default="outputs/response_detector.pt",
+        parser.add_argument("--response-detector", default=f"{OUT_DIR}/response_detector.pt",
                             help="Logistic-regression response checkpoint; required by "
                                  "--remask v3*. Its layer must match --detector-layer.")
         parser.add_argument("--remask-prompt", action="store_true",
                             help="v3: recover all prompt text, preserving special tokens.")
-        parser.add_argument("--recovery-steps", type=int, default=32,
+        parser.add_argument("--recovery-steps", type=lambda s: "auto" if s == "auto" else int(s), default=32,
                             help="Steps spent regenerating a triggered block (v3).")
         parser.add_argument("--recovery-rounds", type=int, default=1,
                             help="v3: re-audit after each recovery round and remask "
@@ -390,7 +395,8 @@ class Ours(Defender):
         sites = []
         if args.steer != "none":
             bundle = torch.load(args.vector, map_location="cpu")
-            for layer in (int(s) for s in args.layer.split(",")):
+            layer_spec = str(bundle["best_layer"]) if args.layer is None else args.layer
+            for layer in (int(s) for s in layer_spec.split(",")):
                 li = bundle["layers"].index(layer)
                 sites.append((layer, bundle["vector"][li].to(device), bundle["mean_act_norm"][li]))
         det_vec, det_layer, threshold = load_detector(
@@ -398,7 +404,7 @@ class Ours(Defender):
         shared = dict(model=model, gate_layer=det_layer, gate_vector=det_vec,
                       threshold=threshold, width=args.gate_width, sites=sites,
                       strength=args.alpha, transform=args.transform,
-                      steer=args.steer)
+                      steer=args.steer, steer_shift=args.steer_shift)
         if args.remask == "none":
             return cls(**shared)
         response_detector = torch.load(args.response_detector, map_location="cpu",
@@ -545,11 +551,16 @@ class Ours(Defender):
                 audit.block_row.nonzero().flatten())
             audit_pools = [take_true(committed[0], n_committed), *audit.chunks]
 
+        steer_mask = masks[0] if steer else None
+        if steer and self.steer_shift:
+            steer_mask = steer_mask.clone()
+            steer_mask[:-1] |= masks[0, 1:]
+
         return _ForwardPlan(
             source="generated" if n_committed else "masked",
             n_committed=n_committed, read_gate=read_gate, steer=steer,
             gate_pool=gate_pool,
-            steer_mask=masks[0] if steer else None,
+            steer_mask=steer_mask,
             audit=audit, audit_pools=audit_pools)
 
     def _run_hooked_forward(self, x, plan, logit_positions):
@@ -572,7 +583,7 @@ class Ours(Defender):
                 if plan.audit_pools is not None:
                     handles.append(self.gate_block.register_forward_hook(
                         self._audit_capture_hook(plan.audit_pools, feats)))
-                if logit_positions is not None:
+                if logit_positions is not None and self.ln_f is not None:
                     # Slice ln_f so the vocab projection runs only on the rows
                     # the sampler is about to read.
                     handles.append(self.ln_f.register_forward_hook(
@@ -717,7 +728,7 @@ class Ours(Defender):
         return {"defense": self.name, "steer": self.steer_mode,
                 "transform": self.transform, "strength": self.strength,
                 "threshold": self.threshold, "width": self.width,
-                "layers": self.steer_layers, "remask": "none"}
+                "layers": self.steer_layers, "steer_shift": self.steer_shift, "remask": "none"}
 
 
 class V3(Ours):
@@ -737,7 +748,7 @@ class V3(Ours):
                  recovery_rounds=1, audit_all_boundaries=False,
                  audit_boundary=0, infill_checkpoint=0,
                  recovery_alpha_growth=1.0, remask_prompt=False, **kw):
-        if recovery_steps <= 0:
+        if recovery_steps != "auto" and recovery_steps <= 0:
             raise ValueError("recovery_steps must be positive")
         if recovery_rounds <= 0:
             raise ValueError("recovery_rounds must be positive")
@@ -755,7 +766,7 @@ class V3(Ours):
             raise ValueError(f"response detector missing keys: {sorted(missing)}")
         self.remask_prompt = remask_prompt
         self._prompt_text_slots = None
-        self.recovery_steps = int(recovery_steps)
+        self.recovery_steps = "auto" if recovery_steps == "auto" else int(recovery_steps)
         self.recovery_rounds = int(recovery_rounds)
         self.audit_all_boundaries = bool(audit_all_boundaries)
         self.audit_boundary = int(audit_boundary)
@@ -839,7 +850,7 @@ class V3(Ours):
     @torch.no_grad()
     def after_block(self, x, region, *, block_number, block_positions,
                     prompt_length, temperature, remasking, last_block=False,
-                    rng=None):
+                    rng=None, sampling=None):
         if self._pending_audit is not None:
             # A deferred audit whose next forward never arrived still runs.
             pending = self._pending_audit
@@ -851,7 +862,7 @@ class V3(Ours):
                               block_row=block_positions[0],
                               prompt_length=prompt_length,
                               temperature=temperature, remasking=remasking,
-                              rng=rng)
+                              rng=rng, sampling=sampling)
         if last_block:
             # No later forward to piggyback on; audit with a dedicated pass.
             reading = self._audit(x, region, self._chunk_positions(
@@ -911,7 +922,10 @@ class V3(Ours):
             region.sum()]).tolist()
         positions = take_true(targets, target_count)
         from sampler import commit_sample, transfer_counts
-        counts = transfer_counts(positions.numel(), self.recovery_steps)
+        recovery_steps = positions.numel() if self.recovery_steps == "auto" else self.recovery_steps
+        recovery_steps = max(1, recovery_steps)
+        event["extra_sampling_steps"] = recovery_steps
+        counts = transfer_counts(positions.numel(), recovery_steps)
         num_span_positions = span_slots.sum()
         for round_i in range(self.recovery_rounds):
             # Re-detected rounds steer harder: strength *= growth ** round_i.
@@ -925,18 +939,31 @@ class V3(Ours):
             eligible = positions
             self.in_recovery = True
             try:
-                for i in range(self.recovery_steps):
-                    final = i == self.recovery_steps - 1
-                    if eligible.numel() == 0:
-                        break
-                    if counts[i] == 0 and not final:
-                        continue
-                    logits = self.forward(x, region, schedule_scale=1.0,
-                                          logit_positions=eligible,
-                                          n_masks=outside + eligible.numel()).logits
-                    eligible = commit_sample(x, logits, eligible, counts[i],
-                                             temperature, remasking, final=final,
-                                             rng=audit.rng)
+                if audit.sampling and audit.sampling["decoder"] == "dream":
+                    from dream_sampler import dream_denoise
+                    rule = {k: v for k, v in audit.sampling.items() if k != "decoder"}
+                    def recovery_logits(cur):
+                        logits = self.forward(cur, region, schedule_scale=1.0).logits
+                        if self.remask_prompt:
+                            user_positions = self._prompt_text_slots.nonzero().flatten()
+                            banned = torch.tensor((*TURN_BREAKERS, self.mask_id), device=x.device)
+                            logits[0, user_positions[:, None], banned[None, :]] = torch.finfo(logits.dtype).min
+                        return logits
+                    dream_denoise(x, targets[None], recovery_steps,
+                                  recovery_logits, rng=audit.rng, **rule)
+                else:
+                    for i in range(recovery_steps):
+                        final = i == recovery_steps - 1
+                        if eligible.numel() == 0:
+                            break
+                        if counts[i] == 0 and not final:
+                            continue
+                        logits = self.forward(x, region, schedule_scale=1.0,
+                                              logit_positions=eligible,
+                                              n_masks=outside + eligible.numel()).logits
+                        eligible = commit_sample(x, logits, eligible, counts[i],
+                                                 temperature, remasking, final=final,
+                                                 rng=audit.rng)
             finally:
                 self.in_recovery = False
             event["rounds"].append({
@@ -946,7 +973,7 @@ class V3(Ours):
                 "num_span_positions": num_span_positions,
                 "old_token_ids": old_tokens,
                 "new_token_ids": x[0, positions].clone(),
-                "round_sampling_forwards": self.recovery_steps,
+                "round_sampling_forwards": recovery_steps,
                 "post_trial_token_ids": x[0].clone()})
             if round_i + 1 >= self.recovery_rounds:
                 break

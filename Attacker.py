@@ -16,10 +16,9 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import NamedTuple
 
-from common import MASK_ID
+from common import MASK_TOKEN, MASK_ID
 from pap_common import TOP5, SAMPLING, assign_techniques, load_cache, require_cache
 
-MASK_TOKEN = "<|mdm_mask|>"
 DIJA_MASK_PATTERN = re.compile(r"<mask:(\d+)>")
 
 # DIJA refined prompt files (Wen et al. 2025), keyed by exp.py --source.

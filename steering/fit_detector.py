@@ -26,6 +26,8 @@ Usage:
     CUDA_VISIBLE_DEVICES=1 python -m steering.fit_detector
 """
 
+from common import OUT_DIR, DETECTOR_LAYER, MODEL_KEY, add_model_arg
+
 import argparse
 import json
 from pathlib import Path
@@ -62,10 +64,11 @@ def collect(model, tokenizer, prompts, gen_length, layers, device, tag):
 
 def main():
     ap = argparse.ArgumentParser()
+    add_model_arg(ap)
     ap.add_argument("--pairs", default=str(ROOT / "data/steer_pairs.json"))
     ap.add_argument("--csv", default=str(ROOT / "data/llada8b_wild_unsafe_only.csv"))
-    ap.add_argument("--out", default=str(ROOT / "outputs/steer_detector.pt"))
-    ap.add_argument("--report", default=str(ROOT / "outputs/steer_detector_report.json"))
+    ap.add_argument("--out", default=str(ROOT / OUT_DIR / "steer_detector.pt"))
+    ap.add_argument("--report", default=str(ROOT / OUT_DIR / "steer_detector_report.json"))
     ap.add_argument("--gen-length", type=int, default=128)
     ap.add_argument("--max-pairs", type=int, default=0)
     ap.add_argument("--n-eval", type=int, default=30)

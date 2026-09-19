@@ -94,23 +94,26 @@ def _resume_stream(output_path, items):
     left by an earlier run over a different --in cannot leak foreign rows into
     this run's results, and a twice-resumed file cannot double-count a row.
     """
-    wanted = {_item_key(it) for it in items}
+    wanted = {_item_key(it): it for it in items}
     results, done, stale = [], set(), 0
     if output_path is not None and Path(output_path).exists():
-        for line in Path(output_path).open(encoding="utf-8"):
-            if not line.strip():
-                continue
-            item = json.loads(line)
-            key = _item_key(item)
-            if key not in wanted or key in done:
-                stale += 1
-                continue
-            results.append(item)
-            done.add(key)
+        with Path(output_path).open(encoding="utf-8") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                key = _item_key(item)
+                if (key not in wanted or key in done
+                        or any(item.get(field) != wanted[key].get(field)
+                               for field in ("prompt", "response", "evaluation_scope"))):
+                    stale += 1
+                    continue
+                results.append(item)
+                done.add(key)
         if done:
             print(f"  [resume] {len(done)} items already graded, skipping.")
         if stale:
-            print(f"  [resume] ignored {stale} row(s) absent from this input.")
+            print(f"  [resume] ignored {stale} row(s) duplicated or not matching this input/scope.")
     out_file = None
     if output_path is not None:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)

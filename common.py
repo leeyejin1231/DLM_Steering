@@ -1,7 +1,7 @@
 """Shared constants, model loading and IO helpers for the steering experiments.
 
-MODEL_NAME and MASK_ID stay canonically in llada.py (the reference sampler);
-everything else shared lives here.
+Target constants come from models.py, selected before import by --model or
+DLM_MODEL. llada.py retains its standalone reference constants.
 """
 
 import glob
@@ -16,7 +16,19 @@ import torch
 
 from model_loading import load_pretrained
 
-from llada import MODEL_NAME, MASK_ID  # noqa: F401  (re-exported)
+from models import MODEL, MODEL_KEY, add_model_arg  # noqa: F401  (re-exported)
+
+MODEL_NAME = MODEL["name"]
+MASK_ID = MODEL["mask_id"]
+MASK_TOKEN = MODEL["mask_token"]     # text form, expanded into DIJA prompts
+EOT_ID = MODEL["eot_id"]             # closes the user turn in the chat template
+USER_HEADER_ID = MODEL["user_header_id"]
+NEWLINE_ID = MODEL["newline_id"]
+TURN_BREAKERS = tuple(MODEL["turn_breakers"])
+N_LAYERS = MODEL["n_layers"]
+OUT_DIR = MODEL["out_dir"]           # default home of fitted vectors/detectors
+DETECTOR_LAYER = MODEL["detector_layer"]   # None: detector bundle best_layer
+STEER_LAYERS = MODEL["steer_layers"]       # None: vector bundle best_layer
 
 # Serializes hook-registration -> model(x) -> hook-removal sections. Forward
 # hooks are module-global, so two concurrent forwards (exp.py --row-workers)
@@ -43,7 +55,7 @@ def block_index(layer):
 # Layer sweep shared by the vector and detector fits: hidden_states[1..31],
 # i.e. the outputs of blocks[0..30]. Both fits must sweep the same layers for
 # their "best layer" picks to be comparable.
-FIT_LAYERS = list(range(1, 32))
+FIT_LAYERS = list(range(1, N_LAYERS))
 
 DATA_DIR = Path(__file__).parent / "data"   # populated by data_downloader.py
 
@@ -107,8 +119,53 @@ def hf_glob(pattern, required=True):
     return []
 
 
-def load_llada(device=None):
-    """LLaDA tokenizer and eval-mode bf16 model on `device`.
+class ShiftedLogits(torch.nn.Module):
+    """Dream's lm_head is trained with an autoregressive shift: logits[:, p]
+    scores the token at position p+1. Dream's own sampler realigns them with
+    cat([logits[:, :1], logits[:, :-1]], 1) before reading masked slots, and
+    this wrapper does the same so model(x).logits[0, p] scores slot p exactly
+    as LLaDA's does. Hidden states are untouched (they are per-position
+    residual streams, which is what the detectors and steering hooks read),
+    so hooks are registered on .blocks of the wrapped model as usual.
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.inner = model
+
+    def forward(self, input_ids, **kwargs):
+        kwargs.setdefault("use_cache", False)
+        out = self.inner(input_ids, **kwargs)
+        logits = out.logits
+        out.logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
+        return out
+
+    @property
+    def device(self):
+        return self.inner.device
+
+    @property
+    def config(self):
+        return self.inner.config
+
+    @property
+    def blocks(self):
+        return model_blocks(self.inner)
+
+
+def model_blocks(model):
+    """The transformer block list hooks attach to (LLaDA, Dream, or a wrapper)."""
+    if hasattr(model, "blocks"):
+        return model.blocks
+    if hasattr(model, "model") and hasattr(model.model, "transformer"):
+        return model.model.transformer.blocks      # LLaDA
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        return model.model.layers                  # Dream (Qwen2 layout)
+    raise AttributeError("cannot locate transformer blocks on the model")
+
+
+def load_model(device=None):
+    """Selected target tokenizer and eval-mode bf16 model on `device`.
 
     device_map puts each checkpoint shard straight on the target device.
     `.to(device)` instead materialises the whole 16 GB state dict in CPU RAM
@@ -117,10 +174,18 @@ def load_llada(device=None):
     from transformers import AutoModel, AutoTokenizer
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    if MODEL["chat_control"]:
+        tokenizer.add_special_tokens({"additional_special_tokens": list(MODEL["chat_control"])},
+                                     replace_additional_special_tokens=False)
     model = load_pretrained(AutoModel, MODEL_NAME, trust_remote_code=True,
                                       torch_dtype=torch.bfloat16,
                                       device_map={"": device}).eval()
+    if MODEL["shift_logits"]:
+        model = ShiftedLogits(model).eval()
     return tokenizer, model
+
+
+load_llada = load_model  # Backward-compatible name for the selected target.
 
 
 def seed_all(seed):

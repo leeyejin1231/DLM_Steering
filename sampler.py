@@ -12,7 +12,7 @@ like the rest.
 
 import torch
 
-from common import MASK_ID, MODEL_LOCK, step_scale
+from common import MASK_ID, MODEL_LOCK, MODEL, step_scale
 from llada import PAD_ID, add_gumbel_noise
 
 
@@ -77,13 +77,22 @@ def commit_sample(x, logits, eligible, count, temperature, remasking,
 @torch.no_grad()
 def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
              block_length=32, temperature=0.0, remasking="low_confidence",
-             schedule="const", rng=None):
+             schedule="const", rng=None, decoder="block", alg="origin",
+             alg_temp=None, top_p=0.95, top_k=50):
     """Diffusion sampling driven by a Defender; None runs undefended.
 
     gen_length=0 runs pure infilling: the prompt's own mask slots (e.g. DIJA
     spans) form a single block denoised over `steps` steps, with no assistant
     suffix appended. rng: per-row torch.Generator; all sampling draws come
     from it so concurrent row workers stay bit-identical to serial runs."""
+    if decoder == "dream":
+        from dream_sampler import generate as generate_dream
+        return generate_dream(model, prompt_ids, defender, steps=steps,
+                              gen_length=gen_length, block_length=block_length,
+                              temperature=temperature, alg=alg, alg_temp=alg_temp,
+                              top_p=top_p, top_k=top_k, rng=rng)
+    if decoder != "block":
+        raise ValueError(f"Unknown decoder: {decoder}")
     if prompt_ids.ndim != 2 or prompt_ids.shape[0] != 1:
         raise ValueError("generate supports one prompt at a time")
     if gen_length < 0 or block_length <= 0 or steps <= 0:
@@ -126,7 +135,9 @@ def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
             if eligible.numel() == 0:
                 break
 
-            if defender is None:
+            if defender is None and MODEL["shift_logits"]:
+                logits = model(x).logits
+            elif defender is None:
                 ln_f = model.model.transformer.ln_f
                 with MODEL_LOCK:
                     handle = ln_f.register_forward_hook(
@@ -179,7 +190,8 @@ def generate(model, prompt_ids, defender=None, *, steps=128, gen_length=128,
 @torch.no_grad()
 def generate_batch(model, prompts, *, steps=128, gen_length=128,
                    block_length=32, temperature=0.0, remasking="low_confidence",
-                   schedule="const", pad_id=PAD_ID, rng=None):
+                   schedule="const", pad_id=PAD_ID, rng=None, decoder="block",
+                   alg="origin", alg_temp=None, top_p=0.95, top_k=50):
     """Batched undefended diffusion sampling over left-padded prompts.
 
     prompts: list of (1, L_i) token-id tensors. Rows are left-padded with
@@ -196,6 +208,11 @@ def generate_batch(model, prompts, *, steps=128, gen_length=128,
     Batched kernels reduce in a different order than the per-prompt path, so
     outputs are numerically equivalent but not guaranteed bit-identical.
     """
+    if decoder == "dream" or MODEL["shift_logits"]:
+        return [generate(model, prompt, steps=steps, gen_length=gen_length,
+                         block_length=block_length, temperature=temperature,
+                         decoder=decoder, alg=alg, alg_temp=alg_temp,
+                         top_p=top_p, top_k=top_k, rng=rng) for prompt in prompts]
     if gen_length < 0 or block_length <= 0 or steps <= 0:
         raise ValueError("gen_length must be >= 0; block length and steps must be positive")
     if gen_length and (gen_length % block_length or steps % (gen_length // block_length)):

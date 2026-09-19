@@ -15,9 +15,9 @@ metadata describes:
                (data/llada8b_wild_unsafe_only.csv -- the unsafe-verdict half
                of the original generation set; we only need its prompts)
 
-Samples are produced by the same sampler used at inference: the DIJA
-interleaved template with --gen-length 0 (prompt-span infilling only), so
-features come from the same committed-slot distribution the boundary audit
+Samples are produced by the same sampler used at inference: the plain prompt
+with no attack wrapper, so the committed slots the features pool over are
+the generated response suffix -- the same distribution the boundary audit
 reads. Both classes are judged, so the negative arm carries real GT labels
 rather than assumed-safe regenerations.
 
@@ -28,6 +28,8 @@ Usage:
     CUDA_VISIBLE_DEVICES=1,2 python -m steering.fit_response_detector \
         --groups 384 --guard-device cuda:2
 """
+
+from common import OUT_DIR, DETECTOR_LAYER, MODEL_KEY, add_model_arg
 
 import argparse
 import json
@@ -59,7 +61,8 @@ def generate_state(model, tokenizer, attacker, prompt, layer, device, *,
     x_in = encode_prompt(tokenizer, user_message, device)
     slots = (x_in == MASK_ID)[0].nonzero().flatten()
     x = generate(model, x_in, None, steps=steps, gen_length=gen_length,
-                 block_length=block_length, temperature=temperature)
+                 block_length=block_length, temperature=temperature,
+                 decoder="dream" if MODEL_KEY == "dream" else "block")
     if slots.numel() == 0:  # no prompt masks: the generated suffix is the response
         slots = torch.arange(x_in.shape[1], x.shape[1], device=x.device)
     filled = tokenizer.decode(x[0, slots], skip_special_tokens=True)
@@ -92,20 +95,18 @@ def fit_logistic(X, y, C, steps=400):
 
 def main():
     ap = argparse.ArgumentParser()
+    add_model_arg(ap)
     ap.add_argument("--csv", default=str(ROOT / "data/llada8b_wild_unsafe_only.csv"),
                     help="WildJailbreak prompt source (only the prompts are used)")
-    ap.add_argument("--out", default=str(ROOT / "outputs/response_detector.pt"))
-    ap.add_argument("--report", default=str(ROOT / "outputs/response_detector_report.json"))
+    ap.add_argument("--out", default=str(ROOT / OUT_DIR / "response_detector.pt"))
+    ap.add_argument("--report", default=str(ROOT / OUT_DIR / "response_detector_report.json"))
     ap.add_argument("--groups", type=int, default=384)
-    ap.add_argument("--layer", type=int, default=18)
+    ap.add_argument("--layer", type=int, default=DETECTOR_LAYER)
     ap.add_argument("--C", type=float, default=0.01)
     ap.add_argument("--threshold", type=float, default=0.5,
                     help="probability cutoff V3 triggers on")
-    ap.add_argument("--attack", choices=["none", "dija"], default="none",
-                    help="prompt wrapper used for the training samples")
     ap.add_argument("--steps", type=int, default=64)
-    ap.add_argument("--gen-length", type=int, default=None,
-                    help="default 0 for dija (span infilling only), else 128")
+    ap.add_argument("--gen-length", type=int, default=128)
     ap.add_argument("--block-length", type=int, default=32)
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--device", default="cuda:0")
@@ -113,16 +114,18 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
+    if args.layer is None:
+        bundle = torch.load(ROOT / OUT_DIR / "steer_detector.pt", map_location="cpu")
+        args.layer = int(bundle["best_layer"])
+
     df = pd.read_csv(args.csv)
     rng = np.random.default_rng(args.seed)
     rows = df.iloc[rng.permutation(len(df))[: args.groups]]
     print(f"{len(rows)} prompt groups from {args.csv}")
 
-    from Attacker import DIJA, NoAttack
-    attacker = DIJA() if args.attack == "dija" else NoAttack()
+    from Attacker import NoAttack
+    attacker = NoAttack()
     gen_length = args.gen_length
-    if gen_length is None:
-        gen_length = 0 if args.attack == "dija" else 128
 
     print(f"loading {MODEL_NAME} ...")
     tokenizer, model = load_llada(args.device)
@@ -185,7 +188,7 @@ def main():
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     torch.save({"weight": w, "bias": b, "threshold": threshold,
                 "layer": args.layer, "model": MODEL_NAME,
-                "pool": "mean_committed_template_slots",
+                "pool": "mean_committed_response_tokens",
                 "target": "visible_response_unsafe",
                 "source": "wildjailbreak_response_states",
                 "train_groups": [int(g) for g in groups],
@@ -194,7 +197,7 @@ def main():
         {"groups": int(len(X)), "n_train": int(len(X)),
          "layer": args.layer, "C": args.C,
          "auroc": auc, "threshold": threshold, "balanced_accuracy": bal_acc,
-         "attack": args.attack, "steps": args.steps,
+         "steps": args.steps,
          "gen_length": gen_length, "seed": args.seed}, indent=2))
     print(f"-> {args.out}\n-> {args.report}")
 

@@ -19,6 +19,8 @@ def generation_items(data, rows=None):
     if not is_iterative(data):
         return [{"index": r["index"], "prompt": r["prompt"],
                  "response": r["generation"],
+                 **({"evaluation_scope": data["evaluation_scope"]}
+                    if data.get("evaluation_scope") else {}),
                  **({"reference_response": r["reference_response"]}
                     if r.get("reference_response") else {})} for r in rows]
     items = []

@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 
 from Attacker import ATTACKERS
-from common import (MODEL_NAME, PROMPT_SOURCES, enable_reproducibility,
+from common import (MODEL_KEY, MODEL_NAME, add_model_arg, PROMPT_SOURCES, enable_reproducibility,
                     force_math_attention, load_llada, load_prompts,
                     plan_shards, read_jobs, run_eval_shards, run_persistent_jobs,
                     seed_all, strip_argv_flag, write_json)
@@ -47,6 +47,7 @@ def parse_args(argv=None):
     known, _ = pre.parse_known_args(argv)
 
     p = argparse.ArgumentParser(parents=[pre])
+    add_model_arg(p)
     p.add_argument("--source", choices=list(PROMPT_SOURCES), default="jbb_harmful",
                    help="harmful: jbb_harmful, advbench, harmbench, strongreject, xstest_unsafe; "
                         "benign (over-refusal): truthfulqa, xstest_safe, jbb_benign, wj_benign; "
@@ -64,6 +65,12 @@ def parse_args(argv=None):
                    help="Token selection strategy: DiffuGuard defaults to adaptive_step "
                         "(SAR); other defenses default to low_confidence.")
     p.add_argument("--schedule", default="const", choices=["const", "linear", "cosine"])
+    p.add_argument("--decoder", choices=["block", "dream"],
+                   default="dream" if MODEL_KEY == "dream" else "block")
+    p.add_argument("--alg", choices=["origin", "entropy", "maskgit_plus", "topk_margin"], default="origin")
+    p.add_argument("--alg-temp", type=float, default=None)
+    p.add_argument("--top-p", type=float, default=0.95)
+    p.add_argument("--top-k", type=int, default=50)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--reproduct", action="store_true",
                    help="Bitwise-deterministic generation: fixed seeds, deterministic "
@@ -84,6 +91,14 @@ def parse_args(argv=None):
     ATTACKERS[known.attack].add_args(p)
     DEFENDERS[known.defense].add_args(p)
     args = p.parse_args(argv)
+    if args.model != MODEL_KEY:
+        raise ValueError(f"Process loaded {MODEL_KEY}; launch exp.py --model {args.model} in a new process")
+    if args.model != "dream" and args.decoder == "dream":
+        raise ValueError("--decoder dream requires --model dream")
+    if args.model == "dream" and args.defense == "diffuguard":
+        raise ValueError("Bundled DiffuGuard supports LLaDA only; Dream needs its author's separate backend")
+    if not 0 < args.top_p <= 1 or args.top_k < 0 or (args.alg_temp is not None and args.alg_temp < 0):
+        raise ValueError("Invalid Dream top-p/top-k/alg-temp")
     return args
 
 
@@ -140,6 +155,16 @@ def main(argv=None, loaded=None):
         write_json(args.jobs + ".timing.json", report)
         print(f"Done in {report['seconds']:.2f}s")
         return
+    if args.defense == "ours":
+        required = [args.detector]
+        if args.steer != "none":
+            required.append(args.vector)
+        if args.remask == "v3":
+            required.append(args.response_detector)
+        missing = [p for p in required if not Path(p).is_file()]
+        if missing:
+            raise FileNotFoundError(f"{args.model} defense checkpoints missing: {', '.join(missing)}; "
+                                    f"prepare model-specific bundles using steering fitters --model {args.model}")
     try:
         ATTACKERS[args.attack].validate_inputs(args)
     except FileNotFoundError as exc:
@@ -173,6 +198,9 @@ def main(argv=None, loaded=None):
     gen_config = {"steps": args.steps, "gen_length": args.gen_length,
                   "block_length": args.block_length, "temperature": args.temperature,
                   "remasking": args.remasking, "schedule": args.schedule}
+    if args.decoder == "dream":
+        gen_config.update(decoder="dream", alg=args.alg, alg_temp=args.alg_temp,
+                          top_p=args.top_p, top_k=args.top_k or None)
 
     # One lane per row worker: attacker/defender instances hold per-response
     # state (PAIR convs, V3 recovery/audit), so interleaved rows each get a

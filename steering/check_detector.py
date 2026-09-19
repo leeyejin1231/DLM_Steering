@@ -16,6 +16,8 @@ Usage:
     CUDA_VISIBLE_DEVICES=1 python -m steering.check_detector
 """
 
+from common import OUT_DIR, DETECTOR_LAYER, MODEL_KEY, add_model_arg
+
 import argparse
 import json
 from pathlib import Path
@@ -31,8 +33,9 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--detector", default=str(ROOT / "outputs/steer_detector.pt"))
-    ap.add_argument("--out", default=str(ROOT / "outputs/detector_controlled.json"))
+    add_model_arg(ap)
+    ap.add_argument("--detector", default=str(ROOT / OUT_DIR / "steer_detector.pt"))
+    ap.add_argument("--out", default=str(ROOT / OUT_DIR / "detector_controlled.json"))
     ap.add_argument("--n", type=int, default=50)
     args = ap.parse_args()
 
