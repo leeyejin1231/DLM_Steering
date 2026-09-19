@@ -1,0 +1,116 @@
+{
+  "created": "2026-09-19T11:49:04.796010+00:00",
+  "status": "complete",
+  "cwd": "/home/work/DLM_Steering",
+  "commands": [
+    {
+      "argv": [
+        "/home/work/DLM_Steering/.venv/bin/python",
+        "eval_llamaguard.py",
+        "--in",
+        "/home/work/DLM_Steering/outputs/interactive/matrix_eval_matrix_llada_jbb_harmful_dija_ours_seed42/dija_combined_input.json",
+        "--out",
+        "/home/work/DLM_Steering/outputs/interactive/matrix_eval_matrix_llada_jbb_harmful_dija_ours_seed42/lg4_dija_combined.json",
+        "--batch-size",
+        "4",
+        "--gpus",
+        "3"
+      ],
+      "env": {},
+      "parameters": {
+        "input_original": "/home/work/DLM_Steering/outputs/interactive/matrix_llada_jbb_harmful_dija_ours_seed42/llada_jbb_harmful_dija_ours_seed42.json",
+        "input_sha256": "6d6d2910c13de2e0f467e9999004082de818b5d87607a1fa34bd8a1bc4953154",
+        "target_model": "GSAI-ML/LLaDA-8B-Instruct",
+        "generation_config": {
+          "steps": 128,
+          "gen_length": 128,
+          "block_length": 32,
+          "temperature": 0.2,
+          "remasking": "low_confidence",
+          "schedule": "const"
+        },
+        "attack": {
+          "attack": "dija",
+          "refined_file": "DIJA/run_jailbreakbench/refine_prompt/jailbreakbench_data_refined_Qwen.json",
+          "version": "Qwen",
+          "steps": 128
+        },
+        "rows": 100,
+        "evaluation_scope": "dija_combined",
+        "inp": "/home/work/DLM_Steering/outputs/interactive/matrix_eval_matrix_llada_jbb_harmful_dija_ours_seed42/dija_combined_input.json",
+        "out": "/home/work/DLM_Steering/outputs/interactive/matrix_eval_matrix_llada_jbb_harmful_dija_ours_seed42/lg4_dija_combined.json",
+        "jsonl": null,
+        "start": 0,
+        "n": null,
+        "gpus": "3",
+        "jobs": null,
+        "max_new_tokens": 20,
+        "batch_size": 4,
+        "with_reference": false
+      },
+      "status": "complete",
+      "returncode": 0
+    },
+    {
+      "argv": [
+        "/home/work/DLM_Steering/.venv/bin/python",
+        "run_sr_eval.py",
+        "--in",
+        "/home/work/DLM_Steering/outputs/interactive/matrix_eval_matrix_llada_jbb_harmful_dija_ours_seed42/dija_combined_input.json",
+        "--out",
+        "/home/work/DLM_Steering/outputs/interactive/matrix_eval_matrix_llada_jbb_harmful_dija_ours_seed42/gptoss_dija_combined.json",
+        "--auto-server",
+        "--gpus",
+        "3",
+        "--gpu",
+        "3",
+        "--model",
+        "gpt-oss:20b",
+        "--workers",
+        "4",
+        "--reasoning-effort",
+        "low",
+        "--num-predict",
+        "4096"
+      ],
+      "env": {},
+      "parameters": {
+        "input_original": "/home/work/DLM_Steering/outputs/interactive/matrix_llada_jbb_harmful_dija_ours_seed42/llada_jbb_harmful_dija_ours_seed42.json",
+        "input_sha256": "6d6d2910c13de2e0f467e9999004082de818b5d87607a1fa34bd8a1bc4953154",
+        "target_model": "GSAI-ML/LLaDA-8B-Instruct",
+        "generation_config": {
+          "steps": 128,
+          "gen_length": 128,
+          "block_length": 32,
+          "temperature": 0.2,
+          "remasking": "low_confidence",
+          "schedule": "const"
+        },
+        "attack": {
+          "attack": "dija",
+          "refined_file": "DIJA/run_jailbreakbench/refine_prompt/jailbreakbench_data_refined_Qwen.json",
+          "version": "Qwen",
+          "steps": 128
+        },
+        "rows": 100,
+        "evaluation_scope": "dija_combined",
+        "inp": "/home/work/DLM_Steering/outputs/interactive/matrix_eval_matrix_llada_jbb_harmful_dija_ours_seed42/dija_combined_input.json",
+        "out": "/home/work/DLM_Steering/outputs/interactive/matrix_eval_matrix_llada_jbb_harmful_dija_ours_seed42/gptoss_dija_combined.json",
+        "jsonl": null,
+        "start": 0,
+        "n": null,
+        "gpus": "3",
+        "model": "gpt-oss:20b",
+        "auto_server": true,
+        "gpu": 3,
+        "reasoning_effort": "low",
+        "workers": 4,
+        "num_predict": 4096,
+        "server": "GPU별 전용 서버 자동 시작/종료, 빈 포트 자동 배정",
+        "temperature": 0.0
+      },
+      "status": "complete",
+      "returncode": 0
+    }
+  ]
+}

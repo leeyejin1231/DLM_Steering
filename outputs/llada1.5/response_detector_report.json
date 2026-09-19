@@ -1,0 +1,12 @@
+{
+  "groups": 384,
+  "n_train": 384,
+  "layer": 18,
+  "C": 0.01,
+  "auroc": 0.9804033952891728,
+  "threshold": 0.5,
+  "balanced_accuracy": 0.9302382706951609,
+  "steps": 64,
+  "gen_length": 128,
+  "seed": 0
+}

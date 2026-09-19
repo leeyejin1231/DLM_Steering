@@ -207,6 +207,33 @@ def enable_reproducibility(seed=42):
     torch.use_deterministic_algorithms(True)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    # Deterministic mode NaN-fills every torch.empty() to expose reads of
+    # uninitialised memory. Nothing here reads any, so the fill is one wasted
+    # kernel per allocation (~3% of a forward) for bit-identical outputs.
+    torch.utils.deterministic.fill_uninitialized_memory = False
+
+
+def release_cublas_env(device):
+    """Drop CUBLAS_WORKSPACE_CONFIG once `device`'s cuBLAS handle exists.
+
+    torch 2.3 re-parses that variable with a freshly compiled std::regex on
+    EVERY matmul while it is set, which makes an 8B forward launch-bound: 73 ms
+    regardless of length against 37 ms without it, for bit-identical logits.
+    The variable only matters up to the first cuBLAS call -- torch checks it
+    once (a static) and from then on hands cuBLAS an explicit workspace on
+    every call, which is what makes the results deterministic. So run that
+    first call here, then unset it. Children spawned later set it again for
+    themselves in enable_reproducibility.
+
+    Call after enable_reproducibility and model loading, and only when every
+    model in the process lives on `device`: a handle created for another
+    device afterwards would size its workspace from the default instead.
+    """
+    if not torch.cuda.is_available() or "CUBLAS_WORKSPACE_CONFIG" not in os.environ:
+        return
+    probe = torch.ones(2, 2, device=device)
+    (probe @ probe).sum().item()
+    del os.environ["CUBLAS_WORKSPACE_CONFIG"]
 
 
 def force_math_attention():
@@ -495,6 +522,53 @@ def parse_gpu_ids(spec):
     if not gpu_ids:
         raise ValueError("--gpus needs at least one GPU id")
     return gpu_ids
+
+
+# Free memory one generation worker needs: bf16 8B weights (~16 GiB) plus
+# activations and the full-vocab logits of the longest prompts.
+WORKER_MIB = 19 * 1024
+
+
+def _free_mib(gpu_id):
+    """Free MiB on a physical GPU id/UUID, or None when nvidia-smi cannot say."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "-i", gpu_id, "--query-gpu=memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, check=True, timeout=10).stdout
+        return int(out.strip().splitlines()[0])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
+
+
+def worker_devices(spec, procs="1", limit=2):
+    """Expand --gpus into one entry per generation worker, round-robin.
+
+    Generations are identical for any layout: every row is seeded by its index,
+    so which worker runs it is irrelevant. Whether a second worker on a card
+    pays depends on how launch-bound decoding is. It was 2.0x while --reproduct
+    still paid the per-matmul regex (see release_cublas_env); with that gone a
+    ~330-token DIJA row keeps the GPU busy by itself and two workers measured
+    10% SLOWER (100 JBB rows on 2 cards: 281s vs 310s; --reproduct 291s vs
+    331s). Hence the default of 1; try 2 only for short prompts.
+
+    procs: workers per card, or "auto" to give each card as many as its free
+    memory holds (up to `limit`) -- a card another job is using gets fewer
+    instead of an OOM. The result interleaves cards ("0,1,0,1", never
+    "0,0,1,1") so a run with fewer tasks than workers still spreads out.
+    """
+    ids = parse_gpu_ids(spec)
+    if str(procs) == "auto":
+        free = [_free_mib(g) for g in ids]
+        counts = [1 if f is None else max(1, min(limit, f // WORKER_MIB))
+                  for f in free]
+    else:
+        if int(procs) < 1:
+            raise ValueError("--procs-per-gpu must be 'auto' or >= 1")
+        counts = [int(procs)] * len(ids)
+    return [g for rank in range(max(counts))
+            for g, n in zip(ids, counts) if rank < n]
 
 
 def plan_shards(spec, pairs=False):

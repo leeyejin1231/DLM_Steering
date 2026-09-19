@@ -20,7 +20,7 @@ require "$VECTOR" "$DETECTOR" outputs/gate_threshold.json data/llada8b_wild_unsa
 GATE=(--attack none --defense ours --steer fixed --remask none
       --detector "$DETECTOR" --detector-layer "$DETECTOR_LAYER"
       --vector "$VECTOR" --alpha "$ALPHA" --temperature 0 --block-length 32
-      --gpus "$GPUS")
+      --gpus "$GPUS" --procs-per-gpu "$PROCS_PER_GPU")
 
 # Each job shards its own prompt set across every card in $GPUS, so they run
 # one after another rather than pinned to a card each. Per-row seeding makes

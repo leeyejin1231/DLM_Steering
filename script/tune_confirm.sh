@@ -16,7 +16,7 @@ run() { # stem, args...
     local f="$OUT/$stem.json"
     printf '%s exp.py %s --gpus %s --out %s\n' "$PY" "$*" "$GPUS" "$f" >> "$LOG"
     [ -s "$f" ] && { echo "  skip $stem"; return 0; }
-    $PY exp.py "$@" --gpus "$GPUS" --out "$f" > "$OUT/$stem.log" 2>&1 \
+    $PY exp.py "$@" --gpus "$GPUS" --procs-per-gpu "${PROCS_PER_GPU:-1}" --out "$f" > "$OUT/$stem.log" 2>&1 \
         && echo "  ok   $stem" || { echo "  FAIL $stem"; tail -3 "$OUT/$stem.log"; }
 }
 

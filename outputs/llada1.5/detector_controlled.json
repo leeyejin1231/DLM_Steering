@@ -1,0 +1,20 @@
+{
+  "XSTest  unsafe vs safe": {
+    "by_layer": {
+      "18": 0.1548
+    },
+    "best_layer": 18,
+    "best_auroc": 0.1548,
+    "mean_chars_pos": 36.6,
+    "mean_chars_neg": 42.6
+  },
+  "JBB     harmful vs benign": {
+    "by_layer": {
+      "18": 0.528
+    },
+    "best_layer": 18,
+    "best_auroc": 0.528,
+    "mean_chars_pos": 85.2,
+    "mean_chars_neg": 71.0
+  }
+}

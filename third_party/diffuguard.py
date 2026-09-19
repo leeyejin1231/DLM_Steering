@@ -61,6 +61,36 @@ def add_gumbel_noise(logits, temperature):
     return logits.exp() / gumbel_noise
 
 
+def _sample_masked(logits, mask_index, temperature, need_confidence=True):
+    """(x0, model_confidence) computed only on the still-masked rows.
+
+    The original loop ran the float64 Gumbel transform, argmax and softmax over
+    every position x the full vocab each step (30-60 ms, as much as the forward
+    itself), then discarded all but the masked rows: x0 is overwritten by x and
+    the confidence by -inf everywhere else. Here the noise is still DRAWN for
+    the full tensor, so the RNG stream is untouched, but the arithmetic runs on
+    the masked rows alone. Every op involved is per-element or per-row, so
+    those rows get bit-identical values. Single-sequence batches only; callers
+    fall back to the original code otherwise.
+    """
+    rows = mask_index[0].nonzero(as_tuple=False).squeeze(1)
+    sub = logits[0, rows]
+    if temperature == 0:
+        noisy = sub
+    else:
+        noise = torch.rand(logits.shape, dtype=torch.float64, device=logits.device)
+        noisy = sub.to(torch.float64).exp() / ((-torch.log(noise[0, rows])) ** temperature)
+    picked = torch.argmax(noisy, dim=-1)
+    x0 = torch.zeros(logits.shape[:2], dtype=torch.long, device=logits.device)
+    x0[0, rows] = picked
+    confidence = None
+    if need_confidence:
+        p = F.softmax(sub, dim=-1)
+        confidence = torch.zeros(logits.shape[:2], dtype=p.dtype, device=logits.device)
+        confidence[0, rows] = torch.gather(p, -1, picked[:, None]).squeeze(-1)
+    return x0, confidence
+
+
 def get_num_transfer_tokens(mask_index, steps):
     mask_num = mask_index.sum(dim=1, keepdim=True)  # [B,1]
     steps = max(int(steps), 1)
@@ -301,11 +331,13 @@ def generate(
                 h_block = last_h[:, block_start:block_end, :]
                 first_step_block_hidden_mean = h_block.mean(dim=1).squeeze(0).detach()
 
-            logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-            x0 = torch.argmax(logits_with_noise, dim=-1)
-
-            p = F.softmax(logits, dim=-1)
-            model_confidence = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
+            if x.shape[0] == 1:
+                x0, model_confidence = _sample_masked(logits, mask_index, temperature)
+            else:
+                logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+                x0 = torch.argmax(logits_with_noise, dim=-1)
+                p = F.softmax(logits, dim=-1)
+                model_confidence = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
             R = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
 
             if remasking == "low_confidence":
@@ -407,13 +439,17 @@ def generate(
                             original_token_ids_at_remasked_pos[0]
                         ] -= suppression_value
 
-                    logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-                    x0 = torch.argmax(logits_with_noise, dim=-1)
-
-                    if remasking == "low_confidence":
-                        p = F.softmax(logits, dim=-1)
-                        x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
+                    if x.shape[0] == 1:
+                        x0, x0_p = _sample_masked(logits, mask_index, temperature,
+                                                  need_confidence=remasking == "low_confidence")
                     else:
+                        logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+                        x0 = torch.argmax(logits_with_noise, dim=-1)
+                        x0_p = None
+                        if remasking == "low_confidence":
+                            p = F.softmax(logits, dim=-1)
+                            x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
+                    if x0_p is None:
                         x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
 
                     # Drop-in only inside the current block

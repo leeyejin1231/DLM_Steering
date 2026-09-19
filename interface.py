@@ -1,4 +1,5 @@
 """Interactive experiment/evaluation launcher. Run: .venv/bin/python interface.py"""
+import argparse
 import datetime as dt
 import hashlib
 import json
@@ -60,6 +61,13 @@ def seeds(value):
     return values
 
 
+def worker_count(value):
+    value = value.strip().lower()
+    if value != 'auto' and integer(value, 1) > 2:
+        raise ValueError('auto, 1 또는 2를 입력하세요 (8B 모델은 작업자당 약 19GB).')
+    return value
+
+
 def gpu_ids(value):
     allowed = os.environ.get('CUDA_VISIBLE_DEVICES')
     if value.strip().lower() == 'all':
@@ -94,11 +102,100 @@ def command(script, args, config, env=None):
             'env': env or {}, 'parameters': config}
 
 
+def pap_preparation_command(source, seed, model, reproduct, gpus, cache):
+    args = ['--pap-generate', '--source', source, '--seed', str(seed),
+            '--pap-model', model, '--gpus', gpus, '--out', str(cache)]
+    if reproduct:
+        args.append('--reproduct')
+    return command('interface.py', args,
+                   {'source': source, 'seed': seed, 'model': model, 'gpus': gpus,
+                    'scope': '전체 원본 데이터셋; Better top5 균등 배정; 행당 1회',
+                    'temperature': 1, 'top_p': 1, 'max_new_tokens': 256,
+                    'reproduct': reproduct, 'out': str(cache)})
+
+
+def prepare_pap_sharded(source, seed, model, reproduct, gpus, cache):
+    """Resume one seed on one worker per GPU, then validate and merge caches."""
+    from common import load_prompts
+    from pap_common import identity, validate
+    rows = load_prompts(source)
+    devices = gpus.split(',')
+    expected = identity(source, seed, reproduct, model)
+    if cache.is_file():
+        current = json.loads(cache.read_text())
+        if current.get('model') != model:
+            raise ValueError(f'PAP 캐시 모델 불일치: {cache}')
+        validate(current, rows, source, seed, reproduct, complete=False)
+        if len(current['results']) == len(rows):
+            print(f'PAP 캐시 완료: {cache} ({len(rows)}행)', flush=True)
+            return
+    shard_dir = cache.parent / '.shards' / f'seed{seed}'
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    running = []
+    for index, gpu in enumerate(devices):
+        output = shard_dir / f'gpu{index}.json'
+        log_path = shard_dir / f'gpu{index}.log'
+        args = [str(PYTHON), '-u', 'pap_generate.py', '--source', source,
+                '--seed', str(seed), '--model', model, '--out', str(output),
+                '--shard-index', str(index), '--shard-count', str(len(devices))]
+        if reproduct:
+            args.append('--reproduct')
+        if cache.is_file():
+            args += ['--reuse', str(cache)]
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu,
+                   OMP_NUM_THREADS='4', MKL_NUM_THREADS='4', OPENBLAS_NUM_THREADS='4')
+        with log_path.open('w') as log:
+            process = subprocess.Popen(args, cwd=REPO, env=env,
+                                       stdout=log, stderr=subprocess.STDOUT,
+                                       start_new_session=True)
+        running.append((gpu, process, log_path, output))
+        print(f'GPU {gpu}: PAP 샤드 {index+1}/{len(devices)} 시작, 로그 {log_path}', flush=True)
+    previous_term = signal.getsignal(signal.SIGTERM)
+    def interrupted(*_):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, interrupted)
+    try:
+        try:
+            failed = [(gpu, process.wait(), log_path) for gpu, process, log_path, _ in running]
+        except BaseException:
+            for _, process, _, _ in running:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+            for _, process, _, _ in running:
+                process.wait()
+            raise
+    finally:
+        signal.signal(signal.SIGTERM, previous_term)
+    failed = [(gpu, code, log) for gpu, code, log in failed if code]
+    if failed:
+        raise RuntimeError(f'PAP 샤드 실패; 부분 캐시는 유지됩니다: {failed}')
+    merged = dict(expected)
+    entries = {}
+    for path in [cache, *(output for _, _, _, output in running)]:
+        if not path.is_file():
+            continue
+        data = json.loads(path.read_text())
+        if data.get('model') != model:
+            raise ValueError(f'PAP 샤드 모델 불일치: {path}')
+        valid = validate(data, rows, source, seed, reproduct, complete=False)
+        for row_index, entry in valid.items():
+            if row_index in entries and entries[row_index] != entry:
+                raise ValueError(f'PAP 행 {row_index} 충돌: {path}')
+            entries[row_index] = entry
+        if 'backend' in data:
+            merged['backend'] = data['backend']
+    merged['results'] = [entries[index] for index in sorted(entries)]
+    validate(merged, rows, source, seed, reproduct, complete=True)
+    save(cache, merged)
+    print(f'PAP 캐시 완료: {cache} ({len(entries)}/{len(rows)}행)', flush=True)
+
+
 def extra_args():
     text = ask('추가 CLI 옵션 (기본값 유지: Enter)', '')
     args = shlex.split(text)
     reserved = {'--attack', '--defense', '--source', '--seed', '--gpus', '--out', '--in',
-                '--jobs', '--n', '--start', '--pap-cache', '--reproduct', '--model'}
+                '--jobs', '--n', '--start', '--pap-cache', '--reproduct', '--model',
+                '--procs-per-gpu'}
     if any(token.startswith('--') and any(flag.startswith(token.split('=')[0]) for flag in reserved) for token in args):
         raise ValueError('공격·방어·입력·출력·시드·GPU·범위·캐시는 위 질문으로 설정하세요.')
     return args
@@ -132,9 +229,18 @@ def experiment_plan(folder):
     sources = ('jbb_harmful', 'harmbench', 'strongreject') if attack == 'dija' else PROMPT_SOURCES
     source = choose('데이터셋', [(x, x) for x in sources])
     selected_seeds = ask('시드 (여러 개: 42,43,44)', '42', seeds)
-    gpus = ask('GPU (all: 전체 자동 분할 / 0: 첫 GPU / 0,1: 지정)', os.environ.get('CUDA_VISIBLE_DEVICES', '0'), gpu_ids)
+    gpus = ask('GPU (all: 전체 자동 분할 / 0: 첫 GPU / 0,1: 지정)', 'all', gpu_ids)
     print(f'선택 GPU: {gpus} — 데이터를 작업자에 나누어 처리합니다.')
     devices = gpus.split(',')
+    procs = '1'
+    if attack != 'pair':
+        # 행 단위 시드라 작업자 수와 무관하게 출력은 같다. 330토큰 안팎의 행은 작업자
+        # 1개로 이미 GPU가 포화되어 2개가 약 10% 느렸으므로(실측) 기본값은 1.
+        procs = ask('GPU당 생성 작업자 수 (1 권장 / 2: 짧은 프롬프트용 / auto: 카드별 여유 메모리로 1~2개)', '1', worker_count)
+        from common import worker_devices
+        layout = worker_devices(gpus, procs)
+        print('작업자 배치: ' + ', '.join(f'GPU {g}×{layout.count(g)}' for g in dict.fromkeys(layout))
+              + (' (실행 시점의 여유 메모리로 다시 계산됩니다)' if procs == 'auto' else ''))
     if attack == 'pair' and (len(devices) % 2 or any(a == b for a, b in zip(devices[::2], devices[1::2]))):
         raise ValueError('PAIR는 타깃/공격자 GPU 쌍이 필요합니다. 예: 0,1 또는 0,1,2,3')
     reproduct = choose('결정적 실행 (--reproduct)', [(True, '사용'), (False, '사용 안 함')])
@@ -153,7 +259,8 @@ def experiment_plan(folder):
     options = ['--model', model_key, '--attack', attack, '--defense', defense, '--source', source,
                '--start', str(start), '--n', str(n), '--gen-length', str(length),
                '--steps', str(steps), '--block-length', str(block),
-               '--temperature', str(temperature), '--gpus', gpus]
+               '--temperature', str(temperature), '--gpus', gpus,
+               '--procs-per-gpu', procs]
     if model_key == 'dream':
         options += ['--decoder', 'dream', '--alg', choose('Dream 토큰 선택 방식', [(x, x) for x in ('origin', 'entropy', 'maskgit_plus', 'topk_margin')]),
                     '--top-p', str(ask('Top-p', 0.95, real)), '--top-k', str(ask('Top-k (0: 제한 없음)', 50, integer))]
@@ -191,24 +298,47 @@ def experiment_plan(folder):
                 raise ValueError(f'{model_key} 전용 방어 체크포인트가 없습니다: {missing}. steering 피팅 명령에 --model {model_key}를 사용해 준비하세요.')
         if attack == 'pap':
             cache = default_cache_path(source, seed)
+            ready = False
             if cache.exists():
-                data = load_cache(cache, source, seed, reproduct)
-                print(f'PAP 캐시 재사용: {cache} (공격 모델: {data["model"]})')
-            else:
-                print(f'PAP 캐시 없음: seed {seed}. 먼저 전체 데이터셋 공격 프롬프트를 준비합니다.')
+                try:
+                    data = load_cache(cache, source, seed, reproduct)
+                    print(f'PAP 캐시 재사용: {cache} (공격 모델: {data["model"]})')
+                    ready = True
+                except ValueError:
+                    print(f'PAP 캐시 미완성: {cache}. 저장된 행부터 이어서 준비합니다.')
+            if not ready:
                 model = ask('PAP 공격 생성 모델', 'Qwen/Qwen3-14B')
-                args = ['--source', source, '--seed', str(seed), '--model', model, '--out', str(cache)]
-                if reproduct:
-                    args += ['--reproduct']
-                commands.append(command('pap_generate.py', args,
-                                        {'source': source, 'seed': seed, 'model': model,
-                                         'scope': '전체 원본 데이터셋; Better top5 균등 배정; 행당 1회',
-                                         'temperature': 1, 'top_p': 1, 'max_new_tokens': 256,
-                                         'reproduct': reproduct, 'out': str(cache)},
-                                        {'CUDA_VISIBLE_DEVICES': gpus.split(',')[0]}))
+                commands.append(pap_preparation_command(source, seed, model,
+                                                        reproduct, gpus, cache))
             cfg.pap_cache = str(cache)
             argv += ['--pap-cache', str(cache)]
         commands.append(command('exp.py', argv, {**vars(cfg), 'model_name': MODELS[model_key]['name']}))
+    return commands, []
+
+
+def pap_plan():
+    from common import load_prompts
+    from pap_common import default_cache_path, load_cache
+    source = choose('PAP 데이터셋', [(x, x) for x in
+                    ('jbb_harmful', 'harmbench', 'strongreject')])
+    selected_seeds = ask('시드 (여러 개: 42,43,44)', '42,43,44', seeds)
+    gpus = ask('GPU (all: 전체 자동 분할 / 0,1: 지정)', 'all', gpu_ids)
+    reproduct = choose('결정적 실행 (--reproduct)', [(True, '사용'), (False, '사용 안 함')])
+    model = ask('PAP 공격 생성 모델', 'Qwen/Qwen3-14B')
+    rows = load_prompts(source)
+    commands = []
+    for seed in selected_seeds:
+        cache = default_cache_path(source, seed)
+        if cache.is_file():
+            try:
+                data = load_cache(cache, source, seed, reproduct)
+                if data['model'] == model and len(data['results']) == len(rows):
+                    print(f'PAP 캐시 완료: {cache}')
+                    continue
+            except ValueError:
+                pass
+        commands.append(pap_preparation_command(source, seed, model,
+                                                reproduct, gpus, cache))
     return commands, []
 
 
@@ -237,8 +367,8 @@ def evaluation_plan(folder):
     original = str(inp)
     if data.get('attack', {}).get('attack') == 'dija':
         scope = choose('DIJA 평가 범위', [
-            ('dija_combined', 'assistant 포함: 템플릿 채움 + assistant 답변'),
-            ('dija_template', 'assistant 제외: 템플릿 채움만')])
+            ('dija_combined', '전체: 템플릿 채움 + assistant 답변'),
+            ('dija_template', '템플릿 채움만')], default=2)
         required = ['filled_template'] + (['assistant_text'] if scope == 'dija_combined' else [])
         for row in data['results']:
             if row['generation'] == '[STEERING_ERROR]':
@@ -275,7 +405,7 @@ def evaluation_plan(folder):
     if len(cached_commands) == len(requested):
         return [cached_commands[k] for k in requested], []
     commands.extend(cached_commands.values())
-    gpu = ask('평가 GPU (all: 전체 자동 분할 / 0 또는 0,1: 지정)', os.environ.get('CUDA_VISIBLE_DEVICES', '0'), gpu_ids)
+    gpu = ask('평가 GPU (all: 전체 자동 분할 / 0 또는 0,1: 지정)', 'all', gpu_ids)
     print(f'선택 GPU: {gpu} — 평가 데이터를 나누어 처리합니다.')
     if judge in ('lg4', 'both') and 'lg4' not in cached_commands:
         batch = ask('LG4 배치 크기', 16, lambda x: integer(x, 1))
@@ -404,11 +534,32 @@ def main():
         from interface_progress import watch
         watch(sys.argv[2])
         return
+    if '--pap-generate' in sys.argv[1:]:
+        from pap_common import default_cache_path
+        parser = argparse.ArgumentParser(description='PAP 프롬프트를 GPU별로 분산 생성하고 합칩니다.')
+        parser.add_argument('--pap-generate', action='store_true')
+        parser.add_argument('--source', required=True,
+                            choices=('jbb_harmful', 'harmbench', 'strongreject'))
+        parser.add_argument('--seed', required=True, type=int)
+        parser.add_argument('--gpus', default='all')
+        parser.add_argument('--pap-model', default='Qwen/Qwen3-14B')
+        parser.add_argument('--reproduct', action='store_true')
+        parser.add_argument('--out')
+        args = parser.parse_args()
+        cache = Path(args.out).resolve() if args.out else default_cache_path(args.source, args.seed)
+        prepare_pap_sharded(args.source, args.seed, args.pap_model,
+                            args.reproduct, gpu_ids(args.gpus), cache)
+        return
     print('실험 / 평가 인터페이스 — Enter: 기본값, Ctrl+C: 취소')
-    mode = choose('작업 선택', [('experiment', '실험용'), ('evaluation', '평가용')])
+    mode = choose('작업 선택', [('experiment', '실험용'), ('evaluation', '평가용'),
+                                 ('pap', 'PAP 공격 프롬프트 준비')])
     stamp = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     folder = REPO/'outputs'/'interactive'/f'{stamp}_{mode}_{uuid.uuid4().hex[:8]}'
-    commands, prepared = experiment_plan(folder) if mode == 'experiment' else evaluation_plan(folder)
+    commands, prepared = (experiment_plan(folder) if mode == 'experiment' else
+                          pap_plan() if mode == 'pap' else evaluation_plan(folder))
+    if not commands:
+        print('요청한 PAP 캐시가 모두 완성돼 있습니다.')
+        return
     if commands and all(item.get('cached_result') for item in commands):
         from evaluation_cache import show_cached
         for item in commands:
@@ -424,7 +575,7 @@ def main():
         print(f'\n[{i}] 최종 파라미터 (CLI 기본값 포함)')
         print(json.dumps(item['parameters'], ensure_ascii=False, indent=2))
         print(format_command(item))
-    if ask('이 설정으로 실행하려면 yes 입력', 'no').lower() != 'yes':
+    if ask('이 설정으로 실행하려면 yes 입력', 'yes').lower() != 'yes':
         print('취소했습니다. 실행하거나 결과 파일을 만들지 않았습니다.')
         return
     execute(folder, commands, prepared)

@@ -73,7 +73,30 @@ def main():
             pass
 
     devices = plan_shards(args.gpus) if args.gpus else []
-    if devices:
+    grader_name = (f"StrongREJECT / {args.model} "
+                   f"(reasoning_effort={args.reasoning_effort})")
+    if devices and args.auto_server:
+        # Private servers: one work queue over every GPU instead of static
+        # shards, so items are graded while later servers are still starting.
+        from Evaluator import _resume_stream, _item_key, _run_graded
+        from ollama_runtime import OllamaServerPool
+        jsonl = Path(args.jsonl or Path(args.out).with_suffix(".jsonl"))
+        _, done, stream = _resume_stream(jsonl, items)
+        stream.close()
+
+        def make_grader(port):
+            return GptOss20b(model=args.model, port=port, workers=args.workers,
+                             reasoning_effort=args.reasoning_effort,
+                             num_predict=args.num_predict,
+                             timeout_sec=args.timeout_sec, start_container=False)
+
+        with OllamaServerPool(devices, args.out, args.model, args.workers, make_grader,
+                              sum(_item_key(it) not in done for it in items)) as pool:
+            graded = _run_graded(items, jsonl, pool.grade, workers=pool.capacity,
+                                 desc=f"SR-Ollama ({args.model})")
+        graded.sort(key=lambda r: r['index'])
+        summary = GptOss20b.summarize(graded)
+    elif devices:
         def extra(i, gpu):
             port = args.port + i
             return ["--port", port, "--gpu", gpu,
@@ -98,8 +121,6 @@ def main():
                 graded = grader.evaluate(items, output_path=Path(jsonl))
                 graded.sort(key=lambda r: r['index'])
                 summary = grader.summarize(graded)
-        grader_name = (f"StrongREJECT / {args.model} "
-                       f"(reasoning_effort={args.reasoning_effort})")
 
     payload = {
         "grader": grader_name,

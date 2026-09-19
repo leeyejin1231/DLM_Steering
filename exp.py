@@ -32,8 +32,9 @@ from pathlib import Path
 from Attacker import ATTACKERS
 from common import (MODEL_KEY, MODEL_NAME, add_model_arg, PROMPT_SOURCES, enable_reproducibility,
                     force_math_attention, load_llada, load_prompts,
-                    plan_shards, read_jobs, run_eval_shards, run_persistent_jobs,
-                    seed_all, strip_argv_flag, write_json)
+                    plan_shards, read_jobs, release_cublas_env, run_eval_shards,
+                    run_persistent_jobs, seed_all, strip_argv_flag, worker_devices,
+                    write_json)
 from Defender import DEFENDERS
 from experiment_row import RowExecution
 
@@ -78,6 +79,14 @@ def parse_args(argv=None):
     p.add_argument("--gpus", default=None,
                    help="Comma-separated GPU ids: keep a model on each GPU and "
                         "distribute row chunks as workers finish.")
+    p.add_argument("--procs-per-gpu", default="1",
+                   help="Generation workers per --gpus card: an integer, or "
+                        "'auto' for as many as each card's free memory holds "
+                        "(max 2). Generations are identical for any value "
+                        "(rows are seeded by index). Default 1: a second worker "
+                        "measured ~10%% slower on ~330-token rows, where one "
+                        "worker already saturates the GPU. Ignored by "
+                        "two-model attacks and --chunk-size 0.")
     p.add_argument("--jobs", help="JSON list of experiment CLI argument lists; "
                    "reuse models across conditions (each job supplies --out)")
     p.add_argument("--chunk-size", type=int, default=2,
@@ -91,6 +100,9 @@ def parse_args(argv=None):
     ATTACKERS[known.attack].add_args(p)
     DEFENDERS[known.defense].add_args(p)
     args = p.parse_args(argv)
+    if args.procs_per_gpu != "auto" and not (args.procs_per_gpu.isdigit()
+                                             and int(args.procs_per_gpu) >= 1):
+        raise ValueError("--procs-per-gpu must be 'auto' or a positive integer")
     if args.model != MODEL_KEY:
         raise ValueError(f"Process loaded {MODEL_KEY}; launch exp.py --model {args.model} in a new process")
     if args.model != "dream" and args.decoder == "dream":
@@ -110,6 +122,7 @@ def run_sharded(args, devices, argv=None):
     """
     if args.chunk_size and not ATTACKERS[args.attack].needs_second_device:
         job = strip_argv_flag(sys.argv[1:] if argv is None else argv, "--gpus")
+        job = strip_argv_flag(job, "--procs-per-gpu")
         # --out may have been left at its normal CLI default.
         job = [*strip_argv_flag(job, "--out"), "--out", args.out]
         report = run_persistent_jobs("generate", [job], ",".join(devices),
@@ -150,7 +163,8 @@ def main(argv=None, loaded=None):
     if args.jobs:
         if loaded is not None:
             raise ValueError("a worker cannot launch nested jobs")
-        report = run_persistent_jobs("generate", read_jobs(args.jobs), args.gpus,
+        gpus = args.gpus and ",".join(worker_devices(args.gpus, args.procs_per_gpu))
+        report = run_persistent_jobs("generate", read_jobs(args.jobs), gpus,
                                      chunk_size=args.chunk_size)
         write_json(args.jobs + ".timing.json", report)
         print(f"Done in {report['seconds']:.2f}s")
@@ -174,8 +188,14 @@ def main(argv=None, loaded=None):
     if args.gpus:
         # [] means one shard: plan_shards pinned this process to that GPU and
         # the run continues inline instead of spawning a single child.
-        devices = plan_shards(
-            args.gpus, pairs=ATTACKERS[args.attack].needs_second_device)
+        pairs = ATTACKERS[args.attack].needs_second_device
+        devices = ([] if pairs or not args.chunk_size else
+                   worker_devices(args.gpus, args.procs_per_gpu))
+        if len(devices) > len(set(devices)):
+            print("workers per GPU: " + ", ".join(
+                f"{g}x{devices.count(g)}" for g in dict.fromkeys(devices)))
+        else:
+            devices = plan_shards(args.gpus, pairs=pairs)
         if devices:
             return run_sharded(args, devices, argv)
     if args.reproduct:
@@ -190,6 +210,10 @@ def main(argv=None, loaded=None):
         tokenizer, model = loaded
     if args.reproduct:
         force_math_attention()
+        if (not ATTACKERS[args.attack].needs_second_device
+                and args.row_workers <= 1):
+            # One model, one thread, one device: see release_cublas_env.
+            release_cublas_env(model.device)
 
     all_rows = load_prompts(args.source)
     rows = all_rows[args.start: args.start + args.n]

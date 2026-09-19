@@ -3,9 +3,11 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import queue
 import shutil
 import socket
 import subprocess
+import threading
 import time
 import urllib.request
 
@@ -42,11 +44,18 @@ class GPUDiscoveryError(RuntimeError):
     pass
 
 
+class StartupCancelled(RuntimeError):
+    pass
+
+
 class OllamaServer:
-    def __init__(self, gpu, output, model='gpt-oss:20b', workers=4):
+    def __init__(self, gpu, output, model='gpt-oss:20b', workers=4, wanted=None):
         self.gpu, self.output, self.model, self.workers = str(gpu), Path(output), model, workers
         self.process = None
         self.log = None
+        # Asked once this server reaches the front of the startup queue; a pool
+        # whose work ran out while it waited answers False (see OllamaServerPool).
+        self.wanted = wanted
 
     def request(self, route, body=None, timeout=3):
         encoded = json.dumps(body).encode() if body is not None else None
@@ -63,6 +72,8 @@ class OllamaServer:
         print(f'GPU {self.gpu}: 서버 초기화 순서 대기 중…', flush=True)
         with lock_path.open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
+            if self.wanted is not None and not self.wanted():
+                raise StartupCancelled(f'GPU {self.gpu}: 남은 작업이 없어 서버를 띄우지 않습니다.')
             for attempt in range(1, 4):
                 try:
                     return self._start()
@@ -129,3 +140,87 @@ class OllamaServer:
                 self.process.wait()
         if self.log is not None:
             self.log.close()
+
+
+class OllamaServerPool:
+    """One server per GPU feeding a single work queue, usable as they come up.
+
+    Server startup has to be serialized (see OllamaServer.__enter__) and costs
+    ~20s per GPU, while a server grades about one item per second however many
+    requests it is given. Static shards therefore made an 8-GPU run wait ~150s
+    for its last server to grade a dozen items in 13s. Here every server that
+    is ready starts taking items at once, later ones join as they come up, and
+    one still queued when the remaining items are already in flight is never
+    started. A GPU whose server fails to start only costs its share of the
+    throughput instead of failing the whole run.
+
+    grade(chunk) is the _run_graded callback; run it with workers=capacity.
+    """
+
+    def __init__(self, gpus, output, model, workers, make_grader, n_items):
+        self.gpus, self.output, self.model = list(gpus), Path(output), model
+        self.workers, self.make_grader = workers, make_grader
+        self.capacity = len(self.gpus) * workers
+        self.slots = queue.Queue()
+        self.lock = threading.Lock()
+        self.outstanding, self.ready, self.failed = n_items, 0, 0
+        self.closing = False
+        self.servers, self.threads = [], []
+
+    def _wanted(self):
+        with self.lock:
+            return not self.closing and self.outstanding > self.ready
+
+    def _serve(self, index, gpu):
+        part = self.output.with_name(f'{self.output.stem}.gpu{index}{self.output.suffix}')
+        server = OllamaServer(gpu, part, self.model, self.workers, wanted=self._wanted)
+        with self.lock:
+            self.servers.append(server)
+        try:
+            server.__enter__()
+            grader = self.make_grader(server.port)
+        except BaseException as exc:
+            server.__exit__(None, None, None)
+            if not isinstance(exc, StartupCancelled) and not self.closing:
+                print(f'GPU {gpu}: 평가 서버를 사용할 수 없습니다: {exc}', flush=True)
+            with self.lock:
+                self.failed += 1
+                nothing_left = self.failed == len(self.gpus)
+            if nothing_left:    # unblock every waiting grade() so the run fails
+                for _ in range(self.capacity):
+                    self.slots.put(None)
+            return
+        with self.lock:
+            self.ready += self.workers
+        for _ in range(self.workers):
+            self.slots.put(grader)
+
+    def __enter__(self):
+        for index, gpu in enumerate(self.gpus):
+            thread = threading.Thread(target=self._serve, args=(index, gpu), daemon=True)
+            thread.start()
+            self.threads.append(thread)
+        return self
+
+    def grade(self, chunk):
+        grader = self.slots.get()
+        try:
+            if grader is None:
+                raise RuntimeError('사용 가능한 Ollama 평가 서버가 없습니다. *.ollama.log를 확인하세요.')
+            return grader._grade(chunk)
+        finally:
+            self.slots.put(grader)
+            with self.lock:
+                self.outstanding -= len(chunk)
+
+    def __exit__(self, *exc):
+        with self.lock:
+            self.closing = True
+            servers = list(self.servers)
+        for server in servers:      # also aborts a startup still in progress
+            if server.process is not None and server.process.poll() is None:
+                server.process.terminate()
+        for thread in self.threads:
+            thread.join()
+        for server in servers:
+            server.__exit__(None, None, None)

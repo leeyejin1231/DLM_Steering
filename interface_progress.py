@@ -28,7 +28,7 @@ class Progress:
             start, count = int(self.option('--start', 0)), int(self.option('--n', 20))
             self.expected = set(range(start, start+count))
             return count
-        if self.script == 'pap_generate.py':
+        if self.script == 'pap_generate.py' or (self.script == 'interface.py' and '--pap-generate' in self.argv):
             from common import load_prompts
             rows = load_prompts(self.option('--source'))
             self.expected = {r['index'] for r in rows}
@@ -87,6 +87,9 @@ class Progress:
         chunk_dir = out.parent/'.parts'/out.stem
         paths.update(chunk_dir.glob('chunk*.json'))
         paths.update(chunk_dir.glob('chunk*.log'))
+        if self.script == 'interface.py' and '--pap-generate' in self.argv:
+            seed = self.option('--seed')
+            paths.update((out.parent/'.shards'/f'seed{seed}').glob('gpu*.json'))
         ids = set()
         for path in paths:
             ids.update(self.read_ids(path))
@@ -111,6 +114,8 @@ class Progress:
         suffix = f' | 남은 시간 약 {eta/60:.1f}분' if eta is not None else ''
         label = {'exp.py':'응답 생성', 'pap_generate.py':'PAP 프롬프트 준비',
                  'eval_llamaguard.py':'LG4 채점', 'run_sr_eval.py':'GPT-OSS 채점'}.get(self.script,self.script)
+        if self.script == 'interface.py' and '--pap-generate' in self.argv:
+            label = 'PAP 프롬프트 준비'
         cfg = self.item['parameters']
         details = ', '.join(f'{k}={cfg[k]}' for k in ('source','attack','defense','seed')
                             if isinstance(cfg.get(k), (str,int)))

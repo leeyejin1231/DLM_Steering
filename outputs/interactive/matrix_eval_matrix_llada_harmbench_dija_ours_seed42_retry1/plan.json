@@ -1,0 +1,106 @@
+{
+  "created": "2026-09-19T12:55:58.116347+00:00",
+  "status": "running",
+  "cwd": "/home/work/DLM_Steering",
+  "commands": [
+    {
+      "argv": [
+        "/home/work/DLM_Steering/.venv/bin/python",
+        "eval_llamaguard.py",
+        "--in",
+        "/home/work/DLM_Steering/outputs/interactive/matrix_eval_matrix_llada_harmbench_dija_ours_seed42_retry1/dija_combined_input.json",
+        "--out",
+        "/home/work/DLM_Steering/outputs/interactive/matrix_eval_matrix_llada_harmbench_dija_ours_seed42_retry1/lg4_dija_combined.json"
+      ],
+      "env": {},
+      "parameters": {
+        "input_original": "/home/work/DLM_Steering/outputs/interactive/matrix_llada_harmbench_dija_ours_seed42/llada_harmbench_dija_ours_seed42.json",
+        "input_sha256": "9491c50c7925278ec7505f447ec4f063de1b685983348a2b50c20095360599e4",
+        "target_model": "GSAI-ML/LLaDA-8B-Instruct",
+        "generation_config": {
+          "steps": 128,
+          "gen_length": 128,
+          "block_length": 32,
+          "temperature": 0.2,
+          "remasking": "low_confidence",
+          "schedule": "const"
+        },
+        "attack": {
+          "attack": "dija",
+          "refined_file": "DIJA/run_harmbench/refine_prompt/harmbench_behaviors_text_all_refined_Qwen.json",
+          "version": "Qwen",
+          "steps": 128
+        },
+        "rows": 393,
+        "evaluation_scope": "dija_combined"
+      },
+      "cached_result": {
+        "path": "/home/work/DLM_Steering/outputs/interactive/matrix_eval_matrix_llada_harmbench_dija_ours_seed42/lg4_dija_combined.json",
+        "sha256": "c89c6c70ad2f86850b775089fe57d521a5965cada5b0ba15a70d758277f6d3d4"
+      },
+      "status": "complete",
+      "returncode": 0,
+      "reused": true
+    },
+    {
+      "argv": [
+        "/home/work/DLM_Steering/.venv/bin/python",
+        "run_sr_eval.py",
+        "--in",
+        "/home/work/DLM_Steering/outputs/interactive/matrix_eval_matrix_llada_harmbench_dija_ours_seed42_retry1/dija_combined_input.json",
+        "--out",
+        "/home/work/DLM_Steering/outputs/interactive/matrix_eval_matrix_llada_harmbench_dija_ours_seed42_retry1/gptoss_dija_combined.json",
+        "--auto-server",
+        "--gpus",
+        "0",
+        "--gpu",
+        "0",
+        "--model",
+        "gpt-oss:20b",
+        "--workers",
+        "4",
+        "--reasoning-effort",
+        "low",
+        "--num-predict",
+        "4096"
+      ],
+      "env": {},
+      "parameters": {
+        "input_original": "/home/work/DLM_Steering/outputs/interactive/matrix_llada_harmbench_dija_ours_seed42/llada_harmbench_dija_ours_seed42.json",
+        "input_sha256": "9491c50c7925278ec7505f447ec4f063de1b685983348a2b50c20095360599e4",
+        "target_model": "GSAI-ML/LLaDA-8B-Instruct",
+        "generation_config": {
+          "steps": 128,
+          "gen_length": 128,
+          "block_length": 32,
+          "temperature": 0.2,
+          "remasking": "low_confidence",
+          "schedule": "const"
+        },
+        "attack": {
+          "attack": "dija",
+          "refined_file": "DIJA/run_harmbench/refine_prompt/harmbench_behaviors_text_all_refined_Qwen.json",
+          "version": "Qwen",
+          "steps": 128
+        },
+        "rows": 393,
+        "evaluation_scope": "dija_combined",
+        "inp": "/home/work/DLM_Steering/outputs/interactive/matrix_eval_matrix_llada_harmbench_dija_ours_seed42_retry1/dija_combined_input.json",
+        "out": "/home/work/DLM_Steering/outputs/interactive/matrix_eval_matrix_llada_harmbench_dija_ours_seed42_retry1/gptoss_dija_combined.json",
+        "jsonl": null,
+        "start": 0,
+        "n": null,
+        "gpus": "0",
+        "model": "gpt-oss:20b",
+        "auto_server": true,
+        "gpu": 0,
+        "reasoning_effort": "low",
+        "workers": 4,
+        "num_predict": 4096,
+        "server": "GPU별 전용 서버 자동 시작/종료, 빈 포트 자동 배정",
+        "temperature": 0.0
+      },
+      "status": "running"
+    }
+  ]
+}

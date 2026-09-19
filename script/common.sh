@@ -56,6 +56,11 @@ if [ -z "${GPUS:-}" ]; then
 fi
 export GPUS
 
+# Generation workers per card (1, 2 or auto = by free memory). Generations are
+# identical either way; one worker already saturates the GPU on ~330-token
+# rows and a second measured ~10% slower, so 2 only pays on short prompts.
+export PROCS_PER_GPU="${PROCS_PER_GPU:-1}"
+
 # Cards for the jobs that want exactly one. Taken from $GPUS rather than fixed
 # at 0 and 1, so `CUDA_VISIBLE_DEVICES=4,5 script/...` keeps them on 4 and 5
 # instead of reaching for cards this shell was told not to touch.
