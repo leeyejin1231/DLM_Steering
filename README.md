@@ -83,11 +83,10 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python exp.py \
 
 ### DIJA
 
-먼저 refined 프롬프트가 있는 저장소를 준비합니다.
+DIJA의 Qwen refined 프롬프트 세 데이터셋은 `data/dija/`에 포함되어 있습니다.
+해당 자료의 출처는 [DIJA 저장소](https://github.com/ZichenWen1/DIJA)이며 라이선스는 `data/dija/LICENSE`에 있습니다.
 
 ```bash
-git clone https://github.com/ZichenWen1/DIJA.git
-
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python exp.py \
   --attack dija --defense diffuguard \
   --source jbb_harmful --n 100 --seed 42 --reproduct \

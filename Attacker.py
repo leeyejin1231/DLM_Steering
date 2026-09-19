@@ -140,13 +140,13 @@ class DIJA(NoAttack):
     name = "dija"
     needs_vanilla = True
 
-    def __init__(self, source, dija_dir="DIJA", version="Qwen", steps="auto"):
+    def __init__(self, source, dija_dir=None, version="Qwen", steps="auto"):
         if source not in DIJA_REFINED:
             raise ValueError(f"--attack dija has refined prompts only for "
                              f"{sorted(DIJA_REFINED)}, not {source!r}")
         rel, vanilla_key, refined_key = DIJA_REFINED[source]
         self.source, self.version, self.steps = source, version, steps
-        self.refined_file = Path(dija_dir) / rel.format(v=version)
+        self.refined_file = Path(dija_dir or Path(__file__).parent / "data/dija") / rel.format(v=version)
         items = json.loads(self.refined_file.read_text())
         self.refined = {it[vanilla_key].strip(): it[refined_key] for it in items}
 
