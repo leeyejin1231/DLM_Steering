@@ -1,0 +1,53 @@
+{
+  "created": "2026-09-20T09:40:15.558675+00:00",
+  "status": "complete",
+  "cwd": "/home/work/DLM_Steering",
+  "commands": [
+    {
+      "argv": [
+        "/home/work/DLM_Steering/.venv/bin/python",
+        "eval_llamaguard.py",
+        "--in",
+        "/home/work/DLM_Steering/outputs/interactive/20260919T192920Z_experiment_467a99a6/harmbench_prefix_none_seed44.json",
+        "--out",
+        "/home/work/DLM_Steering/outputs/interactive/20260920T094015Z_evaluation_5210e013/lg4.json",
+        "--batch-size",
+        "16",
+        "--gpus",
+        "0,1"
+      ],
+      "env": {},
+      "parameters": {
+        "input_original": "/home/work/DLM_Steering/outputs/interactive/20260919T192920Z_experiment_467a99a6/harmbench_prefix_none_seed44.json",
+        "input_sha256": "234421532440d738bbf8c25f4d858e8f07eb3f8feee20e49172906b80545e6af",
+        "target_model": "GSAI-ML/LLaDA-8B-Instruct",
+        "generation_config": {
+          "steps": 128,
+          "gen_length": 128,
+          "block_length": 32,
+          "temperature": 0.2,
+          "remasking": "low_confidence",
+          "schedule": "const"
+        },
+        "attack": {
+          "attack": "prefix",
+          "prefix_file": "attacks/prefix.txt"
+        },
+        "rows": 393,
+        "evaluation_scope": null,
+        "inp": "/home/work/DLM_Steering/outputs/interactive/20260919T192920Z_experiment_467a99a6/harmbench_prefix_none_seed44.json",
+        "out": "/home/work/DLM_Steering/outputs/interactive/20260920T094015Z_evaluation_5210e013/lg4.json",
+        "jsonl": null,
+        "start": 0,
+        "n": null,
+        "gpus": "0,1",
+        "jobs": null,
+        "max_new_tokens": 20,
+        "batch_size": 16,
+        "with_reference": false
+      },
+      "status": "complete",
+      "returncode": 0
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 {
   "created": "2026-09-19T19:29:51.131546+00:00",
-  "status": "running",
+  "status": "complete",
   "cwd": "/home/work/DLM_Steering",
   "commands": [
     {
@@ -132,7 +132,8 @@
         "row_workers": 1,
         "model_name": "GSAI-ML/LLaDA-8B-Instruct"
       },
-      "status": "running"
+      "status": "complete",
+      "returncode": 0
     },
     {
       "argv": [
@@ -196,7 +197,9 @@
         "chunk_size": 2,
         "row_workers": 1,
         "model_name": "GSAI-ML/LLaDA-8B-Instruct"
-      }
+      },
+      "status": "complete",
+      "returncode": 0
     }
   ]
 }

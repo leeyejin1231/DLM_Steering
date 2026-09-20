@@ -50,6 +50,7 @@ def matches(payload, expected, kind):
 
 def find_cached(repo, command, data):
     from attack_evaluation import generation_items
+    from interface_results import project_path
     kind = 'lg4' if Path(command['argv'][1]).name == 'eval_llamaguard.py' else 'gptoss'
     expected = generation_items(data)
     # Completed interactive results plus earlier experiment-level evaluations.
@@ -58,7 +59,8 @@ def find_cached(repo, command, data):
         try:
             for old in json.loads(path.read_text())['commands']:
                 if old.get('status') == 'complete' and Path(old['argv'][1]).name == Path(command['argv'][1]).name:
-                    candidates.add(Path(old['argv'][old['argv'].index('--out')+1]))
+                    # plan.json keeps absolute paths from the machine that ran the judge.
+                    candidates.add(project_path(old['argv'][old['argv'].index('--out')+1], repo/'outputs'))
         except (OSError, ValueError, KeyError, IndexError):
             continue
     for pattern in (f'*/*_{kind}.json', f'*_{kind}.json'):
