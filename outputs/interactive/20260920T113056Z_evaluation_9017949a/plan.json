@@ -1,0 +1,44 @@
+{
+  "created": "2026-09-20T11:30:56.556379+00:00",
+  "status": "complete",
+  "cwd": "/home/work/DLM_Steering",
+  "commands": [
+    {
+      "argv": [
+        "/home/work/DLM_Steering/.venv/bin/python",
+        "run_sr_eval.py",
+        "--in",
+        "/home/work/DLM_Steering/outputs/interactive/20260920T033308Z_experiment_2180b0a5/llada1.5_strongreject_prefix_diffuguard_seed42.json",
+        "--out",
+        "/home/work/DLM_Steering/outputs/interactive/20260920T113056Z_evaluation_9017949a/gptoss.json"
+      ],
+      "env": {},
+      "parameters": {
+        "input_original": "/home/work/DLM_Steering/outputs/interactive/20260920T033308Z_experiment_2180b0a5/llada1.5_strongreject_prefix_diffuguard_seed42.json",
+        "input_sha256": "ff86ca22a79ba1e0b01d68834b37ea85e3f3640ea7d068785f5e82d02330433d",
+        "target_model": "GSAI-ML/LLaDA-1.5",
+        "generation_config": {
+          "steps": 128,
+          "gen_length": 128,
+          "block_length": 32,
+          "temperature": 0.2,
+          "remasking": "adaptive_step",
+          "schedule": "const"
+        },
+        "attack": {
+          "attack": "prefix",
+          "prefix_file": "attacks/prefix.txt"
+        },
+        "rows": 313,
+        "evaluation_scope": null
+      },
+      "cached_result": {
+        "path": "/home/work/DLM_Steering/outputs/interactive/20260920T110111Z_evaluation_294bc2f9/gptoss.json",
+        "sha256": "8b2e97bf3e50b2ad8f9948a7101c855b12a5654e97493001d132d80661121c68"
+      },
+      "status": "complete",
+      "returncode": 0,
+      "reused": true
+    }
+  ]
+}

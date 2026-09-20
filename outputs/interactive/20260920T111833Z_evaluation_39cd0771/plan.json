@@ -1,0 +1,68 @@
+{
+  "created": "2026-09-20T11:18:34.678995+00:00",
+  "status": "complete",
+  "cwd": "/home/work/DLM_Steering",
+  "commands": [
+    {
+      "argv": [
+        "/home/work/DLM_Steering/.venv/bin/python",
+        "run_sr_eval.py",
+        "--in",
+        "/home/work/DLM_Steering/outputs/interactive/20260920T111833Z_evaluation_39cd0771/dija_template_input.json",
+        "--out",
+        "/home/work/DLM_Steering/outputs/interactive/20260920T111833Z_evaluation_39cd0771/gptoss_dija_template.json",
+        "--auto-server",
+        "--gpus",
+        "4,5",
+        "--gpu",
+        "4",
+        "--model",
+        "gpt-oss:20b",
+        "--workers",
+        "4",
+        "--reasoning-effort",
+        "low",
+        "--num-predict",
+        "4096"
+      ],
+      "env": {},
+      "parameters": {
+        "input_original": "/home/work/DLM_Steering/outputs/interactive/20260920T033227Z_experiment_b0bcf28b/llada1.5_strongreject_dija_none_seed42.json",
+        "input_sha256": "97fa52e5894875f10d0ce5f86ec4294f291243a65bb284ed1db201c3e1c1c50e",
+        "target_model": "GSAI-ML/LLaDA-1.5",
+        "generation_config": {
+          "steps": 128,
+          "gen_length": 128,
+          "block_length": 32,
+          "temperature": 0.2,
+          "remasking": "low_confidence",
+          "schedule": "const"
+        },
+        "attack": {
+          "attack": "dija",
+          "refined_file": "/home/work/DLM_Steering/data/dija/run_strongreject/refine_prompt/strongreject_data_refined_Qwen.json",
+          "version": "Qwen",
+          "steps": 128
+        },
+        "rows": 313,
+        "evaluation_scope": "dija_template",
+        "inp": "/home/work/DLM_Steering/outputs/interactive/20260920T111833Z_evaluation_39cd0771/dija_template_input.json",
+        "out": "/home/work/DLM_Steering/outputs/interactive/20260920T111833Z_evaluation_39cd0771/gptoss_dija_template.json",
+        "jsonl": null,
+        "start": 0,
+        "n": null,
+        "gpus": "4,5",
+        "model": "gpt-oss:20b",
+        "auto_server": true,
+        "gpu": 4,
+        "reasoning_effort": "low",
+        "workers": 4,
+        "num_predict": 4096,
+        "server": "GPU별 전용 서버 자동 시작/종료, 빈 포트 자동 배정",
+        "temperature": 0.0
+      },
+      "status": "complete",
+      "returncode": 0
+    }
+  ]
+}

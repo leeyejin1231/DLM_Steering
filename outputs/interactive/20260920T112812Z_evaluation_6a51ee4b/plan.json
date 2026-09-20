@@ -1,0 +1,46 @@
+{
+  "created": "2026-09-20T11:28:13.098391+00:00",
+  "status": "complete",
+  "cwd": "/home/work/DLM_Steering",
+  "commands": [
+    {
+      "argv": [
+        "/home/work/DLM_Steering/.venv/bin/python",
+        "run_sr_eval.py",
+        "--in",
+        "/home/work/DLM_Steering/outputs/interactive/20260920T112812Z_evaluation_6a51ee4b/dija_template_input.json",
+        "--out",
+        "/home/work/DLM_Steering/outputs/interactive/20260920T112812Z_evaluation_6a51ee4b/gptoss_dija_template.json"
+      ],
+      "env": {},
+      "parameters": {
+        "input_original": "/home/work/DLM_Steering/outputs/interactive/20260920T033227Z_experiment_b0bcf28b/llada1.5_strongreject_dija_none_seed44.json",
+        "input_sha256": "eddacccebe84a54a8d5474a608a9e804b5b4b2edee4b06ecb6d3dbf20d7f1c3a",
+        "target_model": "GSAI-ML/LLaDA-1.5",
+        "generation_config": {
+          "steps": 128,
+          "gen_length": 128,
+          "block_length": 32,
+          "temperature": 0.2,
+          "remasking": "low_confidence",
+          "schedule": "const"
+        },
+        "attack": {
+          "attack": "dija",
+          "refined_file": "/home/work/DLM_Steering/data/dija/run_strongreject/refine_prompt/strongreject_data_refined_Qwen.json",
+          "version": "Qwen",
+          "steps": 128
+        },
+        "rows": 313,
+        "evaluation_scope": "dija_template"
+      },
+      "cached_result": {
+        "path": "/home/work/DLM_Steering/outputs/interactive/20260920T105049Z_evaluation_4242edeb/gptoss_dija_template.json",
+        "sha256": "03dedc055aaa984d068b6d4f55b8b617349b8f8ed9881a39ae11c66115434f22"
+      },
+      "status": "complete",
+      "returncode": 0,
+      "reused": true
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 {
   "created": "2026-09-20T10:54:52.609895+00:00",
-  "status": "running",
+  "status": "complete",
   "cwd": "/home/work/DLM_Steering",
   "commands": [
     {
@@ -61,7 +61,8 @@
         "server": "GPU별 전용 서버 자동 시작/종료, 빈 포트 자동 배정",
         "temperature": 0.0
       },
-      "status": "running"
+      "status": "complete",
+      "returncode": 0
     }
   ]
 }
