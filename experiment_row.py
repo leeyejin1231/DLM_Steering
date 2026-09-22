@@ -11,7 +11,7 @@ from common import ERROR_SENTINEL, MASK_ID, encode_prompt
 
 def graded_fields(row):
     """Carry dataset answer keys through to the utility evaluators."""
-    return {key: row[key] for key in ("task", "answer", "subject", "category")
+    return {key: row[key] for key in ("task", "answer", "subject", "category", "level")
             if key in row}
 
 

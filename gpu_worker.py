@@ -6,6 +6,7 @@ import queue
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from dlm_steering.runtime.progress import CHILD_PROGRESS_ENV
 
 
 class GPUJobPool:
@@ -21,7 +22,7 @@ class GPUJobPool:
             for gpu in self.gpus:
                 process = subprocess.Popen(
                     [sys.executable, str(Path(__file__).resolve())],
-                    env=dict(os.environ, CUDA_VISIBLE_DEVICES=gpu),
+                    env={**os.environ, 'CUDA_VISIBLE_DEVICES': gpu, **CHILD_PROGRESS_ENV},
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                     text=True, bufsize=1,
                 )

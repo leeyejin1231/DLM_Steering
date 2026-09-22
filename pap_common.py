@@ -7,6 +7,7 @@ from pathlib import Path
 
 from attack_prompts import PAP_BETTER_TEMPLATES_PATH
 from common import load_prompts
+from dlm_steering.runtime.utils import atomic_write_json
 
 TOP5 = ("Logical Appeal", "Authority Endorsement", "Misrepresentation",
         "Evidence-based Persuasion", "Expert Endorsement")
@@ -63,9 +64,7 @@ def digest(path):
 def save(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + '.tmp')
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
-    tmp.replace(path)
+    atomic_write_json(path, data)
 
 
 def identity(source, seed, reproduct, model):

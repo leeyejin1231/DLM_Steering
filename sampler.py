@@ -48,6 +48,16 @@ def commit_sample(x, logits, eligible, count, temperature, remasking,
     # [1, n, vocab] (ln_f hook); identical when every position is eligible.
     sub = logits[0, eligible] if logits.shape[1] == x.shape[1] else logits[0]
     predicted = add_gumbel_noise(sub, temperature, rng).argmax(-1)
+    if k == n and remasking in ("low_confidence", "random"):
+        # Every candidate is committed, so confidence and ranking are unused.
+        # Preserve random remasking's draws for subsequent steps and blocks.
+        if remasking == "random":
+            torch.rand(n, dtype=torch.float64, device=x.device, generator=rng)
+        positions = torch.arange(x.shape[1], device=x.device)
+        rows = torch.searchsorted(eligible, positions).clamp_(max=n - 1)
+        chosen = eligible[rows] == positions
+        x[0].copy_(torch.where(chosen, predicted[rows], x[0]))
+        return eligible[:0]
     if remasking == "low_confidence":
         sub64 = sub.to(torch.float64)
         confidence = (sub64 - sub64.logsumexp(dim=-1, keepdim=True)).exp()

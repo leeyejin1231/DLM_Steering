@@ -51,7 +51,8 @@ MODELS = {
         family="llada", name="GSAI-ML/LLaDA-1.5",
         mask_id=126336, mask_token="<|mdm_mask|>", eot_id=126348,
         n_layers=32, chat_control=(),
-        out_dir="outputs/llada1.5", detector_layer=18, steer_layers="25",
+        # steer layer: single-layer sweep on jbb prefix/DIJA, seeds 42-44 (22 < 24 < 23 < 25)
+        out_dir="outputs/llada1.5", detector_layer=18, steer_layers="22",
         shift_logits=False, user_header_id=126347, newline_id=198,
         turn_breakers=(126080, 126081, 126346, 126347, 126348),
     ),

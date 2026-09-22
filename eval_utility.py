@@ -1,4 +1,4 @@
-"""Score exp.py generations on the graded sources (mmlu, gsm8k, truthfulqa_mc).
+"""Score exp.py generations on the graded sources (mmlu, gsm8k, math500, truthfulqa_mc).
 
 Each result row carries "task" and "answer" from common.load_utility_prompts;
 this extracts the model's answer from "generation" and reports accuracy, plus
@@ -59,6 +59,72 @@ def same_number(pred, gold):
         return False
 
 
+def last_boxed(text):
+    """Contents of the last \\boxed{...} (or \\fbox{...}), braces balanced; None if absent."""
+    start = max(text.rfind("\\boxed"), text.rfind("\\fbox"))
+    if start < 0:
+        return None
+    i = text.find("{", start)
+    if i < 0:
+        return None
+    depth = 0
+    for j in range(i, len(text)):
+        depth += {"{": 1, "}": -1}.get(text[j], 0)
+        if depth == 0:
+            return text[i + 1:j]
+    return None   # unbalanced: the answer was cut off by gen_length
+
+
+def _fix_fracs(s):
+    # \frac12 -> \frac{1}{2}, \frac1{72} -> \frac{1}{72}
+    parts = s.split("\\frac")
+    out = parts[0]
+    for part in parts[1:]:
+        out += "\\frac"
+        if part[:1] == "{" or len(part) < 2:
+            out += part
+            continue
+        a, b, rest = part[0], part[1], part[2:]
+        out += f"{{{a}}}{b}{rest}" if b == "{" else f"{{{a}}}{{{b}}}{rest}"
+    return out
+
+
+def normalize_math(s):
+    """The MATH repository's is_equiv normalization (Hendrycks et al. 2021):
+    strip spacing/units/formatting so equal answers compare as equal strings."""
+    s = s.strip().replace("\n", "").replace("\\!", "")
+    s = s.replace("\\\\", "\\").replace("tfrac", "frac").replace("dfrac", "frac")
+    s = s.replace("\\left", "").replace("\\right", "")
+    s = s.replace("^{\\circ}", "").replace("^\\circ", "")
+    s = s.replace("\\$", "").replace("$", "")
+    if "\\text{ " in s and s.split("\\text{ ")[0].strip():     # "5 \text{ cm}" -> "5"
+        s = s.split("\\text{ ")[0]
+    s = re.sub(r"\\text\{\s*([^{}]*)\}", r"\1", s)       # \text{Evelyn} -> Evelyn
+    s = re.sub(r"\\mbox\{\s*([^{}]*)\}", r"\1", s)
+    s = s.replace("\\%", "").replace("%", "")
+    s = s.replace(" .", " 0.").replace("{.", "{0.")
+    if s.startswith("."):
+        s = "0" + s
+    if len(s.split("=")) == 2 and len(s.split("=")[0]) <= 2:   # "x = 5" -> "5"
+        s = s.split("=")[1]
+    s = re.sub(r"\\sqrt(\w)", r"\\sqrt{\1}", s)
+    s = s.replace(" ", "")
+    s = _fix_fracs(s)
+    if re.fullmatch(r"-?\d+/\d+", s):                        # 1/2 -> \frac{1}{2}
+        a, b = s.split("/")
+        s = f"\\frac{{{a}}}{{{b}}}"
+    if s == "0.5":
+        s = "\\frac{1}{2}"
+    if re.fullmatch(r"-?[\d,]+(\.\d+)?", s):
+        s = s.replace(",", "")
+    return s.rstrip(".")
+
+
+def same_math(pred, gold):
+    a, b = normalize_math(pred), normalize_math(gold)
+    return a == b or same_number(a, b)
+
+
 def score_row(row):
     task, gold, gen = row["task"], row["answer"], row.get("generation", "")
     if gen == ERROR_SENTINEL:
@@ -69,6 +135,9 @@ def score_row(row):
     if task == "gsm8k":
         pred = extract_number(gen)
         correct = pred is not None and same_number(pred, gold)
+    elif task == "math500":
+        pred = last_boxed(gen)
+        correct = pred is not None and same_math(pred, gold)
     else:
         n_choices = len(re.findall(r"^[A-P]\. ", row["prompt"], flags=re.MULTILINE))
         pred = extract_letter(gen, n_choices)
@@ -88,7 +157,8 @@ def summarize(all_rows):
     summary = {"task": all_rows[0]["task"] if all_rows else None, "total": total,
                "correct": correct, "accuracy": round(correct / total, 4) if total else 0.0,
                "unparsed": unparsed, "n_errors": n_errors}
-    group_key = {"mmlu": "subject", "truthfulqa_mc": "category"}.get(summary["task"])
+    group_key = {"mmlu": "subject", "math500": "subject",
+                 "truthfulqa_mc": "category"}.get(summary["task"])
     if group_key:
         groups = collections.defaultdict(lambda: [0, 0])
         for r in rows:
@@ -111,7 +181,7 @@ def main():
     missing = [r["index"] for r in rows if "task" not in r or "answer" not in r]
     if missing:
         raise SystemExit(f"{len(missing)} rows lack task/answer fields; was --source a "
-                         f"utility set (mmlu, gsm8k, truthfulqa_mc)? e.g. index {missing[:5]}")
+                         f"utility set (mmlu, gsm8k, math500, truthfulqa_mc)? e.g. index {missing[:5]}")
     scored = [{**r, **score_row(r)} for r in rows]
     summary = summarize(scored)
     payload = {"source": args.inp, "config": data.get("config"), "attack": data.get("attack"),

@@ -16,7 +16,8 @@ from pathlib import Path
 
 from common import plan_shards, run_eval_shards
 from Evaluator import GptOss20b
-from attack_evaluation import generation_items, is_iterative, summarize_attack
+from attack_evaluation import generation_items
+from dlm_steering.evaluation.results import build_evaluation_payload
 
 
 def parse_args(argv=None):
@@ -44,9 +45,14 @@ def parse_args(argv=None):
                    help="Concurrent requests per ollama server. The run prints "
                         "the effective concurrency it actually achieved; raise "
                         "this only while that number still tracks it.")
+    p.add_argument("--startup-workers", type=int, default=2,
+                   help="Concurrent private server initializations (default 2). "
+                        "CUDA discovery stays serialized; 1 serializes all loading.")
     p.add_argument("--num-predict", type=int, default=1000, help="Maximum judge output tokens")
     p.add_argument("--timeout-sec", type=float, default=None, help="Ollama request timeout (auto server: 600s; otherwise: 120s)")
     args = p.parse_args(argv)
+    if args.startup_workers < 1:
+        p.error("--startup-workers must be >= 1")
     if args.timeout_sec is None:
         args.timeout_sec = 600 if args.auto_server else 120
     return args
@@ -91,7 +97,8 @@ def main():
                              timeout_sec=args.timeout_sec, start_container=False)
 
         with OllamaServerPool(devices, args.out, args.model, args.workers, make_grader,
-                              sum(_item_key(it) not in done for it in items)) as pool:
+                              sum(_item_key(it) not in done for it in items),
+                              startup_workers=args.startup_workers) as pool:
             graded = _run_graded(items, jsonl, pool.grade, workers=pool.capacity,
                                  desc=f"SR-Ollama ({args.model})")
         graded.sort(key=lambda r: r['index'])
@@ -122,19 +129,10 @@ def main():
                 graded.sort(key=lambda r: r['index'])
                 summary = grader.summarize(graded)
 
-    payload = {
-        "grader": grader_name,
-        "source": args.inp,
-        "source_model": data.get("model"),
-        "source_config": data.get("config"),
-        "evaluation_scope": data.get("evaluation_scope"),
-        "summary": summary,
-        "results": graded,
-    }
-    if is_iterative(data):
-        payload["attempt_summary"] = summary
-        summary, outcomes = summarize_attack(rows, graded, "gpt-oss-20b")
-        payload.update(summary=summary, row_results=outcomes)
+    payload = build_evaluation_payload(
+        data, rows, graded, summary, source=args.inp,
+        kind="gpt-oss-20b", grader=grader_name)
+    summary = payload["summary"]
     Path(args.out).write_text(json.dumps(payload, ensure_ascii=False, indent=2))
 
     print(f"\n-> {args.out}")

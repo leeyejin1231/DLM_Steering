@@ -20,6 +20,10 @@ AdvBench·HarmBench 다운로드에는 Hugging Face 데이터셋 접근 동의�
 
 `--n` 기본값은 **20**입니다. 전체 평가 시 위 행 수를 명시하세요. PAP과 PAIR는 원본 데이터셋을 사용하고, DIJA만 별도 refined 프롬프트를 사용합니다.
 
+`interface.py`의 응답 생성·PAP 준비·채점 진행률은 작업별 tqdm 하나로 표시합니다.
+자식 작업의 진행 막대는 숨기고 상세 출력은 작업 로그에 보관합니다.
+`exp.py`·`pap_generate.py`를 직접 실행할 때도 tqdm을 사용합니다.
+
 ### 방어 준비
 
 | `--defense` | 설명 | 준비물 |
@@ -143,23 +147,54 @@ PAIR는 타깃 공격자 모델용으로 GPU 2장을 사용합니다.
 - **LG4**: Llama-Guard-4의 unsafe 판정으로 ASR을 계산합니다.
 - **GPT-OSS**: Ollama의 `gpt-oss:20b`로 StrongREJECT 채점합니다.
 
+로컬 Ollama를 자동으로 실행해 여러 GPU에서 채점하려면 `run_sr_eval.py`에
+`--auto-server --gpus 0,1 --startup-workers 2`를 지정합니다. 기본적으로 서버
+2개까지 초기화하며, CUDA 탐색은 순서대로 하고 모델 로드는 겹쳐 실행합니다.
+일시적인 초기화 실패는 최대 2회 재시도합니다. `--startup-workers 1`은
+모델 로드까지 모두 순서대로 실행합니다. `--workers`는 로드 후 서버당 채점 동시성입니다.
+
 ### 과잉 거절·일반 능력
 
 | 목적 | 생성 시 `--source` | 평가 명령 |
 |---|---|---|
-| 과잉 거절 | `truthfulqa`, `xstest_safe` 등 | `python -m steering.judge_refusal --in <응답.json> --out <평가.json>` |
-| 일반 능력 | `mmlu`, `gsm8k`, `truthfulqa_mc` | `python eval_utility.py --in <응답.json> --out <평가.json>` |
+| 과잉 거절 | `truthfulqa`, `xstest_safe` 등 | `python eval_refusal.py --in <응답.json> --out <평가.json> --auto-server --gpus 0,1` (`interface.py` 평가 메뉴의 Over-refusal) |
+| 일반 능력 | `mmlu`, `gsm8k`, `math500`, `truthfulqa_mc` | `python eval_utility.py --in <응답.json> --out <평가.json>` (`interface.py` 평가 메뉴의 성능) |
+
+`gsm8k`, `math500`, `truthfulqa`는 `python data_downloader.py gsm8k math500 truthfulqa`로 `data/`에 받아 둔다. `math500`은 마지막 `\boxed{}`를 MATH 저장소의 정규화 규칙으로 정답과 비교한다.
 
 이 평가는 `--attack none`으로 생성하고, 같은 데이터 범위에서 `--defense none`과 비교합니다. 위 명령의 Python도 `.venv/bin/python`을 사용하세요.
 
-## 코드 위치
+## 코드 구조
 
-| 파일 | 역할 |
+공격·방어·평가·실행 지원 코드는 `dlm_steering/` 아래에서 역할별로 관리합니다.
+기존 CLI 명령과 `Attacker`, `Defender`, `Evaluator`, `common`, `interface` 등의
+import 경로는 호환 모듈로 유지합니다. 구현을 수정할 때는 아래 패키지에서 수정하세요.
+
+```text
+dlm_steering/
+├── paths.py          # 저장소·데이터 공통 경로
+├── attacks/          # 공격 인터페이스, prefix, DIJA, PAP, PAIR
+├── defenses/         # 방어 인터페이스, steering, V3 복구, baseline
+├── evaluation/       # 평가기, JSONL 재개, 공격별 집계, 캐시, 결과 형식
+├── runtime/          # 모델 로딩, 데이터, 재현성, GPU 작업 분배, JSON 저장
+└── launcher/         # 대화형 입력, 실행 계획, 프로세스 실행, 진행률·결과 표시
+```
+
+| 파일·디렉터리 | 역할 |
 |---|---|
+| `interface.py` | 대화형 실험·평가 CLI 진입점 |
 | `exp.py` / `experiment_row.py` | 실험 실행 / 행별 응답·결과 기록 |
-| `Attacker.py` / `Defender.py` | 공격 / 방어 정책 |
+| `eval_llamaguard.py` / `run_sr_eval.py` | LG4 / GPT-OSS 평가 CLI 진입점 |
 | `pap_generate.py` / `pap_common.py` | PAP 공격 생성 / 기법 배정·캐시 검증 |
-| `sampler.py` | 공통 디퓨전 샘플러 |
-| `Evaluator.py` / `attack_evaluation.py` | 채점 / 공격 시도별 ASR 집계 |
+| `sampler.py` / `dream_sampler.py` | LLaDA / Dream 디퓨전 샘플러 |
+| `models.py` / `model_loading.py` | 타깃 모델 설정 / 사전학습 가중치 로딩 지원 |
+| `ollama_runtime.py` | 전용 Ollama 서버와 시작·종료 관리 |
 | `steering/` | 벡터·검출기 학습과 거절 평가. `python -m steering.<모듈>`로 실행 |
+| `script/` | 실험 조합 실행·운영 스크립트 |
+| `data/` / `attacks/` | 데이터 / 고정 공격 프롬프트 자원 |
+| `outputs/` | 생성·평가 결과와 방어 체크포인트 |
 | `third_party/` | 프로젝트에 포함한 DiffuGuard 생성기와 출처 정보 |
+
+LG4와 GPT-OSS의 결과 JSON 구성은 `evaluation/results.py`, JSONL 이어받기는
+`evaluation/streaming.py`에서 공유합니다. 실행 계획과 PAP 캐시의 원자적 JSON
+저장은 `runtime/utils.py`, 작업자 스레드 환경 설정은 `launcher/storage.py`에 모았습니다.

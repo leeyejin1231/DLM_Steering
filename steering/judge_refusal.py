@@ -36,6 +36,9 @@ def main():
                     help="Comma-separated GPU ids (e.g. 0,1): one ollama "
                          "container per GPU on --port+i, shard items and merge")
     ap.add_argument("--model", default="gpt-oss:20b")
+    ap.add_argument("--auto-server", action="store_true",
+                    help="Manage private local Ollama servers (one per --gpus id) "
+                         "instead of podman containers, as run_sr_eval.py does.")
     ap.add_argument("--port", type=int, default=50001)
     ap.add_argument("--gpu", type=int, default=1)
     ap.add_argument("--container", default=None,
@@ -61,7 +64,30 @@ def main():
 
     t_start = time.time()
     devices = plan_shards(args.gpus) if args.gpus else []
-    if devices:
+    if args.auto_server and args.judge == "ollama":
+        # Private servers and one work queue over every GPU, as in run_sr_eval.py.
+        from Evaluator import _resume_stream, _item_key, _run_graded
+        from ollama_runtime import OllamaServerPool
+        items = items[args.start:
+                      args.start + args.n if args.n is not None else None]
+        jsonl = Path(args.jsonl or Path(args.out).with_suffix(".jsonl"))
+        _, done, stream = _resume_stream(jsonl, items)
+        stream.close()
+
+        def make_grader(port):
+            return Refusal(model=args.model, port=port, workers=args.workers,
+                           reasoning_effort=args.reasoning_effort,
+                           num_predict=args.num_predict, timeout_sec=600,
+                           start_container=False)
+
+        with OllamaServerPool(devices or [str(args.gpu)], args.out, args.model,
+                              args.workers, make_grader,
+                              sum(_item_key(it) not in done for it in items)) as pool:
+            judged = _run_graded(items, jsonl, pool.grade, workers=pool.capacity,
+                                 desc=f"RefusalJudge ({args.model})")
+        judged.sort(key=lambda r: r["index"])
+        summary = Refusal.summarize(judged)
+    elif devices:
         def extra(i, gpu):
             # --judge local has no server to place, so only the ollama judge
             # needs a port/container of its own per shard.
@@ -93,7 +119,9 @@ def main():
 
     payload = {"judge": f"XSTest 3-way / "
                         f"{args.judge_model if args.judge == 'local' else args.model}",
-               "source": args.inp,
+               "source": args.inp, "source_model": data.get("model"),
+               "source_config": data.get("config"), "attack": data.get("attack"),
+               "defense": data.get("defense"),
                "source_set": data.get("source"), "steering": data.get("steering"),
                "summary": summary, "results": judged}
     Path(args.out).write_text(json.dumps(payload, ensure_ascii=False, indent=2))

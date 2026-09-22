@@ -9,7 +9,6 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import interface
-import interface_results
 from common import load_prompts
 
 
@@ -68,8 +67,6 @@ def experiment(model, source, attack, defense, seed, gpu):
 
 def evaluation(inp, gpu):
     folder = new_folder("matrix_eval_" + inp.parent.name)
-    interface_results.select_result = lambda repo, ask, existing_file: inp
-
     def choose(label, options, default=1):
         if label == "평가 모델":
             return "both"
@@ -86,9 +83,9 @@ def evaluation(inp, gpu):
             raise ValueError(f"Unexpected question: {label}")
         return convert(value)
 
-    interface.choose = choose
-    interface.ask = ask
-    commands, prepared = interface.evaluation_plan(folder)
+    commands, prepared = interface.evaluation_plan(
+        folder, ask=ask, choose=choose,
+        select_result=lambda repo, ask, existing_file: inp)
     if all(item.get("cached_result") for item in commands):
         print(f"Both evaluations already cached: {inp}", flush=True)
         return

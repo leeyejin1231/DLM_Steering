@@ -1,16 +1,10 @@
 {
-  "model": "GSAI-ML/LLaDA-1.5",
   "layer": 18,
-  "source": "data/llada1.5_model_pairs.jsonl",
-  "label": "direct_response_lg4_unsafe",
-  "n_train": 293,
-  "n_val": 73,
-  "n_train_unsafe": 155,
-  "n_train_safe": 138,
-  "validation_auroc": 0.6327,
-  "validation_unsafe_open_rate": 0.8462,
-  "validation_safe_open_rate": 0.6471,
-  "percentile": 15,
-  "threshold": -4.9393,
-  "seed": 0
+  "percentile": 15.0,
+  "threshold": 4.327,
+  "validation_auroc": 0.8842,
+  "xstest_unsafe_vs_safe_auroc": 0.9316,
+  "harmful_source": "data/llada8b_wild_unsafe_only.csv (rows 20+, fit split, seed 0)",
+  "model": "GSAI-ML/LLaDA-1.5",
+  "detector_direction_from": "GSAI-ML/LLaDA-8B-Instruct"
 }

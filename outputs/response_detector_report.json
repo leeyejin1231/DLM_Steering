@@ -1,11 +1,24 @@
 {
-  "groups": 384,
-  "n_train": 384,
+  "groups": 768,
+  "n_train": 768,
   "layer": 18,
   "C": 0.01,
-  "auroc": 0.980344180735666,
+  "auroc": 0.9881849757972139,
   "threshold": 0.5,
-  "balanced_accuracy": 0.9269227632330153,
+  "balanced_accuracy": 0.9155027158851569,
+  "per_arm": {
+    "wildjailbreak": {
+      "n": 384,
+      "unsafe_rate": 0.4765625,
+      "trigger_rate": 0.4583333333333333
+    },
+    "alpaca": {
+      "n": 384,
+      "unsafe_rate": 0.0078125,
+      "trigger_rate": 0.0026041666666666665
+    }
+  },
+  "alpaca_groups": 384,
   "steps": 64,
   "gen_length": 128,
   "seed": 0

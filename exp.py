@@ -37,6 +37,7 @@ from common import (MODEL_KEY, MODEL_NAME, add_model_arg, PROMPT_SOURCES, enable
                     write_json)
 from Defender import DEFENDERS
 from experiment_row import RowExecution
+from dlm_steering.runtime.progress import task_progress
 
 
 def parse_args(argv=None):
@@ -261,6 +262,7 @@ def main(argv=None, loaded=None):
     # ~97s of json.dumps). Backing off by ~10% keeps that near linear while
     # never risking more than a tenth of a run.
     next_flush = 5
+    progress = task_progress(total=len(rows), desc='응답 생성', unit='건')
 
     def job_loop(att, dfn):
         nonlocal next_flush
@@ -274,21 +276,29 @@ def main(argv=None, loaded=None):
                 if done >= next_flush or done == len(rows):
                     flush()
                     next_flush = done + max(5, done // 10)
+                progress.update(1)
             preview = str(rec.get("generation", "<row failed>"))
-            print(f"[{done}/{len(rows)}] idx={row['index']} "
-                  f"{rec.get('seconds', -1)}s :: "
-                  f"{preview[:100].replace(chr(10), ' ')}...", flush=True)
+            if progress.disable:
+                # Parent displays one aggregate bar; retain row records in worker logs.
+                print(f"[{done}/{len(rows)}] idx={row['index']} "
+                      f"{rec.get('seconds', -1)}s :: "
+                      f"{preview[:100].replace(chr(10), ' ')}...", flush=True)
+            else:
+                progress.set_postfix(idx=row['index'], seconds=rec.get('seconds', -1))
 
-    if workers == 1:
-        job_loop(*lanes[0])
-    else:
-        threads = [threading.Thread(target=job_loop, args=lane, daemon=True)
-                   for lane in lanes]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        flush()
+    try:
+        if workers == 1:
+            job_loop(*lanes[0])
+        else:
+            threads = [threading.Thread(target=job_loop, args=lane, daemon=True)
+                       for lane in lanes]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            flush()
+    finally:
+        progress.close()
 
     ordered = sorted(results, key=lambda r: r["index"])
     summary = lanes[0][1].summarize(ordered)

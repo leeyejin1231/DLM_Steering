@@ -277,7 +277,9 @@ def generate(
             block_start = min(block_start, int(earlier_masks[:, 1].min().item()))
 
         block_mask_index = (x[:, block_start:block_end] == mask_id)
-        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)
+        # The schedule is fixed for this block; read it once rather than
+        # synchronizing the GPU for each step's Python control flow.
+        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block).tolist()
 
         for i in range(steps_per_block):
             if i == injection_step:
@@ -368,7 +370,7 @@ def generate(
 
             transfer_index = torch.zeros_like(x, dtype=torch.bool, device=x.device)
             for j in range(confidence.shape[0]):
-                k = int(num_transfer_tokens[j, i].item())
+                k = num_transfer_tokens[j][i]
                 if k <= 0:
                     continue
                 _, select_index = torch.topk(confidence[j], k=k)
@@ -415,7 +417,8 @@ def generate(
                 x[:, global_indices_to_remask] = mask_id
 
                 refinement_mask_index = (x[:, block_start:block_end] == mask_id)
-                num_refine_transfer = get_num_transfer_tokens(refinement_mask_index, max(int(refinement_steps), 1))
+                num_refine_transfer = get_num_transfer_tokens(
+                    refinement_mask_index, max(int(refinement_steps), 1)).tolist()
 
                 for r_step in range(max(int(refinement_steps), 1)):
                     mask_index = (x == mask_id)
@@ -464,7 +467,7 @@ def generate(
 
                     refine_transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
                     for j in range(confidence.shape[0]):
-                        k = int(min(num_refine_transfer[j, r_step].item(),
+                        k = int(min(num_refine_transfer[j][r_step],
                                     torch.sum(confidence[j] > -np.inf).item()))
                         if k > 0:
                             _, select_index = torch.topk(confidence[j], k=k)

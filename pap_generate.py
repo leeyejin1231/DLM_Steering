@@ -7,6 +7,7 @@ from attack_prompts import load_better_templates, extract_content
 from common import load_prompts, enable_reproducibility, seed_all, force_math_attention
 from pap_common import (SAMPLING, assign_techniques, normalize_templates,
                         identity, validate, save)
+from dlm_steering.runtime.progress import task_progress
 
 
 class PAPGenerator:
@@ -63,14 +64,14 @@ def main():
         generator = PAPGenerator(llm, load_better_templates())
         assignments = assign_techniques(rows, a.seed)
         data['backend'] = llm.describe()
-        for row in missing:
+        for row in task_progress(missing, total=len(selected), initial=len(entries),
+                                 desc=f'PAP seed={a.seed}', unit='건'):
             i = int(row['index'])
             technique = assignments[i]
             text = generator.generate(row['prompt'], technique, a.seed + i * 1048576)
             entries[i] = dict(index=i, prompt=row['prompt'], technique=technique, attack_prompt=text)
             data['results'] = [entries[i] for i in sorted(entries)]
             save(a.out, data)
-            print(f'PAP seed={a.seed} index={i}: saved', flush=True)
     data['results'] = [entries[i] for i in sorted(entries)]
     save(a.out, data)
 

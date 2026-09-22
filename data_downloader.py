@@ -5,6 +5,9 @@
     harmbench     -> data/harmbench.parquet   (walledai/HarmBench)
     strongreject  -> data/strongreject.parquet (the authors' own CSV)
     xstest         -> data/xstest.parquet      (the authors' own CSV)
+    gsm8k         -> data/gsm8k.parquet       (openai/gsm8k, main/test, 1319 rows)
+    math500       -> data/math500.jsonl       (HuggingFaceH4/MATH-500, 500 rows)
+    truthfulqa    -> data/truthfulqa.csv      (domenicrosati/TruthfulQA)
 
 The walledeval repos ship several parquet shards/splits; they are
 concatenated and de-duplicated like common.load_eval_prompts does.
@@ -23,6 +26,7 @@ Usage:
     python data_downloader.py advbench   # one only
 """
 
+import shutil
 import sys
 from pathlib import Path
 
@@ -76,9 +80,48 @@ def download_xstest():
     print(f"xstest: {len(df)} rows {counts} -> {out}")
 
 
+def download_gsm8k():
+    src = hf_hub_download("openai/gsm8k", "main/test-00000-of-00001.parquet",
+                          repo_type="dataset")
+    df = pd.read_parquet(src)
+    out = DATA_DIR / "gsm8k.parquet"
+    df.to_parquet(out, index=False)
+    print(f"gsm8k: {len(df)} rows -> {out}")
+
+
+def download_math500():
+    src = hf_hub_download("HuggingFaceH4/MATH-500", "test.jsonl", repo_type="dataset")
+    out = DATA_DIR / "math500.jsonl"
+    shutil.copyfile(src, out)
+    print(f"math500: {sum(1 for _ in out.open())} rows -> {out}")
+
+
+def download_truthfulqa():
+    src = hf_hub_download("domenicrosati/TruthfulQA", "train.csv", repo_type="dataset")
+    out = DATA_DIR / "truthfulqa.csv"
+    shutil.copyfile(src, out)
+    print(f"truthfulqa: {len(pd.read_csv(out))} rows -> {out}")
+
+
+def download_alpaca():
+    """Ordinary instructions, used as the response detector's benign arm.
+
+    WildJailbreak alone gives that detector only adversarial prompts, so plain
+    question answering sits off-distribution; see steering/fit_response_detector.
+    """
+    src = hf_hub_download("tatsu-lab/alpaca",
+                          "data/train-00000-of-00001-a09b74b3ef9c3b56.parquet",
+                          repo_type="dataset")
+    df = pd.read_parquet(src)
+    out = DATA_DIR / "alpaca.parquet"
+    df.to_parquet(out, index=False)
+    print(f"alpaca: {len(df)} rows -> {out}")
+
+
 def main():
     DATA_DIR.mkdir(exist_ok=True)
-    wanted = sys.argv[1:] or ["jbb_harmful", *WALLEDAI, "strongreject", "xstest"]
+    wanted = sys.argv[1:] or ["jbb_harmful", *WALLEDAI, "strongreject", "xstest",
+                              "gsm8k", "math500", "truthfulqa", "alpaca"]
     for source in wanted:
         if source == "jbb_harmful":
             download_jbb_harmful()
@@ -86,6 +129,14 @@ def main():
             download_strongreject()
         elif source == "xstest":
             download_xstest()
+        elif source == "gsm8k":
+            download_gsm8k()
+        elif source == "math500":
+            download_math500()
+        elif source == "truthfulqa":
+            download_truthfulqa()
+        elif source == "alpaca":
+            download_alpaca()
         elif source in WALLEDAI:
             download_walledeval(source)
         else:

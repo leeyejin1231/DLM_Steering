@@ -17,7 +17,8 @@ from pathlib import Path
 from common import (plan_shards, read_jobs, run_eval_shards,
                     run_persistent_jobs, write_json)
 from Evaluator import LlamaGuard4
-from attack_evaluation import generation_items, is_iterative, summarize_attack
+from attack_evaluation import generation_items
+from dlm_steering.evaluation.results import build_evaluation_payload
 
 
 def parse_args(argv=None):
@@ -96,19 +97,10 @@ def main(argv=None, grader=None):
             summary = grader.summarize(scored)
         model_id = grader.model_id
 
-    payload = {
-        "guard_model": model_id,
-        "source": args.inp,
-        "source_model": data.get("model"),
-        "source_config": data.get("config"),
-        "evaluation_scope": data.get("evaluation_scope"),
-        "summary": summary,
-        "results": scored,
-    }
-    if is_iterative(data):
-        payload["attempt_summary"] = summary
-        summary, outcomes = summarize_attack(rows, scored, "llamaguard4")
-        payload.update(summary=summary, row_results=outcomes)
+    payload = build_evaluation_payload(
+        data, rows, scored, summary, source=args.inp,
+        kind="llamaguard4", guard_model=model_id)
+    summary = payload["summary"]
     Path(args.out).write_text(json.dumps(payload, ensure_ascii=False, indent=2))
 
     print(f"\nDone in {time.time() - t_start:.1f}s -> {args.out}")
