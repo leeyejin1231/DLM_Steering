@@ -199,11 +199,13 @@ HARMFUL_SOURCES = ("jbb_harmful", "advbench", "harmbench", "strongreject", "xste
 BENIGN_SOURCES = ("truthfulqa", "xstest_safe", "jbb_benign", "wj_benign")
 # Graded sets for generalisation: rows carry "answer"/"task" and are scored
 # by eval_utility.py (accuracy), not by a refusal or harm judge.
-UTILITY_SOURCES = ("mmlu", "gsm8k", "truthfulqa_mc")
+UTILITY_SOURCES = ("mmlu", "gsm8k", "truthfulqa_mc", "math500")
 PROMPT_SOURCES = HARMFUL_SOURCES + BENIGN_SOURCES + UTILITY_SOURCES
 
 LETTERS = "ABCDEFGHIJKLMNOP"
 MC_INSTRUCTION = "Answer with the letter of the correct choice."
+MATH500_INSTRUCTION = ("Solve the problem step by step, then give the final answer on the "
+                       "last line in the form 'Final answer: \\boxed{<answer>}'.")
 GSM8K_INSTRUCTION = ("Solve the problem step by step, then give the final numeric "
                      "answer on the last line in the form '#### <number>'.")
 
@@ -252,17 +254,22 @@ def load_utility_prompts(source):
                                              f"The following is a multiple choice question about {subject}."),
                          "answer": LETTERS[int(r["answer"])], "target": None})
     elif source == "gsm8k":
-        files = glob.glob(GSM8K_GLOB)
-        if not files:
-            raise FileNotFoundError(GSM8K_GLOB)
-        df = _read_arrow(files[0])
+        local = DATA_DIR / "gsm8k_test.parquet"   # openai/gsm8k main/test, file order
+        if local.exists():
+            df = pd.read_parquet(local)
+        else:
+            files = glob.glob(GSM8K_GLOB)
+            if not files:
+                raise FileNotFoundError(GSM8K_GLOB)
+            df = _read_arrow(files[0])
         for i, r in df.iterrows():
             gold = str(r["answer"]).split("####")[-1].strip().replace(",", "")
             rows.append({"index": int(i), "task": "gsm8k",
                          "prompt": f"{r['question']}\n\n{GSM8K_INSTRUCTION}",
                          "answer": gold, "target": None})
     elif source == "truthfulqa_mc":
-        df = pd.read_csv(glob.glob(TRUTHFULQA_GLOB, recursive=True)[0])
+        local = DATA_DIR / "truthfulqa.csv"   # domenicrosati/TruthfulQA
+        df = pd.read_csv(local if local.exists() else glob.glob(TRUTHFULQA_GLOB, recursive=True)[0])
         for i, r in df.iterrows():
             best = str(r["Best Answer"]).strip()
             wrong = [a.strip() for a in str(r["Incorrect Answers"]).split(";") if a.strip()]
@@ -272,6 +279,16 @@ def load_utility_prompts(source):
                          "category": str(r["Category"]),
                          "prompt": format_mc(str(r["Question"]), choices),
                          "answer": LETTERS[choices.index(best)], "target": None})
+    elif source == "math500":
+        # HuggingFaceH4/MATH-500 test.jsonl (500 items) in file order; answer is
+        # the reference \boxed{} content, graded by eval_utility.py.
+        local = DATA_DIR / "math500_test.jsonl"
+        for i, line in enumerate(local.read_text().splitlines()):
+            r = json.loads(line)
+            rows.append({"index": i, "task": "math500", "subject": str(r["subject"]),
+                         "level": int(r["level"]),
+                         "prompt": f"{r['problem']}\n\n{MATH500_INSTRUCTION}",
+                         "answer": str(r["answer"]), "target": None})
     else:
         raise ValueError(source)
     return rows

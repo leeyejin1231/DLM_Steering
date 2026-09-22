@@ -57,11 +57,61 @@ def same_number(pred, gold):
         return False
 
 
+def extract_boxed(text):
+    """Content of the last \\boxed{...} (brace-balanced), else the text after the
+    last 'Final answer:' line, else None."""
+    starts = [m.end() for m in re.finditer(r"\\boxed\s*\{", text)]
+    for start in reversed(starts):
+        depth, i = 1, start
+        while i < len(text) and depth:
+            depth += {"{": 1, "}": -1}.get(text[i], 0)
+            i += 1
+        if depth == 0:
+            return text[start:i - 1]
+    m = None
+    for m in re.finditer(r"[Ff]inal answer\s*[:：]\s*(.+)", text):
+        pass
+    return m.group(1).strip().rstrip(".").strip("$ ") if m else None
+
+
+def normalize_math(ans):
+    """Light LaTeX normalisation so equivalent spellings compare equal."""
+    if ans is None:
+        return None
+    a = ans.strip().strip("$").strip()
+    a = re.sub(r"\\(?:left|right|,|!|;|:|displaystyle)", "", a)
+    a = a.replace("\\dfrac", "\\frac").replace("\\tfrac", "\\frac")
+    a = re.sub(r"\\text\{([^}]*)\}", r"\1", a)
+    a = re.sub(r"\^\{?\\circ\}?", "", a).replace("^\\circ", "")
+    a = a.replace("\\%", "%").replace("%", "")
+    a = re.sub(r"\s+", "", a).rstrip(".")
+    a = re.sub(r"\\frac(\d)(\d)", r"\\frac{\1}{\2}", a)   # \frac12 -> \frac{1}{2}
+    a = re.sub(r"^([a-zA-Z])=", "", a)          # "x=5" -> "5"
+    if re.fullmatch(r"-?\d[\d,]*(?:\.\d+)?", a):
+        a = a.replace(",", "")
+    return a
+
+
+def same_math(pred, gold):
+    p, g = normalize_math(pred), normalize_math(gold)
+    if p is None or g is None:
+        return False
+    if p == g:
+        return True
+    try:
+        return abs(float(p) - float(g)) < 1e-6
+    except ValueError:
+        return False
+
+
 def score_row(row):
     task, gold, gen = row["task"], row["answer"], row.get("generation", "")
     if task == "gsm8k":
         pred = extract_number(gen)
         correct = pred is not None and same_number(pred, gold)
+    elif task == "math500":
+        pred = extract_boxed(gen)
+        correct = pred is not None and same_math(pred, gold)
     else:
         n_choices = len(re.findall(r"^[A-P]\. ", row["prompt"], flags=re.MULTILINE))
         pred = extract_letter(gen, n_choices)
@@ -76,7 +126,7 @@ def summarize(rows):
     summary = {"task": rows[0]["task"] if rows else None, "total": total,
                "correct": correct, "accuracy": round(correct / total, 4) if total else 0.0,
                "unparsed": unparsed}
-    group_key = {"mmlu": "subject", "truthfulqa_mc": "category"}.get(summary["task"])
+    group_key = {"mmlu": "subject", "truthfulqa_mc": "category", "math500": "subject"}.get(summary["task"])
     if group_key:
         groups = collections.defaultdict(lambda: [0, 0])
         for r in rows:
@@ -99,7 +149,7 @@ def main():
     missing = [r["index"] for r in rows if "task" not in r or "answer" not in r]
     if missing:
         raise SystemExit(f"{len(missing)} rows lack task/answer fields; was --source a "
-                         f"utility set (mmlu, gsm8k, truthfulqa_mc)? e.g. index {missing[:5]}")
+                         f"utility set (mmlu, gsm8k, truthfulqa_mc, math500)? e.g. index {missing[:5]}")
     scored = [{**r, **score_row(r)} for r in rows]
     summary = summarize(scored)
     payload = {"source": args.inp, "config": data.get("config"), "attack": data.get("attack"),
