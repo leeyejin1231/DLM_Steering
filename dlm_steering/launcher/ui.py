@@ -82,7 +82,8 @@ def gpu_ids(value):
 
 
 def command(script, args, config, env=None):
-    return {'argv': [str(PYTHON), script, *map(str, args)],
+    """A planned subprocess. `script` is None when `args` starts with -m."""
+    return {'argv': [str(PYTHON), *([script] if script else []), *map(str, args)],
             'env': env or {}, 'parameters': config}
 
 

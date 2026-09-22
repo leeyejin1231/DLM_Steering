@@ -162,6 +162,44 @@ def pap_plan():
     return commands, []
 
 
+def detector_plan(folder, *, ask=ask, choose=choose):
+    """Build the V3 response-detector fit.
+
+    Generation and judging are cached under data/response_fit_cache, so a refit
+    that reuses the same prompts and sampler settings costs minutes; only prompt
+    counts beyond what the cache holds pay the full price.
+    """
+    from models import MODELS
+    from dlm_steering.runtime.constants import DETECTOR_LAYER
+    model_key = choose('학습 모델', [(key, spec['name']) for key, spec in MODELS.items()])
+    out_dir = MODELS[model_key]['out_dir']
+    wild = ask('WildJailbreak 프롬프트 수 (유해, 최대 386)', 384, lambda x: integer(x, 1))
+    alpaca = ask('Alpaca 프롬프트 수 (무해, 0이면 WildJailbreak만)', 384, integer)
+    layer = ask('검출기 레이어', DETECTOR_LAYER, lambda x: integer(x, 0))
+    reg = ask('L2 C', 0.01, real)
+    cutoff = ask('체크포인트에 저장할 트리거 임계값', 0.12, real)
+    if not 0 < cutoff < 1:
+        raise ValueError('임계값은 0과 1 사이여야 합니다.')
+    device = ask('생성 GPU (예: cuda:0)', 'cuda:0')
+    guard = ask('Llama-Guard 판정 GPU (예: cuda:1)', 'cuda:1')
+    refresh = choose('캐시 사용', [(False, '재사용 (권장)'), (True, '무시하고 다시 생성')])
+    out = ask('출력 체크포인트', f'{out_dir}/response_detector.pt')
+    if Path(REPO/out).is_file():
+        print(f'경고: {out} 을 덮어씁니다. 가중치가 달라지면 검출기 지문이 바뀌므로 '
+              '기존 실행으로 뽑아 둔 임계값 프로브와는 더 이상 비교할 수 없습니다.')
+    args = ['-m', 'steering.fit_response_detector', '--model', model_key,
+            '--groups', str(wild), '--alpaca-groups', str(alpaca),
+            '--layer', str(layer), '--C', str(reg), '--threshold', str(cutoff),
+            '--device', device, '--guard-device', guard, '--out', out,
+            '--report', f'{out_dir}/response_detector_report.json']
+    if refresh:
+        args.append('--refresh-cache')
+    return [command(None, args, {'model': model_key, 'wildjailbreak': wild,
+                                 'alpaca': alpaca, 'layer': layer, 'C': reg,
+                                 'threshold': cutoff, 'out': out,
+                                 'refresh_cache': refresh})], []
+
+
 def threshold_plan(folder, *, ask=ask, choose=choose):
     """Build the response-threshold sweep over existing --remask v3 probe runs.
 
