@@ -289,6 +289,11 @@ class Ours(Defender):
     # effective alpha, then the audit vector when an audit rides this forward.
     _N_STEP_SCALARS = 3
 
+    def _audit_pools(self, committed, chunks):
+        """Index sets the audit pools over: the committed answer first, then
+        each chunk of the finished block."""
+        return [committed, *chunks]
+
     def _plan_forward(self, x, region, n_masks=None):
         """Decide what this forward reads, steers and audits.
 
@@ -326,7 +331,8 @@ class Ours(Defender):
         if audit is not None:
             audit.chunks = self._chunk_positions(
                 audit.block_row.nonzero().flatten())
-            audit_pools = [take_true(committed[0], n_committed), *audit.chunks]
+            audit_pools = self._audit_pools(take_true(committed[0], n_committed),
+                                            audit.chunks)
 
         steer_mask = masks[0] if steer else None
         if steer and self.steer_shift:

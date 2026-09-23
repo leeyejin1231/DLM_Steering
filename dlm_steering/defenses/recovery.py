@@ -62,10 +62,20 @@ class V3(Ours):
         self._det_bias = float(response_detector["bias"])
         self._det_threshold = float(response_detector["threshold"])
         self.response_detector = response_detector
+        # A detector fitted with --prompt-tail N also pools the last N prompt
+        # text tokens, so the text next to the answer (a DIJA template, an
+        # injected prefix) is read together with it.
+        self._det_prompt_tail = int(response_detector.get("prompt_tail", 0))
+        self._det_tail_positions = None
 
     def defend(self, model, prompt_ids, rng=None, **gen_config):
-        if self.remask_prompt:
+        if self.remask_prompt or self._det_prompt_tail:
             self._prompt_text_slots = _prompt_text_mask(self.tokenizer, prompt_ids)
+        if self._det_prompt_tail:
+            # Text only: DIJA answer slots inside the prompt are already part
+            # of the committed pool and would otherwise count twice.
+            text = self._prompt_text_slots & (prompt_ids[0] != self.mask_id)
+            self._det_tail_positions = text.nonzero().flatten()[-self._det_prompt_tail:]
         return super().defend(model, prompt_ids, rng=rng, **gen_config)
 
     def reset(self):
@@ -105,7 +115,8 @@ class V3(Ours):
     def _audit(self, x, region, chunks):
         """One unsteered forward capturing gate-layer features pooled over the
         committed tokens and each chunk of the finished block."""
-        pools = [(region[0] & (x[0] != self.mask_id)).nonzero().flatten(), *chunks]
+        pools = self._audit_pools(
+            (region[0] & (x[0] != self.mask_id)).nonzero().flatten(), chunks)
         feats_out = []
         capture = self._audit_capture_hook(pools, feats_out)
 
@@ -268,6 +279,12 @@ class V3(Ours):
         self._n_region = original_region_count
         return True
 
+    def _audit_pools(self, committed, chunks):
+        tail = self._det_tail_positions
+        if tail is None:
+            return [committed, *chunks]
+        return [torch.cat([tail, committed]), *chunks]
+
     def _prompt_slots_to_reopen(self):
         """Prompt text slots recovery reopens.
 
@@ -337,6 +354,7 @@ class V3(Ours):
                  recovery_alpha_growth=self.recovery_alpha_growth,
                  response_threshold=self._det_threshold,
                  response_detector_source=self.response_detector.get("source"),
+                 response_detector_prompt_tail=self._det_prompt_tail,
                  response_detector_fingerprint=self.detector_fingerprint())
         return d
 

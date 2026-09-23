@@ -120,6 +120,10 @@ def main():
                     help="Benign instruction source mixed into the fit")
     ap.add_argument("--alpaca-groups", type=int, default=0,
                     help="How many Alpaca prompts to add (0: WildJailbreak only)")
+    ap.add_argument("--prompt-tail", type=int, default=0,
+                    help="Also pool the last N prompt text tokens with the response "
+                         "(the text right before the answer). V3 reads this from the "
+                         "checkpoint and pools the same way at inference.")
     ap.add_argument("--layer", type=int, default=DETECTOR_LAYER)
     ap.add_argument("--C", type=float, default=0.01)
     ap.add_argument("--threshold", type=float, default=0.5,
@@ -208,12 +212,20 @@ def main():
 
     # Features come from the cached sequence: one forward instead of the 64
     # denoising steps the generation cost, so --layer stays free to change.
-    print(f"replaying {len(rows)} cached sequences at layer {args.layer} ...")
+    print(f"replaying {len(rows)} cached sequences at layer {args.layer}"
+          + (f", pooling the last {args.prompt_tail} prompt tokens too" if args.prompt_tail else "")
+          + " ...")
+    from dlm_steering.defenses.base import _prompt_text_mask
     feats, texts, groups, arms, labels = [], [], [], [], []
     for k, (gi, prompt, arm) in enumerate(rows):
         row = caches[arm][rc.prompt_key(prompt)]
         x = torch.tensor([row["token_ids"]], device=args.device)
         slots = torch.tensor(row["slots"], device=args.device)
+        if args.prompt_tail:
+            prompt_ids = x[:, : int(slots.min())]
+            text = _prompt_text_mask(tokenizer, prompt_ids) & (prompt_ids[0] != MASK_ID)
+            tail = text.nonzero().flatten()[-args.prompt_tail:]
+            slots = torch.cat([tail, slots])
         feats.append(sample_state(model, x, slots, args.layer))
         texts.append(row["text"])
         groups.append(int(row["group"]))
@@ -266,10 +278,20 @@ def main():
                         "trigger_rate": float((probs[sel] >= threshold).mean())}
         print(f"  {arm}: P(trigger)={per_arm[arm]['trigger_rate']:.3f}")
 
+    # Trigger rate per arm across cutoffs, so a refit can be matched to an
+    # existing operating point (e.g. the same Alpaca false-trigger rate).
+    grid = [0.02, 0.05, 0.08, 0.10, 0.12, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50]
+    print("\ncutoff " + " ".join(f"{a:>14s}" for a in dict.fromkeys(arms)))
+    for t in grid:
+        print(f"{t:6.2f} " + " ".join(f"{float((probs[arms == a] >= t).mean()):14.4f}"
+                                     for a in dict.fromkeys(arms)))
+
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     torch.save({"weight": w, "bias": b, "threshold": threshold,
                 "layer": args.layer, "model": MODEL_NAME,
-                "pool": "mean_committed_response_tokens",
+                "pool": ("mean_prompt_tail_and_committed_response_tokens"
+                         if args.prompt_tail else "mean_committed_response_tokens"),
+                "prompt_tail": int(args.prompt_tail),
                 "target": "visible_response_unsafe",
                 "source": ("wildjailbreak+alpaca_response_states"
                            if args.alpaca_groups else
@@ -279,7 +301,7 @@ def main():
                 "C": float(args.C)}, args.out)
     Path(args.report).write_text(json.dumps(
         {"groups": int(len(X)), "n_train": int(len(X)),
-         "layer": args.layer, "C": args.C,
+         "layer": args.layer, "C": args.C, "prompt_tail": args.prompt_tail,
          "auroc": auc, "threshold": threshold, "balanced_accuracy": bal_acc,
          "per_arm": per_arm, "alpaca_groups": args.alpaca_groups,
          "steps": args.steps,
