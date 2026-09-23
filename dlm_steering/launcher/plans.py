@@ -90,8 +90,14 @@ def experiment_plan(folder):
         if model_key == 'dream' and choose('Dream 이전 위치에도 steering 적용', [(False, '사용 안 함 (브랜치 기본값)'), (True, '사용')]):
             options += ['--steer-shift']
         options += ['--alpha', str(ask('Alpha', 1, real)), '--remask', 'v3']
-        if choose('프롬프트 전체 remasking', [(True, '허용'), (False, '허용하지 않음')]):
+        scope = choose('프롬프트 remasking 범위', [
+            ('tail', '응답 직전 32토큰만 (공격 문구 위치, 질문은 유지)'),
+            ('all', '프롬프트 전체 (질문까지 지워 빈 응답이 날 수 있음)'),
+            ('none', '사용하지 않음')])
+        if scope != 'none':
             options += ['--remask-prompt']
+        if scope == 'tail':
+            options += ['--remask-prompt-tail', '32']
     if defense == 'diffuguard':
         options += ['--remasking', 'adaptive_step', '--repair-scope', 'all']
         print('DiffuGuard 기본: SAR 활성화, 전체 블록 복구')

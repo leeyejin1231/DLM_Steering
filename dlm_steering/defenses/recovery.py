@@ -24,7 +24,8 @@ class V3(Ours):
     def __init__(self, model, *, response_detector, recovery_steps=32,
                  recovery_rounds=1, audit_all_boundaries=False,
                  audit_boundary=0, infill_checkpoint=0,
-                 recovery_alpha_growth=1.0, remask_prompt=False, **kw):
+                 recovery_alpha_growth=1.0, remask_prompt=False,
+                 remask_prompt_ratio=1.0, remask_prompt_tail=0, **kw):
         if recovery_steps != "auto" and recovery_steps <= 0:
             raise ValueError("recovery_steps must be positive")
         if recovery_rounds <= 0:
@@ -41,7 +42,15 @@ class V3(Ours):
         missing = {"weight", "bias", "threshold", "layer"} - response_detector.keys()
         if missing:
             raise ValueError(f"response detector missing keys: {sorted(missing)}")
+        if not 0.0 < remask_prompt_ratio <= 1.0:
+            raise ValueError("remask_prompt_ratio must lie in (0, 1]")
         self.remask_prompt = remask_prompt
+        self.remask_prompt_ratio = float(remask_prompt_ratio)
+        if remask_prompt_tail < 0:
+            raise ValueError("remask_prompt_tail must be >= 0")
+        if remask_prompt_tail and remask_prompt_ratio != 1.0:
+            raise ValueError("remask_prompt_tail and remask_prompt_ratio are exclusive")
+        self.remask_prompt_tail = int(remask_prompt_tail)
         self._prompt_text_slots = None
         self.recovery_steps = "auto" if recovery_steps == "auto" else int(recovery_steps)
         self.recovery_rounds = int(recovery_rounds)
@@ -186,7 +195,7 @@ class V3(Ours):
         span_slots = region[0] & (x[0] != self.mask_id)
         span_slots[prompt_length:] = False
         if self.remask_prompt:
-            span_slots[:prompt_length] |= self._prompt_text_slots
+            span_slots[:prompt_length] |= self._prompt_slots_to_reopen(audit.rng)
         targets = audit.block_row | span_slots
         # Recovery may reopen fixed prompt text. Include it in recovery pools
         # only; subsequent ordinary audits still use the original answer region.
@@ -264,6 +273,36 @@ class V3(Ours):
         self._n_region = original_region_count
         return True
 
+    def _prompt_slots_to_reopen(self, rng):
+        """Prompt text slots recovery reopens.
+
+        Reopening every slot leaves the model nothing but the chat headers to
+        condition on, so it fills prompt and answer alike with end-of-text and
+        the response comes back empty. Two ways to keep context:
+
+        --remask-prompt-tail N  the last N text slots only -- the block right
+                                before the response, where DIJA templates and
+                                injected prefixes sit; the request stays.
+        --remask-prompt-ratio r a random fraction r (DiffuGuard uses 0.9),
+                                drawn from the row's generator so --reproduct
+                                stays deterministic.
+        """
+        text = self._prompt_text_slots
+        if self.remask_prompt_tail:
+            idx = text.nonzero().flatten()[-self.remask_prompt_tail:]
+            reopen = torch.zeros_like(text)
+            reopen[idx] = True
+            return reopen
+        if self.remask_prompt_ratio >= 1.0:
+            return text
+        idx = text.nonzero().flatten()
+        keys = torch.rand(idx.numel(), dtype=torch.float64, device=idx.device,
+                          generator=rng)
+        chosen = idx[keys.argsort()[:round(self.remask_prompt_ratio * idx.numel())]]
+        reopen = torch.zeros_like(text)
+        reopen[chosen] = True
+        return reopen
+
     def _remasked(self):
         return any(e["applied"] for e in self.recovery_events)
 
@@ -307,7 +346,10 @@ class V3(Ours):
 
     def describe(self):
         d = super().describe()
-        d.update(remask="v3", remask_prompt=self.remask_prompt, recovery_steps=self.recovery_steps,
+        d.update(remask="v3", remask_prompt=self.remask_prompt,
+                 remask_prompt_ratio=self.remask_prompt_ratio,
+                 remask_prompt_tail=self.remask_prompt_tail,
+                 recovery_steps=self.recovery_steps,
                  recovery_rounds=self.recovery_rounds,
                  audit_all_boundaries=self.audit_all_boundaries,
                  audit_boundary=self.audit_boundary,
