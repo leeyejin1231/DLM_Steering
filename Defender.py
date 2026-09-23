@@ -619,10 +619,12 @@ class V2(Ours):
 class V3(Ours):
     """--remask v3: response-detector boundary audit and block recovery.
 
-    At each block boundary an unsteered audit forward pools gate-layer
-    features over the committed tokens and scores them with a
-    logistic-regression response detector (--response-detector; its layer
-    must match --detector-layer). A trigger on the first block reopens the
+    At each block boundary an unsteered audit forward pools features over the
+    committed tokens and scores them with a logistic-regression response
+    detector (--response-detector) at the checkpoint's own layer; gate
+    projections still come from the gate layer. When the two layers coincide
+    the audit rides the next defended forward, otherwise it runs as a separate
+    unsteered pass. A trigger on the first block reopens the
     whole block and regenerates it over --recovery-steps dedicated
     forwards.
     """
@@ -650,8 +652,20 @@ class V3(Ours):
         self.recovery_alpha_growth = float(recovery_alpha_growth)
         self.remask_prompt = bool(remask_prompt)
         super().__init__(model, remask_enabled=True, **kw)
-        if int(response_detector["layer"]) != self.gate_layer:
-            raise ValueError("response detector layer must match the gate layer")
+        blocks = model_blocks(model)
+        self.det_layer = int(response_detector["layer"])
+        if not 1 <= self.det_layer <= len(blocks):
+            raise ValueError(f"response detector layer must be in 1..{len(blocks)}")
+        self.det_block = blocks[self.det_layer - 1]
+        # Which answer slots the detector pools: the committed ones (default) or
+        # the whole region including still-masked slots ("mean_region_*").
+        self._det_pool_region = "region" in str(response_detector.get("pool", ""))
+        # A boundary audit may ride the next defended forward only when it reads
+        # the gate layer's committed pool, which sits before every steering
+        # layer. Another layer (possibly after steering) or the region pool
+        # needs its own unsteered pass.
+        self._audit_piggyback = (self.det_layer == self.gate_layer
+                                 and not self._det_pool_region)
         device = self.gate_vector.device
         self._det_weight = torch.as_tensor(
             response_detector["weight"], dtype=torch.float32, device=device)
@@ -692,9 +706,13 @@ class V3(Ours):
     def _chunk_positions(positions, size=32):
         return [positions[i:i + size] for i in range(0, positions.numel(), size)]
 
-    def _audit_vector(self, feats):
-        """[committed + chunks] pooled features -> projection/logit/prob vector."""
-        logit = feats[0] @ self._det_weight + self._det_bias
+    def _audit_vector(self, feats, det_feats=None):
+        """[committed + chunks] pooled features -> projection/logit/prob vector.
+
+        feats are gate-layer features (gate projections); det_feats are the
+        response detector's layer (defaults to feats when the layers coincide)."""
+        det = feats if det_feats is None else det_feats
+        logit = det[0] @ self._det_weight + self._det_bias
         return torch.cat([feats @ self.gate_vector,
                           logit.reshape(1), torch.sigmoid(logit.reshape(1))])
 
@@ -710,25 +728,35 @@ class V3(Ours):
 
     @torch.no_grad()
     def _audit(self, x, region, chunks):
-        """One unsteered forward capturing gate-layer features pooled over the
-        committed tokens and each chunk of the finished block."""
+        """One unsteered forward capturing gate-layer (and, when it differs,
+        detector-layer) features pooled over the committed tokens and each chunk
+        of the finished block."""
         pools = [(region[0] & (x[0] != self.mask_id)).nonzero().flatten(), *chunks]
-        feats_out = []
+        det_pools = ([region[0].nonzero().flatten(), *chunks]
+                     if self._det_pool_region else pools)
+        captured = {"gate": [], "det": []}
 
-        def capture(module, inputs, output):
-            hidden = _hidden(output)
-            feats_out.append(torch.stack(
-                [hidden[0, p].to(torch.float32).mean(dim=0) for p in pools]))
+        def capture(key, pool_list):
+            def hook(module, inputs, output):
+                hidden = _hidden(output)
+                captured[key].append(torch.stack(
+                    [hidden[0, p].to(torch.float32).mean(dim=0) for p in pool_list]))
+            return hook
 
-        handle = self.gate_block.register_forward_hook(capture)
+        handles = [self.gate_block.register_forward_hook(capture("gate", pools))]
+        if self.det_block is not self.gate_block or self._det_pool_region:
+            handles.append(self.det_block.register_forward_hook(capture("det", det_pools)))
         try:
             self.model(x)
         finally:
-            handle.remove()
+            for handle in handles:
+                handle.remove()
         self.audit_forwards += 1
-        if len(feats_out) != 1:
+        if len(captured["gate"]) != 1 or len(captured["det"]) != len(handles) - 1:
             raise RuntimeError("audit hook must execute exactly once per forward")
-        return self._reading(self._audit_vector(feats_out[0]).tolist(), len(chunks))
+        det = captured["det"][0] if captured["det"] else None
+        return self._reading(self._audit_vector(captured["gate"][0], det).tolist(),
+                             len(chunks))
 
     @torch.no_grad()
     def after_block(self, x, region, *, block_index, block_positions,
@@ -747,8 +775,9 @@ class V3(Ours):
         audit = {"block_index": block_index, "block_row": block_positions[0],
                  "prompt_length": prompt_length, "temperature": temperature,
                  "remasking": remasking, "sampling": sampling}
-        if last_block:
-            # No later forward to piggyback on; audit with a dedicated pass.
+        if last_block or not self._audit_piggyback:
+            # No later forward to piggyback on (or the detector reads a layer the
+            # next forward may steer); audit with a dedicated unsteered pass.
             reading = self._audit(x, region, self._chunk_positions(
                 block_positions[0].nonzero().flatten()))
             self._apply_audit(x, region, reading, audit=audit)
@@ -883,7 +912,9 @@ class V3(Ours):
                  recovery_rounds=self.recovery_rounds,
                  audit_all_boundaries=self.audit_all_boundaries,
                  recovery_alpha_growth=self.recovery_alpha_growth,
-                 remask_prompt=self.remask_prompt)
+                 remask_prompt=self.remask_prompt,
+                 response_detector_layer=self.det_layer,
+                 response_threshold=self._det_threshold)
         return d
 
 
