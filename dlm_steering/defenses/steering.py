@@ -119,17 +119,13 @@ class Ours(Defender):
                                  "without refitting.")
         parser.add_argument("--remask-prompt", action="store_true",
                             help="v3: recover all prompt text, preserving special tokens.")
-        parser.add_argument("--remask-prompt-ratio", type=float, default=1.0,
-                            help="v3 with --remask-prompt: remask only this random "
-                                 "fraction of the prompt text (per-row rng), as "
-                                 "DiffuGuard does with 0.9. At 1.0 every text slot "
-                                 "is reopened and nothing is left to condition on.")
         parser.add_argument("--remask-prompt-tail", type=int, default=0,
                             help="v3 with --remask-prompt: reopen only the last N "
                                  "prompt text tokens -- the block right before the "
                                  "response, where DIJA templates and prefix "
                                  "injections sit -- and keep the rest as context. "
-                                 "0 reopens all of it (see --remask-prompt-ratio).")
+                                 "0 reopens all of it, which leaves nothing to "
+                                 "condition on and tends to return an empty answer.")
         parser.add_argument("--recovery-steps", type=lambda s: "auto" if s == "auto" else int(s), default=32,
                             help="Steps spent regenerating a triggered block (v3).")
         parser.add_argument("--recovery-rounds", type=int, default=1,
@@ -161,16 +157,10 @@ class Ours(Defender):
     def from_args(cls, args, model):
         if args.remask_prompt and args.remask != "v3":
             raise ValueError("--remask-prompt requires --remask v3")
-        if not 0.0 < args.remask_prompt_ratio <= 1.0:
-            raise ValueError("--remask-prompt-ratio must lie in (0, 1]")
-        if args.remask_prompt_ratio != 1.0 and not args.remask_prompt:
-            raise ValueError("--remask-prompt-ratio requires --remask-prompt")
         if args.remask_prompt_tail < 0:
             raise ValueError("--remask-prompt-tail must be >= 0")
         if args.remask_prompt_tail and not args.remask_prompt:
             raise ValueError("--remask-prompt-tail requires --remask-prompt")
-        if args.remask_prompt_tail and args.remask_prompt_ratio != 1.0:
-            raise ValueError("--remask-prompt-tail and --remask-prompt-ratio are exclusive")
         device = next(model.parameters()).device
         sites = []
         if args.steer != "none":
@@ -197,7 +187,6 @@ class Ours(Defender):
         from .recovery import V3
         return V3(**shared, response_detector=response_detector,
                   remask_prompt=args.remask_prompt,
-                  remask_prompt_ratio=args.remask_prompt_ratio,
                   remask_prompt_tail=args.remask_prompt_tail,
                   recovery_steps=args.recovery_steps,
                   recovery_rounds=args.recovery_rounds,
