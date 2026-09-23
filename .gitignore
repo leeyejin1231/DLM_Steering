@@ -29,16 +29,9 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-outputs/*
-# Interactive runs are shared between machines: generations, judge results, plan.json.
-# Shards, resume streams, prepared DIJA inputs (rebuilt on demand) and logs stay local.
-!outputs/interactive/
-outputs/interactive/**/.parts/
-outputs/interactive/**/*.part[0-9]*
-outputs/interactive/**/*.jsonl
-outputs/interactive/**/*_input.json
-outputs/interactive/**/*.ollama.json
-!outputs/interactive/**/RESULTS.md
+# Generations, judge results and fitted detectors stay out of git; copy them
+# between machines directly.
+outputs/
 strongreject/
 METHOD.md
 log/
