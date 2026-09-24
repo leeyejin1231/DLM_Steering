@@ -261,6 +261,10 @@ class Ours(Defender):
                                  "(request, DIJA anchors, filled spans; chat headers and "
                                  "system turn kept). The rewritten prompt tokens become "
                                  "answer slots: steered, audited and graded like the rest.")
+        parser.add_argument("--remask-prompt-frac", type=float, default=1.0,
+                            help="v3: fraction of the user-turn tokens --remask-prompt "
+                                 "reopens, sampled uniformly at random (1.0 = the whole "
+                                 "turn). The rest stays in place as context for the rewrite.")
         parser.add_argument("--recovery-alpha-growth", type=float, default=1.0,
                             help="v3: steering strength multiplier per re-detected "
                                  "recovery round (round i steers at alpha*growth^i).")
@@ -299,7 +303,8 @@ class Ours(Defender):
                   recovery_rounds=args.recovery_rounds,
                   audit_all_boundaries=args.audit_all_boundaries,
                   recovery_alpha_growth=args.recovery_alpha_growth,
-                  remask_prompt=args.remask_prompt)
+                  remask_prompt=args.remask_prompt,
+                  remask_prompt_frac=args.remask_prompt_frac)
 
     def reset(self):
         self.gate_strength = 0.0
@@ -633,7 +638,8 @@ class V3(Ours):
 
     def __init__(self, model, *, response_detector, recovery_steps=32,
                  recovery_rounds=1, audit_all_boundaries=False,
-                 recovery_alpha_growth=1.0, remask_prompt=False, **kw):
+                 recovery_alpha_growth=1.0, remask_prompt=False,
+                 remask_prompt_frac=1.0, **kw):
         if recovery_steps != "auto" and recovery_steps <= 0:
             raise ValueError("recovery_steps must be positive or 'auto'")
         if recovery_rounds <= 0:
@@ -651,6 +657,9 @@ class V3(Ours):
         self.audit_all_boundaries = bool(audit_all_boundaries)
         self.recovery_alpha_growth = float(recovery_alpha_growth)
         self.remask_prompt = bool(remask_prompt)
+        if not 0.0 < remask_prompt_frac <= 1.0:
+            raise ValueError("remask_prompt_frac must be in (0, 1]")
+        self.remask_prompt_frac = float(remask_prompt_frac)
         super().__init__(model, remask_enabled=True, **kw)
         blocks = model_blocks(model)
         self.det_layer = int(response_detector["layer"])
@@ -820,6 +829,14 @@ class V3(Ours):
         n_prompt_tokens = 0
         if self.remask_prompt:
             user = self._user_content(x, prompt_length) & ~region[0]
+            if self.remask_prompt_frac < 1.0:
+                # Reopen a random subset: the tokens left in place keep part of
+                # the request readable while the rewrite runs.
+                pos = user.nonzero().flatten()
+                k = int(round(pos.numel() * self.remask_prompt_frac))
+                keep = pos[torch.randperm(pos.numel(), device=pos.device)[:k]]
+                user = torch.zeros_like(user)
+                user[keep] = True
             n_prompt_tokens = int(user.sum())
             targets = targets | user
             # The rewritten prompt text joins the answer region in place (the
@@ -913,6 +930,7 @@ class V3(Ours):
                  audit_all_boundaries=self.audit_all_boundaries,
                  recovery_alpha_growth=self.recovery_alpha_growth,
                  remask_prompt=self.remask_prompt,
+                 remask_prompt_frac=self.remask_prompt_frac,
                  response_detector_layer=self.det_layer,
                  response_threshold=self._det_threshold)
         return d
