@@ -1,0 +1,104 @@
+"""Shared PAP technique assignment and cache format; no model generation."""
+import hashlib
+import json
+import random
+import shlex
+import sys
+from pathlib import Path
+
+from attack_prompts import PAP_BETTER_TEMPLATES_PATH
+from common import load_prompts
+
+TOP5 = ("Logical Appeal", "Authority Endorsement", "Misrepresentation",
+        "Evidence-based Persuasion", "Expert Endorsement")
+SAMPLING = {"temperature": 1, "top_p": 1, "max_new_tokens": 256}
+
+
+def default_cache_path(source, seed):
+    return Path(__file__).parent / "data" / "attacks" / "pap_better" / source / f"seed{seed}.json"
+
+
+def require_cache(path, source, seed):
+    """Resolve the default cache before any target model is loaded."""
+    path = Path(path) if path else default_cache_path(source, seed)
+    if not path.is_file():
+        root = Path(__file__).parent
+        command = [sys.executable, str(root / "pap_generate.py"),
+                   "--source", source, "--seed", str(seed), "--reproduct"]
+        command += ["--out", str(path)]
+        raise FileNotFoundError(
+            f"PAP 공격 프롬프트 파일이 없습니다: {path}\n"
+            f"먼저 아래 명령으로 생성한 뒤 다시 실행하세요:\n{shlex.join(command)}")
+    return path
+
+
+def normalize_templates(templates):
+    lowered = {name.lower(): value for name, value in templates.items()}
+    if set(lowered) != {name.lower() for name in TOP5}:
+        raise ValueError("PAP requires exactly the five better in-context templates")
+    normalized = {name: lowered[name.lower()] for name in TOP5}
+    if any(template.count("%s") != 1 for template in normalized.values()):
+        raise ValueError("Each PAP template must have exactly one query placeholder")
+    return normalized
+
+
+def assign_techniques(rows, seed):
+    """Balance techniques over full-source indices, independently of sharding."""
+    indices = sorted(int(row["index"]) for row in rows)
+    if len(indices) != len(set(indices)):
+        raise ValueError("PAP technique assignment requires unique row indices")
+    rng = random.Random(seed)
+    rng.shuffle(indices)
+    techniques = list(TOP5)
+    rng.shuffle(techniques)
+    return {index: techniques[position % len(techniques)]
+            for position, index in enumerate(indices)}
+
+
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def save(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    tmp.replace(path)
+
+
+def identity(source, seed, reproduct, model):
+    return dict(source=source, seed=seed, reproduct=reproduct, model=model,
+                template_sha256=digest(PAP_BETTER_TEMPLATES_PATH),
+                sampling=dict(SAMPLING))
+
+
+def validate(data, rows, source, seed, reproduct, complete=True):
+    expected = identity(source, seed, reproduct, data['model'])
+    if any(data.get(k) != v for k, v in expected.items()):
+        raise ValueError('PAP cache metadata mismatch')
+    assignments = assign_techniques(rows, seed)
+    originals = {int(row['index']): row['prompt'] for row in rows}
+    entries = data['results']
+    indices = [int(e['index']) for e in entries]
+    if len(indices) != len(set(indices)):
+        raise ValueError('Duplicate PAP cache indices')
+    if complete and set(indices) != set(originals):
+        raise ValueError('PAP cache must contain the entire source dataset')
+    for e in entries:
+        i = int(e['index'])
+        if (i not in originals or e['prompt'] != originals[i]
+                or e['technique'] != assignments[i]
+                or not isinstance(e['attack_prompt'], str) or not e['attack_prompt'].strip()):
+            raise ValueError(f'Invalid PAP cache entry {i}')
+    return {int(e['index']): e for e in entries}
+
+
+def load_cache(path, source, seed):
+    """Validated cache for (source, seed). The cache's own `reproduct` flag
+    records how the paraphraser was run; the target run need not match it."""
+    data = json.loads(Path(path).read_text())
+    data['by_index'] = validate(data, load_prompts(source), source, seed,
+                                bool(data.get('reproduct', False)))
+    data['sha256'] = digest(path)
+    return data

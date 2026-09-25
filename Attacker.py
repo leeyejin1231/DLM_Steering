@@ -264,7 +264,7 @@ def _default_attack_device():
     return "cuda:0"
 
 
-class PAP(NoAttack):
+class PAPLoop(NoAttack):
     """PAP (Zeng et al. 2024): persuasion-technique scan with early stop.
 
     Faithful to persuasive_jailbreaker + the paper's deployment loop: for each
@@ -284,7 +284,7 @@ class PAP(NoAttack):
     or the highest-scoring attempt when all trials fail.
     """
 
-    name = "pap"
+    name = "pap_loop"
     needs_second_device = True
 
     def __init__(self, llm, judge, techniques, variant="taxonomy", trials=10,
@@ -428,6 +428,76 @@ class PAP(NoAttack):
         return {"attack": self.name, "variant": self.variant,
                 "techniques": self.techniques, "trials": self.trials,
                 "llm": self.llm.model_id, "judge": getattr(self.judge, "name", "?")}
+
+
+class PAP(NoAttack):
+    """PAP, single-shot cache variant (ported from the code-share-dream branch).
+
+    One of the five released PAP_Better_Incontext_Sample techniques is assigned
+    per row (seeded, balanced over the full source; pap_common.assign_techniques)
+    and the paraphrase is read from a prepared cache
+    (data/attacks/pap_better/<source>/seed<seed>.json, made by pap_generate.py
+    with Qwen3-14B). Each row makes exactly one target call; no in-loop judge,
+    grading is a separate evaluation (Llama Guard 4 / StrongREJECT). No second
+    LLM is loaded, so --gpus shards it like --attack none. The old scan-with-
+    early-stop loop remains available as --attack pap_loop.
+    """
+
+    name = "pap"
+
+    def __init__(self, cache, technique_by_index, seed):
+        from pap_common import TOP5
+        self.cache = cache
+        self.technique_by_index = technique_by_index
+        self.seed = seed
+        self.techniques = list(TOP5)
+
+    @classmethod
+    def add_args(cls, parser):
+        parser.add_argument("--pap-cache", default=None,
+                            help="Prepared PAP prompt cache; default "
+                                 "data/attacks/pap_better/<source>/seed<seed>.json")
+        # The code-share-dream recipe samples the target greedily unless told
+        # otherwise (its README runs Dream at --temperature 0.2).
+        parser.set_defaults(temperature=0.0)
+
+    @classmethod
+    def from_args(cls, args):
+        from common import load_prompts
+        from pap_common import assign_techniques, load_cache, require_cache
+        path = require_cache(args.pap_cache, args.source, args.seed)
+        cache = load_cache(path, args.source, args.seed)
+        assignment = assign_techniques(load_prompts(args.source), args.seed)
+        return cls(cache, assignment, args.seed)
+
+    def run(self, row, respond, tokenizer, vanilla_ids=None):
+        goal, idx = row["prompt"], int(row["index"])
+        tech = self.technique_by_index[idx]
+        entry = self.cache["by_index"].get(idx)
+        if entry is None or entry["prompt"] != goal or entry["technique"] != tech:
+            raise ValueError(f"PAP cache input/technique mismatch at index {idx}")
+        pap = entry["attack_prompt"]
+        out, ids, cfg, shown = respond(pap)
+        resp = _assistant_text(tokenizer, out, ids)
+        extra = {"assistant_text": resp,
+                 "pap": {"technique": tech, "trials_run": 1, "target_queries": 1,
+                         "history": [{"trial": 1, "technique": tech,
+                                      "pap": pap, "response": resp}]}}
+        return AttackResult(shown, resp, extra, cfg, ids)
+
+    def describe(self):
+        from pap_common import SAMPLING
+        counts = {t: sum(v == t for v in self.technique_by_index.values())
+                  for t in self.techniques}
+        return {"attack": self.name, "variant": "better_cache", "techniques": self.techniques,
+                "technique_assignment": "seeded full-dataset shuffle; balanced top5",
+                "assignment_seed": self.seed, "dataset_technique_counts": counts,
+                "trials": 1, "max_target_queries": 1,
+                "paraphraser_prompt": "author PAP_Better_Incontext_Sample",
+                "template_file": "attacks/pap_better_templates.json",
+                "sampling": dict(SAMPLING), "backend": self.cache.get("backend"),
+                "llm": self.cache["model"], "cache_reproduct": self.cache.get("reproduct"),
+                "prompt_cache_sha256": self.cache.get("sha256")}
 
 
 class PAIR(NoAttack):
@@ -619,4 +689,4 @@ class PAIR(NoAttack):
                 "attack_max_tokens": self.attack_max_tokens}
 
 
-ATTACKERS = {a.name: a for a in (NoAttack, Prefix, DIJA, DIJATemplate, PAP, PAIR)}
+ATTACKERS = {a.name: a for a in (NoAttack, Prefix, DIJA, DIJATemplate, PAP, PAPLoop, PAIR)}
