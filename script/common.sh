@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Shared environment for every script in this folder. Source it, do not run it.
 #
-#   PY   The project venv: Python 3.12 + `uv pip sync requirements.lock`
+#   PY   The project venv: Python 3.12 + `uv pip install -r requirements.txt`
 #        (torch 2.3.1 / transformers 4.55.4), as set up in README "0. 환경 세팅".
 #        Other interpreters on a given machine ship different transformers
 #        versions, where LLaDA's trust_remote_code class dies with
@@ -25,8 +25,8 @@ cd "$ROOT"
 export PY="${PY:-$ROOT/.venv/bin/python}"
 if [ ! -x "$PY" ]; then
     echo "no interpreter at $PY -- create the venv (README '0. 환경 세팅':" >&2
-    echo "  uv venv --python 3.12 .venv && uv pip sync -p .venv/bin/python requirements.lock" >&2
-    echo "or point PY= at an env matching requirements.lock" >&2
+    echo "  uv venv --python 3.12 .venv && uv pip install -p .venv/bin/python -r requirements.txt" >&2
+    echo "or point PY= at an env matching requirements.txt" >&2
     exit 1
 fi
 
