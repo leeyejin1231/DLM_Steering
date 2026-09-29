@@ -11,7 +11,7 @@ harmful-vs-benign is reported as a cross-check, but it is calibrated on long
 WildJailbreak roleplay benign prompts and transfers poorly to short questions.
 
 Usage:
-    CUDA_VISIBLE_DEVICES=1 python -m steering.pick_threshold --layer 18
+    CUDA_VISIBLE_DEVICES=1 python -m dlm_steering.fitting.pick_threshold --layer 18
 """
 
 from common import OUT_DIR, DETECTOR_LAYER, MODEL_KEY, add_model_arg
@@ -24,9 +24,9 @@ import numpy as np
 import torch
 
 from common import load_detector_bundle, load_llada
-from steering.fit_detector import collect
+from dlm_steering.fitting.fit_detector import collect
 
-ROOT = Path(__file__).resolve().parent.parent
+from dlm_steering.paths import REPO as ROOT
 
 def main():
     ap = argparse.ArgumentParser()

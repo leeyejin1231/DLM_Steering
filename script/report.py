@@ -6,7 +6,7 @@ payloads:
     python script/report.py outputs/JBB-dija-v3-42_lg4.json outputs/*_sr.json
 
 With no arguments it reports the files evaluate.sh produces. Every input is a
-payload written by eval_llamaguard.py, run_sr_eval.py, steering/judge_refusal.py
+payload written by eval_llamaguard.py, run_sr_eval.py, dlm_steering/fitting/judge_refusal.py
 or eval_utility.py; the grader is inferred from the keys of its "summary"
 block, so no naming convention is assumed. Missing or unrecognised files are
 listed rather than raised, so a partially finished pipeline still reports what

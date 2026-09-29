@@ -18,4 +18,4 @@ $PY exp.py --attack none --defense ours --remask v3 --steer "$STEER" \
     --source truthfulqa --temperature 0.0 --gen-length 128 --steps 128 \
     --block-length 32 --n "$N" --gpus "$GPUS" --procs-per-gpu "$PROCS_PER_GPU" --out "$OUT"
 
-$PY -m steering.judge_refusal --in "$OUT" --out "${OUT%.json}_judged.json" --gpu "$JUDGE_GPU"
+$PY -m dlm_steering.fitting.judge_refusal --in "$OUT" --out "${OUT%.json}_judged.json" --gpu "$JUDGE_GPU"

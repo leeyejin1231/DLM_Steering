@@ -11,7 +11,7 @@ On a *safe* prompt set, over-refusal rate = (full_refusal + partial_refusal) / n
 On an *unsafe* set the same quantity is the desired refusal rate.
 
 Usage:
-    python -m steering.judge_refusal --in outputs/or_xstest_safe_steer.json \
+    python -m dlm_steering.fitting.judge_refusal --in outputs/or_xstest_safe_steer.json \
                                      --out outputs/or_xstest_safe_steer_judged.json
 """
 
@@ -98,7 +98,7 @@ def main():
                     "--container", f"ollama-{port}"]
         # A shard child must re-enter as a module: steering/ is a package, so
         # running this file by path would not find common.py.
-        judged, _ = run_eval_shards("steering.judge_refusal", args, len(items),
+        judged, _ = run_eval_shards("dlm_steering.fitting.judge_refusal", args, len(items),
                                     extra_args=extra, devices=devices)
         summary = Refusal.summarize(judged)
     else:

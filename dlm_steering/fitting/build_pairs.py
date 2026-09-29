@@ -16,7 +16,7 @@ The first --n-eval CSV rows are the prompts already used for baseline eval, and
 are excluded from fitting entirely.
 
 Usage:
-    python -m steering.build_pairs [--n-eval 20] [--seed 0]
+    python -m dlm_steering.fitting.build_pairs [--n-eval 20] [--seed 0]
 """
 
 import argparse
@@ -28,7 +28,7 @@ import pandas as pd
 import pyarrow as pa
 
 WJ_GLOB = "/mnt/shared/huggingface-cache/datasets/allenai___wildjailbreak/train-*/0.0.0/*/*.arrow"
-ROOT = Path(__file__).resolve().parent.parent
+from dlm_steering.paths import REPO as ROOT
 
 
 def norm(s):

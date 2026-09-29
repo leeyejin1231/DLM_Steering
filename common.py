@@ -83,8 +83,4 @@ from dlm_steering.runtime.execution import (
     spawn_shards,
     wait_merge_shards,
     run_eval_shards,
-    _persistent_model,
-    _run_persistent_job,
-    read_jobs,
-    run_persistent_jobs,
 )

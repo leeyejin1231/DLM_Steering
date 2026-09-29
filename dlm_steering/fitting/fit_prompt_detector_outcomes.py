@@ -14,7 +14,7 @@ import torch
 
 from common import MODEL_NAME, auroc, load_llada
 from models import add_model_arg
-from steering.fit_detector import collect
+from dlm_steering.fitting.fit_detector import collect
 
 
 def main():

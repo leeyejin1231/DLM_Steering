@@ -8,8 +8,7 @@ import sys
 import uuid
 from dlm_steering.paths import REPO, PYTHON
 from .ui import ask, choose, gpu_ids
-from .plans import (experiment_plan, evaluation_plan, pap_plan, threshold_plan,
-                    detector_plan)
+from .plans import experiment_plan, evaluation_plan, pap_plan, detector_plan
 from .pap import prepare_pap_sharded
 from .execution import format_command, execute
 
@@ -43,14 +42,12 @@ def main():
     print('실험 / 평가 인터페이스 — Enter: 기본값, Ctrl+C: 취소')
     mode = choose('작업 선택', [('experiment', '실험용'), ('evaluation', '평가용'),
                                  ('pap', 'PAP 공격 프롬프트 준비'),
-                                 ('detector', 'V3 응답 검출기 학습'),
-                                 ('threshold', 'V3 응답 검출기 임계값 탐색')])
+                                 ('detector', 'V3 응답 검출기 학습')])
     stamp = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     folder = REPO/'outputs'/'interactive'/f'{stamp}_{mode}_{uuid.uuid4().hex[:8]}'
     commands, prepared = (experiment_plan(folder) if mode == 'experiment' else
                           pap_plan() if mode == 'pap' else
                           detector_plan(folder) if mode == 'detector' else
-                          threshold_plan(folder) if mode == 'threshold' else
                           evaluation_plan(folder))
     if not commands:
         print('요청한 PAP 캐시가 모두 완성돼 있습니다.')

@@ -111,7 +111,9 @@ class Ours(Defender):
                                  "block and regenerates it over --recovery-steps steps.")
         parser.add_argument("--response-detector", default=f"{OUT_DIR}/response_detector.pt",
                             help="Logistic-regression response checkpoint; required by "
-                                 "--remask v3*. Its layer must match --detector-layer.")
+                                 "--remask v3. Read at the checkpoint's own layer; when "
+                                 "that differs from --detector-layer (Dream: 20 vs 14) "
+                                 "the boundary audit runs as a separate unsteered pass.")
         parser.add_argument("--response-threshold", type=float, default=None,
                             help="Override the response detector's own trigger "
                                  "cutoff. The checkpoint stores the threshold it "

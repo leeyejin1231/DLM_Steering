@@ -27,7 +27,7 @@ reads. Both classes are judged, so the negative arm carries real GT labels
 rather than assumed-safe regenerations.
 
 Generation and judging dominate the cost and are deterministic at temperature
-0, so both are cached under data/response_fit_cache (see steering/response_cache
+0, so both are cached under data/response_fit_cache (see dlm_steering/fitting/response_cache
 .py). A rerun replays the cached token ids through one forward pass to rebuild
 features, which leaves --layer free to change and regenerates only prompts the
 cache has never seen. --refresh-cache forces a full rebuild.
@@ -36,7 +36,7 @@ The split is by prompt group: each row is one group and train/validation
 group lists are stored in the checkpoint like the reference file.
 
 Usage:
-    CUDA_VISIBLE_DEVICES=1,2 python -m steering.fit_response_detector \
+    CUDA_VISIBLE_DEVICES=1,2 python -m dlm_steering.fitting.fit_response_detector \
         --groups 384 --guard-device cuda:2
 """
 
@@ -53,7 +53,7 @@ import torch
 
 from common import MODEL_NAME, MASK_ID, auroc, encode_prompt, load_llada
 
-ROOT = Path(__file__).resolve().parent.parent
+from dlm_steering.paths import REPO as ROOT
 ALPACA_GROUP_OFFSET = 1_000_000
 
 @torch.no_grad()
@@ -164,7 +164,7 @@ def main():
 
     from Attacker import NoAttack
     from Evaluator import LlamaGuard4
-    from steering import response_cache as rc
+    from dlm_steering.fitting import response_cache as rc
     attacker = NoAttack()
     gen_length = args.gen_length
 

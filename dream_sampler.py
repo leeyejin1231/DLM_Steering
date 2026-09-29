@@ -1,4 +1,4 @@
-"""Dream native sampling, ported from origin/dream (98bfb25)."""
+"""Dream native sampling, ported from origin/dream (98bfb25; sampling quirk from 6fc2b7a)."""
 import torch
 import torch.nn.functional as F
 from common import MASK_ID
@@ -35,6 +35,16 @@ def _top_k_logits(logits, top_k=None):
     return logits.masked_fill(indices_to_remove, torch.finfo(logits.dtype).min)
 
 
+def _categorical_would_raise(normalised):
+    """torch.distributions.Categorical's argument validation (validate_args is
+    on by default): every renormalised row must be a simplex within 1e-6."""
+    if normalised.dim() < 1 or normalised.numel() == 0:
+        return normalised.dim() < 1
+    ok = (torch.all(normalised >= 0, dim=-1)
+          & ((normalised.sum(dim=-1) - 1).abs() < 1e-6))
+    return not bool(ok.all())
+
+
 def dream_sample_tokens(logits, temperature=0.0, top_p=None, top_k=None,
                         margin_confidence=False, neg_entropy=False, rng=None):
     """Dream's sample_tokens rule with an explicit row RNG: returns
@@ -47,11 +57,21 @@ def dream_sample_tokens(logits, temperature=0.0, top_p=None, top_k=None,
         logits = _top_k_logits(logits, top_k)
     probs = torch.softmax(logits, dim=-1)
     if temperature > 0:
-        try:
-            x0 = torch.multinomial(probs, 1, generator=rng).squeeze(-1)
-            confidence = torch.gather(probs, -1, x0.unsqueeze(-1)).squeeze(-1)
-        except Exception:
+        # Dream's sample_tokens draws with dists.Categorical(probs).sample()
+        # inside a try/except and falls back to argmax when the constructor
+        # raises. Its simplex validation (|sum - 1| < 1e-6 on the renormalised
+        # row) fails on ~1% of steps with bf16 logits, so the native sampler
+        # goes greedy for that step and consumes no random draw. Reproduced
+        # here -- the draw itself is Categorical's torch.multinomial on the
+        # renormalised rows -- so outputs match Dream (and the origin/dream
+        # runs) token for token, with the row generator in place of the
+        # global RNG.
+        normalised = probs / probs.sum(dim=-1, keepdim=True)
+        if _categorical_would_raise(normalised):
             confidence, x0 = probs.max(dim=-1)
+        else:
+            x0 = torch.multinomial(normalised, 1, generator=rng).squeeze(-1)
+            confidence = torch.gather(probs, -1, x0.unsqueeze(-1)).squeeze(-1)
     else:
         confidence, x0 = probs.max(dim=-1)
     if margin_confidence:

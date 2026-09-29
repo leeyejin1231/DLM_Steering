@@ -23,7 +23,7 @@ questions, a different distribution entirely. If it cannot separate those, a gat
 built on it will stay open and over-refusal will not improve.
 
 Usage:
-    CUDA_VISIBLE_DEVICES=1 python -m steering.fit_detector
+    CUDA_VISIBLE_DEVICES=1 python -m dlm_steering.fitting.fit_detector
 """
 
 from common import OUT_DIR, DETECTOR_LAYER, MODEL_KEY, add_model_arg
@@ -40,7 +40,7 @@ from common import (
     FIT_LAYERS, MODEL_NAME, MASK_ID, auroc, load_eval_prompts, load_llada,
     prompt_token_ids)
 
-ROOT = Path(__file__).resolve().parent.parent
+from dlm_steering.paths import REPO as ROOT
 
 @torch.no_grad()
 def prompt_state(model, tokenizer, prompt, gen_length, layers, device):

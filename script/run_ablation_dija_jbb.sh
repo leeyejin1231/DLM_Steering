@@ -39,32 +39,15 @@ declare -A COND=(
 # CONDS="allbnd bnd1 bnd2 bnd3" selects a subset; default = the four ablation conditions.
 ORDER=(${CONDS:-full noremask promptrm0 nosteer})
 
-JOBS=$OUT/jobs-dija-${CONDS:+analysis-}$SEED.json
-"$PY" - "$JOBS" "${ORDER[@]}" <<PY
-import json, sys, shlex
-from pathlib import Path
-common = shlex.split("""${COMMON[@]}""")
-cond = {"full": shlex.split("""${COND[full]}"""),
-        "noremask": shlex.split("""${COND[noremask]}"""),
-        "promptrm0": shlex.split("""${COND[promptrm0]}"""),
-        "nosteer": shlex.split("""${COND[nosteer]}"""),
-        "allbnd": shlex.split("""${COND[allbnd]}"""),
-        "bnd1": shlex.split("""${COND[bnd1]}"""),
-        "bnd2": shlex.split("""${COND[bnd2]}"""),
-        "bnd3": shlex.split("""${COND[bnd3]}""")}
-jobs = []
-for name in sys.argv[2:]:
-    out = Path("$OUT") / f"JBB-dija-{name}-$SEED.json"
-    if out.exists() and out.stat().st_size:
-        print("skip", out); continue
-    jobs.append([*common, *cond[name], "--out", str(out)])
-Path(sys.argv[1]).write_text(json.dumps(jobs, indent=1))
-print(len(jobs), "generation jobs ->", sys.argv[1])
-PY
-
 say "generation ($(date '+%F %T'))"
-"$PY" exp.py --jobs "$JOBS" --gpus "$GPUS" --procs-per-gpu "$PROCS_PER_GPU" \
-    || { echo "generation failed"; exit 1; }
+for c in "${ORDER[@]}"; do
+  F=$OUT/JBB-dija-$c-$SEED.json
+  [ -s "$F" ] && { echo "skip $F"; continue; }
+  echo "== $c -> $F"
+  "$PY" exp.py "${COMMON[@]}" ${COND[$c]} --gpus "$GPUS" --procs-per-gpu "$PROCS_PER_GPU" --out "$F" \
+      > "log/gen_JBB-dija-$c-$SEED.log" 2>&1 \
+      || { echo "generation failed: $c (log/gen_JBB-dija-$c-$SEED.log)"; exit 1; }
+done
 
 say "Llama Guard 4 ($(date '+%F %T'))"
 for c in "${ORDER[@]}"; do
@@ -84,7 +67,7 @@ for c in "${ORDER[@]}"; do
   "$PY" run_sr_eval.py --in "$F" --out "$SR" --gpus "$GPUS" > "log/sr_JBB-dija-$c-$SEED.log" 2>&1 \
     || echo "SR FAILED: $c"
 done
-podman stop ollama-50001 ollama-50002 >/dev/null 2>&1
+podman stop ollama-50001 ollama-50002 >/dev/null 2>&1 || true   # containers may already be down; common.sh sets -e
 
 say "report"
 "$PY" script/report.py $(ls $OUT/JBB-dija-*-${SEED}_lg4.json $OUT/JBB-dija-*-${SEED}_sr.json 2>/dev/null)

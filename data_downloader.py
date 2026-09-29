@@ -107,7 +107,7 @@ def download_alpaca():
     """Ordinary instructions, used as the response detector's benign arm.
 
     WildJailbreak alone gives that detector only adversarial prompts, so plain
-    question answering sits off-distribution; see steering/fit_response_detector.
+    question answering sits off-distribution; see dlm_steering/fitting/fit_response_detector.
     """
     src = hf_hub_download("tatsu-lab/alpaca",
                           "data/train-00000-of-00001-a09b74b3ef9c3b56.parquet",

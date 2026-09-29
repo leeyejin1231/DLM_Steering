@@ -11,11 +11,9 @@ Usage:
 import argparse
 import json
 import time
-from contextlib import nullcontext
 from pathlib import Path
 
-from common import (plan_shards, read_jobs, run_eval_shards,
-                    run_persistent_jobs, write_json)
+from common import plan_shards, run_eval_shards
 from Evaluator import LlamaGuard4
 from attack_evaluation import generation_items
 from dlm_steering.evaluation.results import build_evaluation_payload
@@ -33,8 +31,6 @@ def parse_args(argv=None):
     p.add_argument("--gpus", default=None,
                    help="Comma-separated GPU ids (e.g. 0,1): shard items into "
                         "one subprocess per GPU and merge the part JSONs")
-    p.add_argument("--jobs", help="JSON list of grading CLI argument lists; "
-                   "reuse each GPU's model across files (each job supplies --out)")
     p.add_argument("--max-new-tokens", type=int, default=20)
     p.add_argument("--batch-size", type=int, default=16,
                    help="Items per Llama Guard forward (default 16: 1.9x "
@@ -52,18 +48,8 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
-def main(argv=None, grader=None):
+def main(argv=None):
     args = parse_args(argv)
-    if args.jobs:
-        if grader is not None:
-            raise ValueError("a worker cannot launch nested jobs")
-        report = run_persistent_jobs("grade", read_jobs(args.jobs), args.gpus)
-        write_json(args.jobs + ".timing.json", report)
-        print(f"Done in {report['seconds']:.2f}s")
-        return
-    if grader is not None and args.gpus:
-        raise ValueError("a reused grader must run on its worker's GPU")
-
     data = json.loads(Path(args.inp).read_text())
     rows = data["results"][args.start:
                            args.start + args.n if args.n is not None else None]
@@ -81,17 +67,9 @@ def main(argv=None, grader=None):
         model_id = head.get("guard_model")
     else:
         jsonl = args.jsonl or str(Path(args.out).with_suffix(".jsonl"))
-        if grader is not None:
-            grader.max_new_tokens = args.max_new_tokens
-            grader.with_reference = args.with_reference
-            grader.batch_size = args.batch_size
-            if grader.batch_size < 1:
-                raise ValueError("batch_size must be >= 1")
-        context = (nullcontext(grader) if grader is not None else
-                   LlamaGuard4(max_new_tokens=args.max_new_tokens,
-                               with_reference=args.with_reference,
-                               batch_size=args.batch_size))
-        with context as grader:
+        with LlamaGuard4(max_new_tokens=args.max_new_tokens,
+                         with_reference=args.with_reference,
+                         batch_size=args.batch_size) as grader:
             scored = grader.evaluate(items, output_path=jsonl)
             scored.sort(key=lambda r: r["index"])
             summary = grader.summarize(scored)

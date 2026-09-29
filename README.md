@@ -164,6 +164,82 @@ PAIR는 타깃 공격자 모델용으로 GPU 2장을 사용합니다.
 
 이 평가는 `--attack none`으로 생성하고, 같은 데이터 범위에서 `--defense none`과 비교합니다. 위 명령의 Python도 `.venv/bin/python`을 사용하세요.
 
+## 5. Dream-v0-Instruct-7B
+
+같은 방법론(gated steering + v3 remask)을 `Dream-org/Dream-v0-Instruct-7B`에서 그대로 돌립니다.
+`--model dream`을 주면 `models.py` 레지스트리에서 모델별 상수(마스크 토큰 `<|mask|>`=151666,
+블록 경로 `model.model.layers`, 28층, `<|im_end|>`)가 선택되고 벡터·검출기 기본 경로가 `outputs/dream/`으로
+바뀝니다. `--model`은 `common.py`가 import되기 전에 읽히므로 반드시 커맨드라인으로 줍니다(`--gpus` 샤딩 자식은
+자동 전달). 환경은 LLaDA와 같은 `.venv`를 씁니다.
+
+### 배포 설정과 체크포인트 (`outputs/dream/`)
+
+| 산출물 | 층 | 비고 |
+|---|---|---|
+| `steer_detector.pt` + `gate_threshold.json` | 14 (`best_layer`) | 게이트. OOD 평균 AUROC 0.970, 임계값 2.706 |
+| `steer_vector.pt` | **20** (`--layer 20` 명시) | 검증 AUROC 최고는 17이지만 alpha sweep에서 17은 alpha 1.5부터 붕괴, 20은 alpha 1에서 거절 100%·유창 |
+| `response_detector3_committed_L20.pt` | **20**, 컷오프 0.387 | v3 응답 검출기. 첫 블록 경계 상태(`dlm_steering/fitting/fit_boundary_detector.py`)로 학습 |
+
+응답 검출기 층(20)이 게이트 층(14)과 다르므로 v3의 경계 감사는 다음 forward에 편승하지 않고 별도의 무조향
+forward로 검출기 층까지만 읽습니다(`dlm_steering/defenses/recovery.py`의 `_audit_piggyback`). LLaDA처럼 두
+층이 같으면 이전과 동일하게 편승합니다. 체크포인트의 `layer`·`pool` 키가 이 동작을 결정하며 결과 JSON의
+`defense.response_detector_layer`에 기록됩니다.
+
+```bash
+# 배포 설정 그대로 한 번 실행 (과잉 거절, XSTest-safe 250)
+.venv/bin/python exp.py --model dream --attack none --defense ours --remask v3 --steer adaptive --layer 20 \
+  --response-detector outputs/dream/response_detector3_committed_L20.pt \
+  --remask-prompt --remask-prompt-frac 0.8 --source xstest_safe --n 250 \
+  --gen-length 128 --steps 128 --block-length 32 --seed 42 --gpus 0,1 \
+  --out outputs/dream/XSTest-safe-none-v3rp80-42.json
+```
+
+### 실험 스크립트
+
+공통 설정은 `script/dream_common.sh`에 있고 환경 변수로 바꿉니다
+(`TAG`=v3rp80, `SEEDS`="42 43 44", `STEER_LAYER`=20, `PROMPT_FRAC`=0.8, `RESPONSE_DETECTOR`, `GEN`/`STEPS`/`BLOCK`,
+`GPUS`/`PROCS_PER_GPU`는 `common.sh`). 출력은 `outputs/dream/<SET>-<attack>-<TAG>-<seed>.json`이고 완료된 파일은 건너뜁니다.
+
+| 스크립트 | 내용 | 후속 |
+|---|---|---|
+| `script/run_dream_overrefusal.sh` | XSTest-safe(250) + TruthfulQA(817) 생성 | `script/judge_dream_overrefusal.sh` (XSTest 3분류 판정 → `OR-summary-<TAG>.{json,md}`), `script/judge_dream_truthfulqa.sh` (truthful/informative → `*_tqa.json`) |
+| `script/run_dream_pap.sh` | PAP 캐시 공격, temperature 0.2. 기본 JBB; `SOURCES="jbb_harmful harmbench strongreject"` | `script/eval_dream_pap.sh` (LG4 + StrongREJECT + `script/report.py`) |
+| `script/run_dream_math500.sh` | MATH-500 정확도, 방어 vs `--defense none` (`DEFS`) | 내부에서 `eval_utility.py` 실행 |
+| `script/run_dream_truthfulqa_mc.sh` | TruthfulQA MC1 정확도 | 내부에서 `eval_utility.py` 실행 |
+
+응답 검출기를 다시 맞추려면 (arm별 생성 → LG4 라벨 → CPU 재적합):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m dlm_steering.fitting.fit_boundary_detector --model dream --arms wildjailbreak,alpaca --gen-only
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m dlm_steering.fitting.fit_boundary_detector --model dream --arms wj_benign --gen-only
+.venv/bin/python -m dlm_steering.fitting.fit_boundary_detector --model dream --pool committed --layer 20 --balanced \
+  --from-samples outputs/dream/boundary_samples_{wildjailbreak,wj_benign,alpaca}.pt \
+  --out outputs/dream/response_detector3_committed_L20.pt
+```
+
+벡터·게이트 검출기·임계값은 LLaDA와 같은 `MODEL=dream script/build_vectors.sh` 경로로 만듭니다. Dream에서
+`--detector-layer`/`--layer`를 생략하면 각 번들의 `best_layer`를 쓰므로 벡터는 `--layer 20`을 명시합니다.
+
+### LLaDA와 다른 점 (구현)
+
+- Dream의 `lm_head`는 다음 위치를 예측하도록(AR shift) 학습되어 있어 `dlm_steering/runtime/models.py`의
+  `ShiftedLogits` 래퍼가 `model(x).logits[0, p]`가 p번째 슬롯을 가리키도록 정렬합니다. hidden state는 위치별
+  residual stream 그대로라 훅·검출기는 수정 없이 동작합니다.
+- 디코딩은 Dream 자체 `diffusion_generate` 규칙의 이식(`dream_sampler.py`, `--decoder dream`이 기본값)입니다.
+  블록 없이 전체 시퀀스를 `--steps` 타임스텝으로 채우고 스텝마다 `--alg`(origin 기본)로 고른 위치를 `--top-p 0.95
+  --top-k 50`으로 샘플링합니다. 방어 없이 같은 seed면 네이티브 출력과 토큰 단위로 일치합니다. `--remasking`/`--schedule`은
+  무시됩니다. Dream 원본 `sample_tokens`는 `Categorical(probs).sample()`을 try/except로 감싸는데, bf16 로짓에서는 확률 합
+  검증(|합−1| < 1e-6)이 스텝의 약 1%에서 실패해 그 스텝만 greedy가 되고 난수도 소비하지 않습니다. `dream_sampler.py`는 이
+  동작까지 재현하므로(`_categorical_would_raise`) `origin/dream` 브랜치로 만든 `outputs/dream/*-v3rp80-*` 결과와 같은 seed에서
+  토큰 단위로 같습니다.
+- v3의 "블록 경계"는 Dream에서는 위치가 아니라 시간 단위입니다. 답변 슬롯이 `--block-length`개 새로 확정될 때마다 그
+  토큰들을 한 블록으로 감사하고, 트리거되면 그 토큰들(+`--remask-prompt` 대상)을 remask해 Dream 규칙으로
+  `--recovery-steps` 타임스텝 동안 조향하며 재생성합니다(`dream_sampler.dream_denoise`).
+- Dream 토크나이저는 `<|im_start|>`/`<|im_end|>`를 special로 취급하지 않아 `load_model`이 둘을 special로 등록해
+  생성문에서 지워지게 합니다.
+- DiffuGuard 베이스라인은 LLaDA 전용입니다(`third_party/diffuguard.py`). Dream은 저자의 별도 러너가 필요해 `exp.py`가
+  `--model dream --defense diffuguard`를 거부합니다.
+
 ## 코드 구조
 
 공격·방어·평가·실행 지원 코드는 `dlm_steering/` 아래에서 역할별로 관리합니다.
@@ -177,6 +253,7 @@ dlm_steering/
 ├── defenses/         # 방어 인터페이스, steering, V3 복구, baseline
 ├── evaluation/       # 평가기, JSONL 재개, 공격별 집계, 캐시, 결과 형식
 ├── runtime/          # 모델 로딩, 데이터, 재현성, GPU 작업 분배, JSON 저장
+├── fitting/          # 벡터·검출기·임계값 학습, 거절/TruthfulQA 판정 CLI (python -m dlm_steering.fitting.<모듈>)
 └── launcher/         # 대화형 입력, 실행 계획, 프로세스 실행, 진행률·결과 표시
 ```
 
@@ -189,8 +266,10 @@ dlm_steering/
 | `sampler.py` / `dream_sampler.py` | LLaDA / Dream 디퓨전 샘플러 |
 | `models.py` / `model_loading.py` | 타깃 모델 설정 / 사전학습 가중치 로딩 지원 |
 | `ollama_runtime.py` | 전용 Ollama 서버와 시작·종료 관리 |
-| `steering/` | 벡터·검출기 학습과 거절 평가. `python -m steering.<모듈>`로 실행 |
+| `dlm_steering/fitting/` | 벡터·검출기·임계값 학습과 거절/TruthfulQA 판정 CLI. `python -m dlm_steering.fitting.<모듈>`로 실행 |
+| `dlm_steering/fitting/fit_boundary_detector.py` / `judge_truthfulqa.py` / `aggregate_dream_overrefusal.py` | Dream 첫 경계 응답 검출기 학습 / TruthfulQA truthful·informative 판정 / Dream 과잉 거절 seed 집계 |
 | `script/` | 실험 조합 실행·운영 스크립트 |
+| `script/dream_common.sh`, `script/run_dream_*.sh`, `script/judge_dream_*.sh`, `script/eval_dream_pap.sh` | Dream 배포 설정과 과잉 거절·PAP·MATH-500·TruthfulQA MC 실행/판정 |
 | `data/` / `attacks/` | 데이터 / 고정 공격 프롬프트 자원 |
 | `outputs/` | 생성·평가 결과와 방어 체크포인트 |
 | `third_party/` | 프로젝트에 포함한 DiffuGuard 생성기와 출처 정보 |

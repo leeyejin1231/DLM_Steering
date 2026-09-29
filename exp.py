@@ -18,13 +18,11 @@ Usage:
     # over-refusal: benign prompts under the same defense, then judge refusals
     CUDA_VISIBLE_DEVICES=1 python exp.py --attack none --defense ours --remask v3 \
         --source truthfulqa --n 200 --out outputs/TQA-none-v3-42.json
-    python -m steering.judge_refusal --in outputs/TQA-none-v3-42.json \
+    python -m dlm_steering.fitting.judge_refusal --in outputs/TQA-none-v3-42.json \
         --out outputs/TQA-none-v3-42_judged.json
 """
 
 import argparse
-import json
-import sys
 import threading
 import time
 from pathlib import Path
@@ -32,9 +30,8 @@ from pathlib import Path
 from Attacker import ATTACKERS
 from common import (MODEL_KEY, MODEL_NAME, add_model_arg, PROMPT_SOURCES, enable_reproducibility,
                     force_math_attention, load_llada, load_prompts,
-                    plan_shards, read_jobs, release_cublas_env, run_eval_shards,
-                    run_persistent_jobs, seed_all, strip_argv_flag, worker_devices,
-                    write_json)
+                    plan_shards, release_cublas_env, run_eval_shards,
+                    seed_all, worker_devices, write_json)
 from Defender import DEFENDERS
 from experiment_row import RowExecution
 from dlm_steering.runtime.progress import task_progress
@@ -78,8 +75,10 @@ def parse_args(argv=None):
                    help="Bitwise-deterministic generation: fixed seeds, deterministic "
                         "kernels, math SDPA backend. Slower but identical across GPUs.")
     p.add_argument("--gpus", default=None,
-                   help="Comma-separated GPU ids: keep a model on each GPU and "
-                        "distribute row chunks as workers finish.")
+                   help="Comma-separated GPU ids (e.g. 0,1): one subprocess per "
+                        "GPU over a contiguous slice of the prompt set, parts "
+                        "merged into --out. Rows are seeded by index, so the "
+                        "result is identical to a single-GPU run.")
     p.add_argument("--procs-per-gpu", default="1",
                    help="Generation workers per --gpus card: an integer, or "
                         "'auto' for as many as each card's free memory holds "
@@ -87,12 +86,7 @@ def parse_args(argv=None):
                         "(rows are seeded by index). Default 1: a second worker "
                         "measured ~10%% slower on ~330-token rows, where one "
                         "worker already saturates the GPU. Ignored by "
-                        "two-model attacks and --chunk-size 0.")
-    p.add_argument("--jobs", help="JSON list of experiment CLI argument lists; "
-                   "reuse models across conditions (each job supplies --out)")
-    p.add_argument("--chunk-size", type=int, default=2,
-                   help="Rows per GPU task (default 2); 0 uses static sharding "
-                        "for a single experiment, or whole-condition jobs")
+                        "two-model attacks.")
     p.add_argument("--row-workers", type=int, default=1,
                    help="Interleave this many prompt rows per shard process: "
                         "while one row's target response denoises, another "
@@ -115,28 +109,10 @@ def parse_args(argv=None):
     return args
 
 
-def run_sharded(args, devices, argv=None):
-    """Distribute row chunks to persistent GPU workers and merge results.
-
-    Paired-model attacks and --chunk-size 0 retain the static shard launcher.
-    Per-row seeds preserve generation across task assignments.
-    """
-    if args.chunk_size and not ATTACKERS[args.attack].needs_second_device:
-        job = strip_argv_flag(sys.argv[1:] if argv is None else argv, "--gpus")
-        job = strip_argv_flag(job, "--procs-per-gpu")
-        # --out may have been left at its normal CLI default.
-        job = [*strip_argv_flag(job, "--out"), "--out", args.out]
-        report = run_persistent_jobs("generate", [job], ",".join(devices),
-                                     chunk_size=args.chunk_size)
-        payload = json.loads(Path(args.out).read_text())
-        results = payload["results"]
-    else:
-        return run_static_sharded(args, devices)
-    _summarize_shards(args, results)
-    print(f"Done in {report['seconds']:.2f}s")
-
-
-def run_static_sharded(args, devices):
+def run_sharded(args, devices):
+    """One subprocess per entry of `devices`, each over a contiguous slice of
+    the prompt set; the parts are merged into --out. Rows are seeded by index,
+    so the merged file is identical to a single-process run."""
     if ATTACKERS[args.attack].needs_second_device:
         print(f"attack needs a second device per shard: {len(devices)} "
               f"shards over pairs {devices}")
@@ -157,19 +133,8 @@ def _summarize_shards(args, results):
         print(summary)
 
 
-def main(argv=None, loaded=None):
+def main(argv=None):
     args = parse_args(argv)
-    if args.chunk_size < 0:
-        raise ValueError("chunk-size must be nonnegative")
-    if args.jobs:
-        if loaded is not None:
-            raise ValueError("a worker cannot launch nested jobs")
-        gpus = args.gpus and ",".join(worker_devices(args.gpus, args.procs_per_gpu))
-        report = run_persistent_jobs("generate", read_jobs(args.jobs), gpus,
-                                     chunk_size=args.chunk_size)
-        write_json(args.jobs + ".timing.json", report)
-        print(f"Done in {report['seconds']:.2f}s")
-        return
     if args.defense == "ours":
         required = [args.detector]
         if args.steer != "none":
@@ -184,31 +149,25 @@ def main(argv=None, loaded=None):
         ATTACKERS[args.attack].validate_inputs(args)
     except FileNotFoundError as exc:
         raise SystemExit(str(exc)) from None
-    if loaded is not None and args.gpus:
-        raise ValueError("a reused model must run on its worker's GPU")
     if args.gpus:
         # [] means one shard: plan_shards pinned this process to that GPU and
         # the run continues inline instead of spawning a single child.
         pairs = ATTACKERS[args.attack].needs_second_device
-        devices = ([] if pairs or not args.chunk_size else
-                   worker_devices(args.gpus, args.procs_per_gpu))
+        devices = [] if pairs else worker_devices(args.gpus, args.procs_per_gpu)
         if len(devices) > len(set(devices)):
             print("workers per GPU: " + ", ".join(
                 f"{g}x{devices.count(g)}" for g in dict.fromkeys(devices)))
         else:
             devices = plan_shards(args.gpus, pairs=pairs)
         if devices:
-            return run_sharded(args, devices, argv)
+            return run_sharded(args, devices)
     if args.reproduct:
         enable_reproducibility(args.seed)
     else:
         seed_all(args.seed)
 
-    if loaded is None:
-        print(f"loading {MODEL_NAME} ...")
-        tokenizer, model = load_llada()
-    else:
-        tokenizer, model = loaded
+    print(f"loading {MODEL_NAME} ...")
+    tokenizer, model = load_llada()
     if args.reproduct:
         force_math_attention()
         if (not ATTACKERS[args.attack].needs_second_device

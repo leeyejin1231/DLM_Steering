@@ -14,7 +14,7 @@ def extra_args():
     text = ask('추가 CLI 옵션 (기본값 유지: Enter)', '')
     args = shlex.split(text)
     reserved = {'--attack', '--defense', '--source', '--seed', '--gpus', '--out', '--in',
-                '--jobs', '--n', '--start', '--pap-cache', '--reproduct', '--model',
+                '--n', '--start', '--pap-cache', '--reproduct', '--model',
                 '--procs-per-gpu'}
     if any(token.startswith('--') and any(flag.startswith(token.split('=')[0]) for flag in reserved) for token in args):
         raise ValueError('공격·방어·입력·출력·시드·GPU·범위·캐시는 위 질문으로 설정하세요.')
@@ -193,7 +193,7 @@ def detector_plan(folder, *, ask=ask, choose=choose):
     if Path(REPO/out).is_file():
         print(f'경고: {out} 을 덮어씁니다. 가중치가 달라지면 검출기 지문이 바뀌므로 '
               '기존 실행으로 뽑아 둔 임계값 프로브와는 더 이상 비교할 수 없습니다.')
-    args = ['-m', 'steering.fit_response_detector', '--model', model_key,
+    args = ['-m', 'dlm_steering.fitting.fit_response_detector', '--model', model_key,
             '--groups', str(wild), '--alpaca-groups', str(alpaca),
             '--layer', str(layer), '--C', str(reg), '--threshold', str(cutoff),
             '--device', device, '--guard-device', guard, '--out', out,
@@ -204,28 +204,6 @@ def detector_plan(folder, *, ask=ask, choose=choose):
                                  'alpaca': alpaca, 'layer': layer, 'C': reg,
                                  'threshold': cutoff, 'out': out,
                                  'refresh_cache': refresh})], []
-
-
-def threshold_plan(folder, *, ask=ask, choose=choose):
-    """Build the response-threshold sweep over existing --remask v3 probe runs.
-
-    The audit stores each row's probability before comparing it with the cutoff,
-    so one probe run per dataset covers every candidate threshold at once.
-    """
-    from models import MODELS
-    model_key = choose('프로브 모델', [(key, spec['name']) for key, spec in MODELS.items()])
-    seed = ask('프로브 시드 (전체: all)', '42')
-    ceiling = ask('허용 최대 오탐률 (무해·성능 세트 평균 트리거율)', 0.15, real)
-    if not 0 < ceiling < 1:
-        raise ValueError('오탐률 상한은 0과 1 사이여야 합니다.')
-    args = ['--auto', '--model', model_key, '--max-false-positive', str(ceiling),
-            '--out', str(folder/'threshold.json')]
-    if seed != 'all':
-        args += ['--seed', str(integer(seed))]
-    print('공격(DIJA) 세트는 트리거가 많을수록, 무해·성능 세트는 적을수록 좋은 것으로 집계합니다.')
-    return [command('tune_response_threshold.py', args,
-                    {'model': model_key, 'seed': seed,
-                     'max_false_positive': ceiling})], []
 
 
 def _result_source(inp):

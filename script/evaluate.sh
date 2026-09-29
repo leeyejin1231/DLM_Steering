@@ -36,7 +36,7 @@ A=$!
             --out "outputs/gated_sr_len$L.json" > "log/gated_sr_$L.log" 2>&1
     done
     for s in xstest jbb tqa; do
-        $PY -m steering.judge_refusal --gpus "$OLLAMA_GPUS" \
+        $PY -m dlm_steering.fitting.judge_refusal --gpus "$OLLAMA_GPUS" \
             --in "outputs/gated_or30_$s.json" \
             --out "outputs/gated_or30_${s}_judged.json" > "log/gated_judge_$s.log" 2>&1
     done

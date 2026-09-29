@@ -1,30 +1,41 @@
 #!/bin/bash
-# Evaluate the Dream PAP runs: Llama Guard 4 (kotox env, transformers 5.x) and
-# StrongREJECT (gpt-oss:20b over ollama), both sharded over GPUs 0,1.
-set -u
-cd /home/yejin/contents/DLM_Steering
-export HF_HOME=/mnt/shared/huggingface-cache/hub HUGGINGFACE_HUB_CACHE=/mnt/shared/huggingface-cache/hub HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false
-PY=/home/yejin/anaconda3/bin/python
-PYLG=/home/yejin/anaconda3/envs/kotox/bin/python
-until grep -q "ALL PAP GENERATION DONE" log/dream_pap_driver.log 2>/dev/null; do sleep 30; done
-for SEED in 42 43 44; do
-  F=outputs/dream/JBB-pap-v3rp80-${SEED}.json
-  [ -s "$F" ] || { echo "missing $F"; continue; }
+# Grade the Dream PAP runs from script/run_dream_pap.sh: Llama Guard 4 (ASR) and
+# StrongREJECT (gpt-oss:20b over ollama), both sharded over $GPUS. Llama Guard 4
+# runs under $PYLG (transformers 5.x), as in script/run_ablation_dija_jbb.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/dream_common.sh"
+export HF_HOME="${HF_HOME:-/mnt/shared/huggingface-cache}" TOKENIZERS_PARALLELISM=false
+PYLG=${PYLG:-/home/yejin/anaconda3/envs/kotox/bin/python}
+SOURCES=${SOURCES:-jbb_harmful}
+
+FILES=()
+for SRC in $SOURCES; do
+  case $SRC in jbb_harmful) P=JBB ;; harmbench) P=HB ;; strongreject) P=SR ;; *) echo "unknown source $SRC"; exit 1 ;; esac
+  for SEED in $SEEDS; do FILES+=("$DREAM_OUT/$P-pap-$TAG-$SEED.json"); done
+done
+
+say "Llama Guard 4 ($(date '+%F %T'))"
+for F in "${FILES[@]}"; do
   LG=${F%.json}_lg4.json
-  if [ ! -s "$LG" ]; then
-    echo "=== $(date '+%F %T') LG4 $F"
-    $PYLG eval_llamaguard.py --in "$F" --out "$LG" --gpus 0,1 > "log/lg4_JBB-pap-v3rp80-${SEED}.log" 2>&1
-    echo "=== $(date '+%F %T') LG4 rc=$?"; grep -E '"asr"' "$LG" | head -1
-  fi
+  [ -s "$F" ] || { echo "missing $F"; continue; }
+  [ -s "$LG" ] && continue
+  HUGGINGFACE_HUB_CACHE="$HF_HOME/hub" \
+    "$PYLG" eval_llamaguard.py --in "$F" --out "$LG" --gpus "$GPUS" > "log/lg4_$(basename "${F%.json}").log" 2>&1 \
+    || echo "LG4 FAILED: $F"
+  grep -E '"asr"' "$LG" 2>/dev/null | head -1
 done
-for SEED in 42 43 44; do
-  F=outputs/dream/JBB-pap-v3rp80-${SEED}.json
+
+say "StrongREJECT / gpt-oss ($(date '+%F %T'))"
+for F in "${FILES[@]}"; do
   SR=${F%.json}_sr.json
-  if [ -s "$F" ] && [ ! -s "$SR" ]; then
-    echo "=== $(date '+%F %T') SR $F"
-    LD_PRELOAD=/home/yejin/anaconda3/lib/libstdc++.so.6 $PY run_sr_eval.py --in "$F" --out "$SR" --gpus 0,1 > "log/sr_JBB-pap-v3rp80-${SEED}.log" 2>&1
-    echo "=== $(date '+%F %T') SR rc=$?"; grep -E '"asr"' "$SR" | head -1
-  fi
+  [ -s "$F" ] || continue
+  [ -s "$SR" ] && continue
+  "$PY" run_sr_eval.py --in "$F" --out "$SR" --gpus "$GPUS" > "log/sr_$(basename "${F%.json}").log" 2>&1 \
+    || echo "SR FAILED: $F"
+  grep -E '"asr"' "$SR" 2>/dev/null | head -1
 done
-podman stop ollama-50001 ollama-50002 >/dev/null 2>&1
+podman stop $(for g in ${GPUS//,/ }; do echo -n "ollama-$((50001 + g)) "; done) >/dev/null 2>&1 || true   # containers may already be down; common.sh sets -e
+
+say "report"
+"$PY" script/report.py $(for F in "${FILES[@]}"; do ls "${F%.json}_lg4.json" "${F%.json}_sr.json" 2>/dev/null; done)
 echo "ALL PAP EVAL DONE $(date '+%F %T')"

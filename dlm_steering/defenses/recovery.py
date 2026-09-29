@@ -2,7 +2,8 @@
 import math
 from dataclasses import asdict
 import torch
-from dlm_steering.runtime.constants import MODEL_LOCK, TURN_BREAKERS
+from dlm_steering.runtime.constants import MODEL_LOCK, TURN_BREAKERS, block_index
+from dlm_steering.runtime.models import model_blocks
 from sampler import take_true
 from .base import _BoundaryReading, _GateReached, _PendingAudit, _prompt_text_mask
 from .steering import Ours
@@ -11,12 +12,15 @@ from .steering import Ours
 class V3(Ours):
     """--remask v3: response-detector boundary audit and block recovery.
 
-    At each block boundary an unsteered audit forward pools gate-layer
-    features over the committed tokens and scores them with a
-    logistic-regression response detector (--response-detector; its layer
-    must match --detector-layer). A trigger on the first block reopens the
-    whole block and regenerates it over --recovery-steps dedicated
-    forwards.
+    At each block boundary an unsteered audit forward pools features over the
+    committed tokens and scores them with a logistic-regression response
+    detector (--response-detector) at the checkpoint's own layer; gate
+    projections still come from the gate layer. When the two layers coincide
+    (LLaDA: both 18) the audit rides the next defended forward; a detector at
+    another layer (Dream: gate 14, response detector 20) or one fitted on the
+    whole answer region runs as a separate unsteered pass. A trigger on the
+    first block reopens the whole block and regenerates it over
+    --recovery-steps dedicated forwards.
     """
 
     name = "v3"
@@ -59,8 +63,20 @@ class V3(Ours):
         self.infill_checkpoint = int(infill_checkpoint)
         self.recovery_alpha_growth = float(recovery_alpha_growth)
         super().__init__(model, remask_enabled=True, **kw)
-        if int(response_detector["layer"]) != self.gate_layer:
-            raise ValueError("response detector layer must match the gate layer")
+        blocks = model_blocks(model)
+        self.det_layer = int(response_detector["layer"])
+        if not 1 <= self.det_layer <= len(blocks):
+            raise ValueError(f"response detector layer must be in 1..{len(blocks)}")
+        self.det_block = blocks[block_index(self.det_layer)]
+        # Which answer slots the detector pools: the committed ones (default) or
+        # the whole region including still-masked slots ("mean_region_*").
+        self._det_pool_region = "region" in str(response_detector.get("pool", ""))
+        # A boundary audit may ride the next defended forward only when it reads
+        # the gate layer's committed pool, which sits before every steering
+        # layer. Another layer (possibly after steering) or the region pool
+        # needs its own unsteered pass.
+        self._audit_piggyback = (self.det_layer == self.gate_layer
+                                 and not self._det_pool_region)
         device = self.gate_vector.device
         self._det_weight = torch.as_tensor(
             response_detector["weight"], dtype=torch.float32, device=device)
@@ -94,9 +110,13 @@ class V3(Ours):
     def _chunk_positions(positions, size=32):
         return [positions[i:i + size] for i in range(0, positions.numel(), size)]
 
-    def _audit_vector(self, feats):
-        """[committed + chunks] pooled features -> projection/logit/prob vector."""
-        logit = feats[0] @ self._det_weight + self._det_bias
+    def _audit_vector(self, feats, det_feats=None):
+        """[committed + chunks] pooled features -> projection/logit/prob vector.
+
+        feats are gate-layer features (gate projections); det_feats are the
+        response detector's own layer/pool, None when both coincide."""
+        det = feats if det_feats is None else det_feats
+        logit = det[0] @ self._det_weight + self._det_bias
         return torch.cat([feats @ self.gate_vector,
                           logit.reshape(1), torch.sigmoid(logit.reshape(1))])
 
@@ -119,30 +139,43 @@ class V3(Ours):
     @torch.no_grad()
     def _audit(self, x, region, chunks):
         """One unsteered forward capturing gate-layer features pooled over the
-        committed tokens and each chunk of the finished block."""
-        pools = self._audit_pools(
-            (region[0] & (x[0] != self.mask_id)).nonzero().flatten(), chunks)
-        feats_out = []
-        capture = self._audit_capture_hook(pools, feats_out)
+        committed tokens and each chunk of the finished block -- and, when the
+        response detector reads another layer or pool, those features too."""
+        committed = (region[0] & (x[0] != self.mask_id)).nonzero().flatten()
+        pools = self._audit_pools(committed, chunks)
+        gate_out, det_out = [], []
+        hooks = [(self.gate_block, self._audit_capture_hook(pools, gate_out))]
+        if not self._audit_piggyback:
+            det_pools = ([region[0].nonzero().flatten(), *chunks]
+                         if self._det_pool_region else pools)
+            hooks.append((self.det_block,
+                          self._audit_capture_hook(det_pools, det_out)))
+        # Nothing after the deeper of the two blocks changes what the audit
+        # reads, so the forward stops there -- see _GateReached. ln_f is never
+        # reached, vocab projection included. The stop hook is registered
+        # last, so the capture hooks on that block have already run.
+        stop_block = (self.det_block if self.det_layer > self.gate_layer
+                      else self.gate_block)
 
-        def capture_and_stop(module, inputs, output):
-            capture(module, inputs, output)
+        def stop(module, inputs, output):
             raise _GateReached
 
-        # Audits read only gate-layer features, so the forward stops there --
-        # see _GateReached. ln_f is never reached, vocab projection included.
         with MODEL_LOCK:
-            handle = self.gate_block.register_forward_hook(capture_and_stop)
+            handles = [block.register_forward_hook(hook) for block, hook in hooks]
+            handles.append(stop_block.register_forward_hook(stop))
             try:
                 self.model(x)
             except _GateReached:
                 pass
             finally:
-                handle.remove()
+                for handle in handles:
+                    handle.remove()
         self.audit_forwards += 1
-        if len(feats_out) != 1:
+        if len(gate_out) != 1 or len(det_out) != len(hooks) - 1:
             raise RuntimeError("audit hook must execute exactly once per forward")
-        return self._reading(self._audit_vector(feats_out[0]).tolist(), len(chunks))
+        det = det_out[0] if det_out else None
+        return self._reading(self._audit_vector(gate_out[0], det).tolist(),
+                             len(chunks))
 
     @torch.no_grad()
     def after_block(self, x, region, *, block_number, block_positions,
@@ -160,8 +193,9 @@ class V3(Ours):
                               prompt_length=prompt_length,
                               temperature=temperature, remasking=remasking,
                               rng=rng, sampling=sampling)
-        if last_block:
-            # No later forward to piggyback on; audit with a dedicated pass.
+        if last_block or not self._audit_piggyback:
+            # No later forward to piggyback on, or the detector reads a layer
+            # the next forward may steer: audit with a dedicated unsteered pass.
             reading = self._audit(x, region, self._chunk_positions(
                 block_positions[0].nonzero().flatten()))
             self._apply_audit(x, region, reading, audit=audit)
@@ -372,6 +406,8 @@ class V3(Ours):
                  infill_checkpoint=self.infill_checkpoint,
                  recovery_alpha_growth=self.recovery_alpha_growth,
                  response_threshold=self._det_threshold,
+                 response_detector_layer=self.det_layer,
+                 response_detector_pool=self.response_detector.get("pool"),
                  response_detector_source=self.response_detector.get("source"),
                  response_detector_prompt_tail=self._det_prompt_tail,
                  response_detector_fingerprint=self.detector_fingerprint())

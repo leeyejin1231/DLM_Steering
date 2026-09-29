@@ -15,7 +15,7 @@ hidden_states[L] is the input to block L, i.e. the output of block L-1, so a
 direction fitted at layer L is applied by hooking blocks[L-1] (see llada_steering).
 
 Usage:
-    CUDA_VISIBLE_DEVICES=1 python -m steering.fit_vector
+    CUDA_VISIBLE_DEVICES=1 python -m dlm_steering.fitting.fit_vector
 """
 
 from common import OUT_DIR, DETECTOR_LAYER, MODEL_KEY, add_model_arg
@@ -30,7 +30,7 @@ import torch
 from common import (
     FIT_LAYERS, MODEL_NAME, MASK_ID, auroc, load_llada, prompt_token_ids)
 
-ROOT = Path(__file__).resolve().parent.parent
+from dlm_steering.paths import REPO as ROOT
 
 @torch.no_grad()
 def collect(model, tokenizer, pairs, t_list, max_resp, layers, seed, device):

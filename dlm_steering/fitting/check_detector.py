@@ -13,7 +13,7 @@ These contrasts hold length and source fixed and vary only permissibility:
     jbb_harmful   vs jbb_benign    index-matched counterparts, topic controlled
 
 Usage:
-    CUDA_VISIBLE_DEVICES=1 python -m steering.check_detector
+    CUDA_VISIBLE_DEVICES=1 python -m dlm_steering.fitting.check_detector
 """
 
 from common import OUT_DIR, DETECTOR_LAYER, MODEL_KEY, add_model_arg
@@ -27,9 +27,9 @@ import torch
 
 from common import (
     auroc, load_detector_bundle, load_eval_prompts, load_llada)
-from steering.fit_detector import collect
+from dlm_steering.fitting.fit_detector import collect
 
-ROOT = Path(__file__).resolve().parent.parent
+from dlm_steering.paths import REPO as ROOT
 
 def main():
     ap = argparse.ArgumentParser()
