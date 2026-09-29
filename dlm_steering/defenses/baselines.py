@@ -1,4 +1,3 @@
-"""SelfReminder prompts and the bundled DiffuGuard adapter."""
 import math
 import torch
 from dlm_steering.runtime.constants import MASK_ID, MODEL_LOCK
@@ -6,9 +5,6 @@ from .base import Defender, NullDefender, _prompt_text_mask
 
 
 class SelfReminder(NullDefender):
-    """Prompt-side baseline: prepends a responsibility reminder to the user turn.
-    Model behaviour is untouched (plain forwards)."""
-
     name = "selfreminder"
     DEFAULT_REMINDER = (
         "You are a responsible AI assistant.\n"
@@ -38,15 +34,11 @@ class SelfReminder(NullDefender):
 
 
 class DiffuGuard(NullDefender):
-    """Adapter to the included author's LLaDA generator."""
-
     name = "diffuguard"
     needs_vanilla = True
 
     def prepare(self, tokenizer, vanilla_ids):
         super().prepare(tokenizer, vanilla_ids)
-        # PAIR candidates in this row share the same clean reference.
-        # A new row must recompute it, even when the defender is reused.
         self._baseline_hidden = None
         self._baseline_model = None
 
@@ -57,9 +49,7 @@ class DiffuGuard(NullDefender):
         parser.add_argument("--refinement-steps", type=int, default=8)
         parser.add_argument("--remask-ratio", type=float, default=0.9)
         parser.add_argument("--repair-scope", choices=["all", "first"], default="all",
-                            help="DiffuGuard repair eligibility: all answer blocks "
-                                 "(default), or only the first block. Prompt text "
-                                 "is eligible in the first block in both modes.")
+                            help="DiffuGuard repair eligibility: all answer blocks (default), or only the first block. Prompt text is eligible in the first block in both modes.")
 
     @classmethod
     def from_args(cls, args, model):
@@ -91,14 +81,11 @@ class DiffuGuard(NullDefender):
             raise RuntimeError("Incompatible bundled DiffuGuard block schedule")
         with MODEL_LOCK, torch.random.fork_rng(devices=[prompt_ids.device]):
             if rng is not None:
-                # Advance the row generator across iterative attack candidates.
-                # Reusing initial_seed() restarted the same stream each time.
                 torch.cuda.set_rng_state(rng.get_state(), prompt_ids.device)
             baseline = (self._baseline_hidden
                         if not model.training and self._baseline_model is model else None)
             if baseline is None:
-                baseline = model(self.vanilla_ids, output_hidden_states=True,
-                                 return_dict=True).hidden_states[-1].mean(dim=1).squeeze(0)
+                baseline = model(self.vanilla_ids, output_hidden_states=True, return_dict=True).hidden_states[-1].mean(dim=1).squeeze(0)
                 # Only fixed eval-mode forwards can be reused without changing
                 # the reference or consuming a different number of RNG draws.
                 self._baseline_hidden = baseline if not model.training else None

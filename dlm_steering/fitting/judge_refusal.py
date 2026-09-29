@@ -1,20 +1,3 @@
-"""Judge refusal vs compliance with the XSTest three-way rubric, via ollama.
-
-Substring matching is not good enough here: "I'm sorry to hear that you're going
-through this" is a compliance that trips every refusal prefix list, and "I'd
-rather not go into that" is a refusal that trips none. The XSTest paper uses an
-LLM judge with a full_compliance / full_refusal / partial_refusal rubric, and
-that is what Evaluator.Refusal reproduces against the local gpt-oss:20b server
-(which it starts itself when down).
-
-On a *safe* prompt set, over-refusal rate = (full_refusal + partial_refusal) / n.
-On an *unsafe* set the same quantity is the desired refusal rate.
-
-Usage:
-    python -m dlm_steering.fitting.judge_refusal --in outputs/or_xstest_safe_steer.json \
-                                     --out outputs/or_xstest_safe_steer_judged.json
-"""
-
 import argparse
 import json
 import time
@@ -22,6 +5,8 @@ from pathlib import Path
 
 from dlm_steering.runtime.execution import plan_shards, run_eval_shards
 from dlm_steering.evaluation.refusal import LocalRefusal, Refusal
+from dlm_steering.evaluation.streaming import _resume_stream, _item_key, _run_graded
+from ollama_runtime import OllamaServerPool
 
 def main():
     ap = argparse.ArgumentParser()
@@ -33,22 +18,17 @@ def main():
     ap.add_argument("--n", type=int, default=None,
                     help="judge only this many items (default all)")
     ap.add_argument("--gpus", default=None,
-                    help="Comma-separated GPU ids (e.g. 0,1): one ollama "
-                         "container per GPU on --port+i, shard items and merge")
+                    help="Comma-separated GPU ids (e.g. 0,1): one ollama container per GPU on --port+i, shard items and merge")
     ap.add_argument("--model", default="gpt-oss:20b")
     ap.add_argument("--auto-server", action="store_true",
-                    help="Manage private local Ollama servers (one per --gpus id) "
-                         "instead of podman containers, as run_sr_eval.py does.")
+                    help="Manage private local Ollama servers (one per --gpus id) instead of podman containers, as run_sr_eval.py does.")
     ap.add_argument("--port", type=int, default=50001)
     ap.add_argument("--gpu", type=int, default=1)
     ap.add_argument("--container", default=None,
-                    help="podman container name (default 'ollama'; sharded runs "
-                         "use ollama-<port> automatically)")
+                    help="podman container name (default 'ollama'; sharded runs use ollama-<port> automatically)")
     ap.add_argument("--judge", choices=["ollama", "local"], default="ollama",
-                    help="'ollama' is gpt-oss:20b through the podman container; "
-                         "'local' runs the same rubric on a local HF model "
-                         "(--judge-model) and needs no podman. The two judges "
-                         "do not agree on every borderline answer -- pick one "
+                    help="'ollama' is gpt-oss:20b through the podman container; 'local' runs the same rubric on a local HF model "
+                         "(--judge-model) and needs no podman. The two judges do not agree on every borderline answer -- pick one "
                          "and keep it for the whole comparison.")
     ap.add_argument("--judge-model", default="Qwen/Qwen3-14B",
                     help="HF model for --judge local.")
@@ -65,45 +45,31 @@ def main():
     t_start = time.time()
     devices = plan_shards(args.gpus) if args.gpus else []
     if args.auto_server and args.judge == "ollama":
-        # Private servers and one work queue over every GPU, as in run_sr_eval.py.
-        from dlm_steering.evaluation.streaming import _resume_stream, _item_key, _run_graded
-        from ollama_runtime import OllamaServerPool
-        items = items[args.start:
-                      args.start + args.n if args.n is not None else None]
+        items = items[args.start: args.start + args.n if args.n is not None else None]
         jsonl = Path(args.jsonl or Path(args.out).with_suffix(".jsonl"))
         _, done, stream = _resume_stream(jsonl, items)
         stream.close()
 
         def make_grader(port):
-            return Refusal(model=args.model, port=port, workers=args.workers,
-                           reasoning_effort=args.reasoning_effort,
-                           num_predict=args.num_predict, timeout_sec=600,
-                           start_container=False)
+            return Refusal(model=args.model, port=port, workers=args.workers, reasoning_effort=args.reasoning_effort,
+                           num_predict=args.num_predict, timeout_sec=600, start_container=False)
 
-        with OllamaServerPool(devices or [str(args.gpu)], args.out, args.model,
-                              args.workers, make_grader,
-                              sum(_item_key(it) not in done for it in items)) as pool:
-            judged = _run_graded(items, jsonl, pool.grade, workers=pool.capacity,
-                                 desc=f"RefusalJudge ({args.model})")
+        with OllamaServerPool(devices or [str(args.gpu)], args.out, args.model, args.workers, make_grader, sum(_item_key(it) not in done for it in items)) as pool:
+            judged = _run_graded(items, jsonl, pool.grade, workers=pool.capacity, desc=f"RefusalJudge ({args.model})")
         judged.sort(key=lambda r: r["index"])
         summary = Refusal.summarize(judged)
     elif devices:
         def extra(i, gpu):
-            # --judge local has no server to place, so only the ollama judge
-            # needs a port/container of its own per shard.
             if args.judge == "local":
                 return []
             port = args.port + i
             return ["--port", port, "--gpu", gpu,
                     "--container", f"ollama-{port}"]
-        # A shard child must re-enter as a module: running this file by path
-        # would put dlm_steering/fitting, not the repository root, on sys.path.
         judged, _ = run_eval_shards("dlm_steering.fitting.judge_refusal", args, len(items),
                                     extra_args=extra, devices=devices)
         summary = Refusal.summarize(judged)
     else:
-        items = items[args.start:
-                      args.start + args.n if args.n is not None else None]
+        items = items[args.start: args.start + args.n if args.n is not None else None]
         jsonl = args.jsonl or str(Path(args.out).with_suffix(".jsonl"))
         if args.judge == "local":
             judge = LocalRefusal(args.judge_model)

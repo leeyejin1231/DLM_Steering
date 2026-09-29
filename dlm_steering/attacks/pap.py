@@ -1,15 +1,8 @@
-"""PAP target calls using validated, pre-generated attack prompts."""
 from pap_common import TOP5, SAMPLING, assign_techniques, load_cache, require_cache
 from .base import NoAttack, AttackResult, _assistant_text
 
 
 class PAP(NoAttack):
-    """PAP: assign one of five techniques per row and apply it exactly once.
-
-    Reads prepared better in-context attack prompts from a validated cache.
-    Each row makes one target call; final grading is a separate evaluation.
-    """
-
     name = "pap"
     records_attempts = True
     def __init__(self, cache, seed=0):

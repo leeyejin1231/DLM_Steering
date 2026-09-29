@@ -1,7 +1,7 @@
 # DLM_Steering
 
 Gated activation steering with response-detector remasking (the `ours` defense) for
-masked-diffusion language models, evaluated against jailbreak attacks (PAP, PAIR, DIJA)
+masked-diffusion language models, evaluated against jailbreak attacks (PAP, DIJA)
 next to the DiffuGuard and Self-Reminder baselines. Target models are
 `GSAI-ML/LLaDA-8B-Instruct` (default) and `Dream-org/Dream-v0-Instruct-7B` (`--model dream`).
 

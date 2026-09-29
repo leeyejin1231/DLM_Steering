@@ -1,11 +1,9 @@
-"""Attack protocol, plain prompts, prefix prompts, and decoding helpers."""
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import NamedTuple
 
 
 class AttackResult(NamedTuple):
-    """run()'s per-row result: the attempt that gets recorded and graded."""
     attack_prompt: str     # user message as seen by the target (post-transform)
     generation: str        # text passed to the evaluators
     extra: dict            # attack-specific result fields
@@ -21,29 +19,26 @@ class Attacker(ABC):
 
     @classmethod
     def add_args(cls, parser):
-        """Register attack-specific CLI arguments (optional)."""
+        ...
 
     @classmethod
     def validate_inputs(cls, args):
-        """Check external inputs before loading models or launching workers."""
+        ...
 
     @classmethod
     def from_args(cls, args):
         return cls()
 
     def prepare_rows(self, rows):
-        """Configure dataset-wide state before slicing or GPU sharding."""
+        ...
 
     @abstractmethod
     def build_prompt(self, row):
-        """Return the user-turn text for this attack."""
+        ...
 
     @abstractmethod
     def decode(self, tokenizer, x, prompt_ids, vanilla_ids=None):
-        """Return (text_to_grade, extra result fields).
-
-        vanilla_ids: the un-attacked user turn encoded the same way (after the
-        defense's prompt transform), for attacks that grade relative to it."""
+        ...
 
     def run(self, row, respond, tokenizer, vanilla_ids=None, respond_batch=None):
         """Drive the per-row attack; default is the one-shot path.
@@ -107,6 +102,5 @@ def _default_attack_device():
     import torch
     if torch.cuda.device_count() > 1:
         return "cuda:1"
-    print("warning: one GPU visible -- the attack/judge LLM shares the card "
-          "with the target model and may OOM")
+    print("warning: one GPU visible -- the attack/judge LLM shares the card with the target model and may OOM")
     return "cuda:0"

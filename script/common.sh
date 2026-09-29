@@ -90,14 +90,13 @@ require() {
 }
 
 # ------------------------------------------------ shared by the run_*.sh drivers
-# MODEL selects the target (llada, dream, llada1.5) and its output folder.
+# MODEL selects the target (llada, dream) and its output folder.
 model_setup() {
     export MODEL="${MODEL:-llada}"
     case "$MODEL" in
         llada)    MODEL_OUT=outputs ;;
         dream)    MODEL_OUT=outputs/dream ;;
-        llada1.5) MODEL_OUT=outputs/llada1.5 ;;
-        *) echo "unknown MODEL=$MODEL (llada|dream|llada1.5)" >&2; exit 1 ;;
+        *) echo "unknown MODEL=$MODEL (llada|dream)" >&2; exit 1 ;;
     esac
     export MODEL_OUT
     mkdir -p "$MODEL_OUT"

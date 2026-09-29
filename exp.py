@@ -4,7 +4,8 @@ import time
 from pathlib import Path
 
 from dlm_steering.attacks import ATTACKERS
-from dlm_steering.runtime.constants import MODEL_KEY, MODEL_NAME, add_model_arg
+from dlm_steering.runtime.constants import MODEL_NAME
+from models import MODEL_KEY, add_model_arg
 from dlm_steering.runtime.data import PROMPT_SOURCES, load_prompts
 from dlm_steering.runtime.models import (enable_reproducibility, force_math_attention, load_llada, release_cublas_env, seed_all)
 from dlm_steering.runtime.execution import plan_shards, run_eval_shards, worker_devices

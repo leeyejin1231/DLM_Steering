@@ -1,12 +1,3 @@
-"""Aggregate the over-refusal runs of one model and tag over seeds.
-
-Reads <out-dir>/{XSTest-safe-none,TQA-none}-<tag>-<seed>.json (generation:
-gate/detector/remask rates) and the matching *_judged.json (XSTest 3-way
-refusal judge) and writes <out-dir>/OR-summary-<tag>.{json,md}.
-
-Usage:
-    python -m dlm_steering.fitting.aggregate_overrefusal --out-dir outputs/dream --tag v3rp80
-"""
 import argparse
 import json
 import statistics as st
@@ -53,13 +44,10 @@ def main():
             gs = gen_stats(json.load(open(g))["results"])
             js = json.load(open(j))["summary"] if j.exists() else {}
             rec = {"seed": s, **gs,
-                   **{k: js.get(k) for k in ("refusal_rate", "full_refusal_rate",
-                                             "2_full_refusal", "3_partial_refusal",
-                                             "n_parse_error")}}
+                   **{k: js.get(k) for k in ("refusal_rate", "full_refusal_rate", "2_full_refusal", "3_partial_refusal", "n_parse_error")}}
             per.append(rec)
             rr = f"{rec['refusal_rate'] * 100:.1f}" if rec.get("refusal_rate") is not None else "-"
-            fr = (f"{rec['full_refusal_rate'] * 100:.1f}"
-                  if rec.get("full_refusal_rate") is not None else "-")
+            fr = (f"{rec['full_refusal_rate'] * 100:.1f}" if rec.get("full_refusal_rate") is not None else "-")
             lines.append(f"| {name} | {s} | {gs['n']} | {rr} | {fr} | "
                          f"{gs['detector_trigger_rate'] * 100:.1f} | {gs['remask_rate'] * 100:.1f} | "
                          f"{gs['gate_open_rate'] * 100:.1f} |")

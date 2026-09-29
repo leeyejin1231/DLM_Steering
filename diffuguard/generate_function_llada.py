@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import re
 from typing import Iterable, Optional, Tuple
 
@@ -14,24 +13,18 @@ def _ids_from_phrases(tokenizer, phrases: Iterable[str]) -> set:
     ids = set()
     for ph in phrases:
         toks = tokenizer(ph, add_special_tokens=False).input_ids
-        # More robust: collect all tokens of the full phrase (avoid taking only the first which could yield an empty set)
         for t in toks:
             ids.add(t)
     return ids
 
-def build_cue_id_sets(tokenizer,
-                      accept_cues: Optional[Iterable[str]] = None,
-                      refuse_cues: Optional[Iterable[str]] = None) -> Tuple[set, set]:
+def build_cue_id_sets(tokenizer, accept_cues: Optional[Iterable[str]] = None, refuse_cues: Optional[Iterable[str]] = None):
     if accept_cues is None:
         accept_cues = ["Sure", "Of course", "Here", "Step", "1.", "First", "Proceed", "Let's"]
     if refuse_cues is None:
         refuse_cues = ["Sorry", "I can't", "cannot", "won't", "illegal", "harmful", "not assist", "refuse"]
     return _ids_from_phrases(tokenizer, accept_cues), _ids_from_phrases(tokenizer, refuse_cues)
 
-def safety_perplexity_from_logits(logits: torch.Tensor,
-                                  positions_mask: torch.Tensor,
-                                  accept_ids: set,
-                                  refuse_ids: set) -> float:
+def safety_perplexity_from_logits(logits: torch.Tensor, positions_mask: torch.Tensor, accept_ids: set, refuse_ids: set):
     with torch.no_grad():
         probs = torch.softmax(logits, dim=-1)
         if len(accept_ids) == 0 or len(refuse_ids) == 0:
@@ -56,23 +49,11 @@ def add_gumbel_noise(logits, temperature):
         return logits
     logits = logits.to(torch.float64)
     noise = torch.rand_like(logits, dtype=torch.float64)
-    # Follow the Gumbel-max idea: add noise (using float64 to reduce low-precision bias)
     gumbel_noise = (-torch.log(noise)) ** temperature
     return logits.exp() / gumbel_noise
 
 
 def _sample_masked(logits, mask_index, temperature, need_confidence=True):
-    """(x0, model_confidence) computed only on the still-masked rows.
-
-    The original loop ran the float64 Gumbel transform, argmax and softmax over
-    every position x the full vocab each step (30-60 ms, as much as the forward
-    itself), then discarded all but the masked rows: x0 is overwritten by x and
-    the confidence by -inf everywhere else. Here the noise is still DRAWN for
-    the full tensor, so the RNG stream is untouched, but the arithmetic runs on
-    the masked rows alone. Every op involved is per-element or per-row, so
-    those rows get bit-identical values. Single-sequence batches only; callers
-    fall back to the original code otherwise.
-    """
     rows = mask_index[0].nonzero(as_tuple=False).squeeze(1)
     sub = logits[0, rows]
     if temperature == 0:
@@ -122,7 +103,6 @@ def expand_span_masks_like_mmdm(text: str,
         n = max(int(m.group(1)), 0)
         return mask_token * n
     out = re.sub(SPECIAL_TOKEN_PATTERN, repl, str(text))
-    # If the sequence contains no mask but a tail is requested, append mask tail
     if add_tail_if_missing and (mask_token not in out) and (mask_counts > 0):
         out = out + (mask_token * mask_counts)
     return out
@@ -167,20 +147,15 @@ def generate(
     x = prompt.clone().to(device)   # [B, prompt_len]
     effective_gen_length = 0
     if int(gen_length) > 0:
-        tail = torch.full(
-            (prompt.shape[0], int(gen_length)),
-            mask_id, dtype=torch.long, device=device
-        )                           # [B, gen_length] all <mask>
+        tail = torch.full((prompt.shape[0], int(gen_length)), mask_id, dtype=torch.long, device=device)                           # [B, gen_length] all <mask>
         x = torch.cat([x, tail], dim=1)
         effective_gen_length = int(gen_length)
 
 
     prompt_index = x != mask_id
-    # --- Align attention_mask to the length of x (HF expects 2D mask [B, L]) ---
     am = None
     if attention_mask is not None:
         am = attention_mask.to(device)
-        # Convert to bool; HF also accepts long/int, but bool is more consistent
         if am.dtype != torch.bool:
             am = am != 0
         if am.shape[1] < x.shape[1]:
@@ -265,20 +240,13 @@ def generate(
             block_start = prompt.shape[1] + num_block * block_length
             block_end = min(block_start + block_length, x.shape[1])
             if fill_all_masks and num_block == 0:
-                # Include fixed prompt text in first-block safety/refinement,
-                # while denoising only its masks and this answer block's masks.
                 block_start = 0
 
-        # Include earlier prompt masks, but never pull future answer blocks
-        # into the current block. The original global guard consumed all
-        # future masks at block zero, ignoring the requested block length.
         earlier_masks = (x[:, :block_end] == mask_id).nonzero(as_tuple=False)
         if earlier_masks.numel() > 0:
             block_start = min(block_start, int(earlier_masks[:, 1].min().item()))
 
         block_mask_index = (x[:, block_start:block_end] == mask_id)
-        # The schedule is fixed for this block; read it once rather than
-        # synchronizing the GPU for each step's Python control flow.
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block).tolist()
 
         for i in range(steps_per_block):
@@ -291,21 +259,16 @@ def generate(
                     absolute_start_pos = prompt.shape[1] + relative_pos
                     absolute_end_pos = absolute_start_pos + len(injection_ids)
                     if 0 <= absolute_start_pos < x.shape[1] and absolute_end_pos <= x.shape[1]:
-                        x[:, absolute_start_pos:absolute_end_pos] = torch.tensor(
-                            injection_ids, dtype=torch.long, device=x.device
-                        ).unsqueeze(0)
+                        x[:, absolute_start_pos:absolute_end_pos] = torch.tensor(injection_ids, dtype=torch.long, device=x.device).unsqueeze(0)
 
             mask_index = (x == mask_id)
 
             if cfg_scale > 0.0:
                 un_x = x.clone()
-                # un_x[prompt_index] = mask_id
                 un_x[uncond_prompt_index] = mask_id
                 x_ = torch.cat([x, un_x], dim=0)
-                # Note: also concatenate attention mask if present
                 am_ = None if am is None else torch.cat([am, am], dim=0)
-                out = model(x_, attention_mask=am_,
-                            output_hidden_states=use_hidden_detection, return_dict=True)
+                out = model(x_, attention_mask=am_, output_hidden_states=use_hidden_detection, return_dict=True)
                 logits = out.logits
                 logits, un_logits = torch.chunk(logits, 2, dim=0)
                 logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
@@ -317,8 +280,7 @@ def generate(
                     print("[Self-Detection] hidden_states unavailable; fallback to logits.", flush=True)
                     warned_no_hidden = True
             else:
-                out = model(x, attention_mask=am,
-                            output_hidden_states=use_hidden_detection, return_dict=True)
+                out = model(x, attention_mask=am, output_hidden_states=use_hidden_detection, return_dict=True)
                 logits = out.logits
                 if use_hidden_detection and hasattr(out, "hidden_states") and out.hidden_states is not None:
                     hidden_states = out.hidden_states
@@ -443,8 +405,7 @@ def generate(
                         ] -= suppression_value
 
                     if x.shape[0] == 1:
-                        x0, x0_p = _sample_masked(logits, mask_index, temperature,
-                                                  need_confidence=remasking == "low_confidence")
+                        x0, x0_p = _sample_masked(logits, mask_index, temperature, need_confidence=remasking == "low_confidence")
                     else:
                         logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
                         x0 = torch.argmax(logits_with_noise, dim=-1)

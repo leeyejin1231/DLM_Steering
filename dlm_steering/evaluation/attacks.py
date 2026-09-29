@@ -1,10 +1,3 @@
-"""Evaluate every iterative-attack candidate, then aggregate by source row.
-
-Resume IDs encode (source index, attempt index) without collisions. Source
-row slicing happens before expansion, so --start/--n/--gpus retain their
-meaning even when rows require different numbers of target calls.
-"""
-
 import math
 
 from dlm_steering.runtime.constants import ERROR_SENTINEL
@@ -17,8 +10,7 @@ def is_iterative(data):
 def generation_items(data, rows=None):
     rows = data["results"] if rows is None else rows
     if not is_iterative(data):
-        return [{"index": r["index"], "prompt": r["prompt"],
-                 "response": r["generation"],
+        return [{"index": r["index"], "prompt": r["prompt"], "response": r["generation"],
                  **({"evaluation_scope": data["evaluation_scope"]}
                     if data.get("evaluation_scope") else {}),
                  **({"reference_response": r["reference_response"]}
@@ -28,8 +20,7 @@ def generation_items(data, rows=None):
         candidates = row.get("attempts")
         if candidates is None:  # Historical PAP/PAIR files retained history.
             name = data["attack"]["attack"]
-            candidates = [{"generation": h["response"]}
-                          for h in row.get(name, {}).get("history", [])]
+            candidates = [{"generation": h["response"]} for h in row.get(name, {}).get("history", [])]
         if not candidates:
             candidates = [{"generation": row.get("generation", ERROR_SENTINEL)}]
         for i, candidate in enumerate(candidates):
@@ -38,20 +29,13 @@ def generation_items(data, rows=None):
                 raise ValueError("source indices must be nonnegative")
             # Cantor pairing, negated: disjoint from old selected-only IDs.
             pair = (source_index + i) * (source_index + i + 1) // 2 + i
-            items.append({"index": -pair - 1, "source_index": source_index,
-                          "attempt_index": i, "prompt": row["prompt"],
-                          "response": candidate["generation"]})
+            items.append({"index": -pair - 1, "source_index": source_index, "attempt_index": i, "prompt": row["prompt"], "response": candidate["generation"]})
     if len({i["index"] for i in items}) != len(items):
         raise ValueError("duplicate source/attempt identity")
     return items
 
 
 def summarize_attack(rows, scored, kind):
-    """Any successful candidate wins. Missing evidence remains unresolved.
-
-    ASR denominator always includes all requested source rows. With unresolved
-    rows, report bounds rather than silently treating errors as safe answers.
-    """
     groups = {}
     for item in scored:
         groups.setdefault(item["source_index"], []).append(item)
@@ -111,6 +95,5 @@ def summarize_attack(rows, scored, kind):
                "n_judge_errors": sum(r["judge_errors"] for r in outcomes),
                "attempts_graded": len(scored)}
     if kind == "llamaguard4":
-        summary.update(unsafe=success, safe=total-success-unresolved,
-                       by_category=categories)
+        summary.update(unsafe=success, safe=total-success-unresolved, by_category=categories)
     return summary, outcomes

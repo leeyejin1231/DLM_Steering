@@ -1,20 +1,5 @@
-"""Choose the gate threshold from fit-split prompts only.
-
-The simulation picked 4.14 by reading the eval sets, which is test-set tuning.
-This selects on the 366 fit-split prompts instead, so the held-out harmful
-prompts and the benign benchmarks stay untouched.
-
-The default rule is a percentile of the *harmful* fit distribution: it states a
-safety-side guarantee directly ("this fraction of harmful prompts gets steered")
-and does not depend on which benign set one happens to imagine. Youden's J on
-harmful-vs-benign is reported as a cross-check, but it is calibrated on long
-WildJailbreak roleplay benign prompts and transfers poorly to short questions.
-
-Usage:
-    CUDA_VISIBLE_DEVICES=1 python -m dlm_steering.fitting.pick_threshold --layer 18
-"""
-
-from dlm_steering.runtime.constants import OUT_DIR, DETECTOR_LAYER, add_model_arg
+from dlm_steering.runtime.constants import OUT_DIR, DETECTOR_LAYER
+from models import add_model_arg
 
 import argparse
 import json
@@ -47,8 +32,7 @@ def main():
     li = layers.index(args.layer)
     v = b["vector"][li]
 
-    pairs = [p for p in json.loads(Path(args.pairs).read_text())["pairs"]
-             if p["split"] == "fit"]
+    pairs = [p for p in json.loads(Path(args.pairs).read_text())["pairs"] if p["split"] == "fit"]
     print(f"fit pairs: {len(pairs)}")
 
     tokenizer, model = load_llada(device)

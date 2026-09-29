@@ -1,9 +1,7 @@
-"""Build the shared evaluation artifact, including iterative-attack summaries."""
 from .attacks import is_iterative, summarize_attack
 
 
 def build_evaluation_payload(data, rows, scored, summary, *, source, kind, **identity):
-    """Keep both judge CLIs on the same output schema and aggregation rules."""
     payload = {
         **identity,
         "source": source,

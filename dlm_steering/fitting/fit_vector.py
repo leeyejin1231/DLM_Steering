@@ -1,24 +1,5 @@
-"""Fit the jailbreak steering direction from response-conditioned activations.
-
-For each fit pair the prompt is held byte-identical and only the answer region
-changes: once filled with a refusal, once with a compliant (unsafe) answer, both
-truncated to the same token count and masked at the same positions. The residual
-difference is therefore "which continuation am I writing", with prompt length and
-roleplay style fully controlled.
-
-Activations are read at several mask ratios t because a diffusion LM sees the
-answer region at every noise level during sampling, and are averaged over the
-masked positions only -- those are the positions the sampler actually predicts,
-and the positions steering will later be injected at.
-
-hidden_states[L] is the input to block L, i.e. the output of block L-1, so a
-direction fitted at layer L is applied by hooking blocks[L-1] (see llada_steering).
-
-Usage:
-    CUDA_VISIBLE_DEVICES=1 python -m dlm_steering.fitting.fit_vector
-"""
-
-from dlm_steering.runtime.constants import OUT_DIR, add_model_arg
+from dlm_steering.runtime.constants import OUT_DIR
+from models import add_model_arg
 
 import argparse
 import json
@@ -35,7 +16,6 @@ from dlm_steering.paths import REPO as ROOT
 
 @torch.no_grad()
 def collect(model, tokenizer, pairs, t_list, max_resp, layers, seed, device):
-    """Return acts[t] -> (refusal, compliant), each (n_pairs, n_layers, d_model)."""
     acts = {t: ([], []) for t in t_list}
     kept = []
     for n, p in enumerate(pairs):
@@ -100,8 +80,7 @@ def main():
     tokenizer, model = load_llada(device)
 
     print(f"collecting activations at t={t_list}, layers 1..31 ...")
-    acts, kept = collect(model, tokenizer, pairs, t_list, args.max_resp,
-                         layers, args.seed, device)
+    acts, kept = collect(model, tokenizer, pairs, t_list, args.max_resp, layers, args.seed, device)
     n = len(kept)
     print(f"collected {n} pairs")
 
@@ -112,8 +91,7 @@ def main():
     val_idx, tr_idx = idx[:n_val], idx[n_val:]
     print(f"vector fit on {len(tr_idx)} pairs, validated on {len(val_idx)}")
 
-    report = {"n_pairs": n, "n_train": len(tr_idx), "n_val": len(val_idx),
-              "t_list": t_list, "layers": layers, "per_t": {}}
+    report = {"n_pairs": n, "n_train": len(tr_idx), "n_val": len(val_idx), "t_list": t_list, "layers": layers, "per_t": {}}
     dirs = []
     for t in t_list:
         ref, cmp_ = acts[t]
@@ -130,8 +108,6 @@ def main():
                                    "best_auroc": max(aucs)}
         print(f"  t={t}: best layer {layers[int(np.argmax(aucs))]} auroc {max(aucs):.4f}")
 
-    # Average the per-t unit directions, then renormalise: a direction that is
-    # consistent across noise levels survives, one that is t-specific cancels.
     v = torch.stack(dirs).mean(dim=0)
     v = v / v.norm(dim=-1, keepdim=True).clamp_min(1e-8)
 

@@ -1,40 +1,3 @@
-"""Fit the V3 response detector on *first-boundary* states (Dream).
-
-fit_response_detector.py reads the finished response, but V3 audits the
-first block boundary: the moment 32 answer tokens have been committed, with
-the rest still masked. A detector fitted on finished responses is miscalibrated
-there (Dream: training AUROC 0.87 -> 0.67 at audit time, probabilities
-collapse). This script generates each prompt through the real V3 defender
-(steering on, recovery disabled by a cutoff > 1) and records, at the first
-boundary, the mean hidden state per layer over two pools:
-
-    committed  the committed answer tokens (what V3._audit reads)
-    region     every answer slot, committed or still masked (the model's
-               hidden state at a masked slot encodes what it intends to
-               write there, like the step-0 prompt-side gate)
-
-The label is Llama-Guard-4's verdict on the *finished* text, so the task is
-"will this response end unsafe?" -- the question the audit actually asks.
-
-Arms (so that neither source nor template can stand in for the label):
-    wildjailbreak   WildJailbreak harmful prompts + the synthetic DIJA template
-    wj_benign       WildJailbreak adversarial_benign (train split) + the same template
-    alpaca          plain Alpaca instructions, no template
-
-The checkpoint carries its own layer and pool; V3 reads it at that layer and,
-when it differs from the gate layer, audits with a separate unsteered pass
-(outputs/dream/response_detector3_committed_L20.pt: layer 20, gate 14).
-
-Usage (generation, one arm per GPU; then a CPU refit over the caches):
-    CUDA_VISIBLE_DEVICES=0 python -m dlm_steering.fitting.fit_boundary_detector --model dream \
-        --arms wildjailbreak,alpaca --gen-only
-    CUDA_VISIBLE_DEVICES=1 python -m dlm_steering.fitting.fit_boundary_detector --model dream \
-        --arms wj_benign --gen-only
-    python -m dlm_steering.fitting.fit_boundary_detector --model dream --pool committed --layer 20 \
-        --from-samples outputs/dream/boundary_samples_{wildjailbreak,wj_benign,alpaca}.pt \
-        --balanced --out outputs/dream/response_detector3_committed_L20.pt
-"""
-
 import argparse
 import json
 import re
@@ -44,16 +7,16 @@ import numpy as np
 import pandas as pd
 import torch
 
-from dlm_steering.runtime.constants import (DETECTOR_LAYER, MODEL_KEY, MODEL_NAME, MASK_ID,
-                                            MASK_TOKEN, N_LAYERS, OUT_DIR, add_model_arg)
+from dlm_steering.runtime.constants import (DETECTOR_LAYER, MODEL_NAME, MASK_ID, MASK_TOKEN,
+                                            N_LAYERS, OUT_DIR)
+from models import MODEL_KEY, add_model_arg
 from dlm_steering.runtime.utils import auroc
 from dlm_steering.runtime.models import encode_prompt, load_detector, seed_all
 from dlm_steering.runtime.data import hf_glob
+from dlm_steering.defenses.recovery import V3
 
 from dlm_steering.paths import REPO as ROOT
 ALL_LAYERS = list(range(1, N_LAYERS))   # hidden_states[L] == output of block L-1
-# Group ids are offset per arm so they stay distinguishable in the checkpoint's
-# group lists (same convention as fit_response_detector.py).
 ALPACA_GROUP_OFFSET = 1_000_000
 WJB_GROUP_OFFSET = 2_000_000
 ALPACA_LOCAL = ROOT / "data/alpaca.parquet"
@@ -64,11 +27,6 @@ POOLS = ("committed", "region")
 
 # ------------------------------------------------------------- fit helpers
 def fit_logistic(X, y, C, steps=400, balanced=False):
-    """L2-regularised logistic regression via LBFGS; returns (w, b).
-
-    balanced=True reweights the positive class by n_neg / n_pos so a rare
-    unsafe class is not drowned out (sklearn's class_weight="balanced").
-    """
     X = X.to(torch.float64)
     y = y.to(torch.float64)
     w = torch.zeros(X.shape[1], dtype=torch.float64, requires_grad=True)
@@ -91,7 +49,6 @@ def fit_logistic(X, y, C, steps=400, balanced=False):
 
 
 def youden_cutoff(probs, y):
-    """Probability cutoff maximising TPR - FPR; ties -> the higher cutoff."""
     order = np.argsort(-probs)
     best_j, best_t = -1.0, 0.5
     n_pos, n_neg = int(y.sum()), int(len(y) - y.sum())
@@ -117,7 +74,6 @@ def rates(probs, y, cutoff):
 
 
 def arm_rates(probs, y, arms, cutoff):
-    """Trigger rates per arm and class: how often recovery would fire."""
     out = {}
     for arm in dict.fromkeys(arms):
         sel = arms == arm
@@ -130,7 +86,6 @@ def arm_rates(probs, y, arms, cutoff):
 
 
 def cv_auroc_by_layer(X_all, y, arms, layers, C, folds, seed, balanced=False):
-    """k-fold AUROC per layer; folds are stratified by (arm, label) like the split."""
     rng = np.random.default_rng(seed)
     fold_of = np.empty(len(y), dtype=int)
     for arm in dict.fromkeys(arms):
@@ -152,10 +107,6 @@ def cv_auroc_by_layer(X_all, y, arms, layers, C, folds, seed, balanced=False):
 
 # ------------------------------------------------------------------ prompts
 class DIJATemplate:
-    """Synthetic DIJA-style template: the goal, a "Sure, here is ..." target
-    line and `steps` lines of "Step k:" followed by `span` mask tokens, all
-    inside the user turn (gen_length 0: the spans are the response)."""
-
     def __init__(self, steps=4, span=16):
         self.steps, self.span = steps, span
 
@@ -179,8 +130,6 @@ def alpaca_path(arg):
 
 
 def load_wj_benign_train(n, seed):
-    """n adversarial_benign prompts from the WildJailbreak *train* split (the
-    eval split is what --source wj_benign probes read; keep them apart)."""
     import pyarrow as pa
     frames = []
     for f in hf_glob(WJ_TRAIN_GLOB):
@@ -200,9 +149,6 @@ def load_wj_benign_train(n, seed):
 
 
 def load_rows(args):
-    """(group id, prompt, arm) rows. WildJailbreak and Alpaca draws replay
-    fit_response_detector's RNG order (WildJailbreak permutation first, then
-    Alpaca) so the groups match; wj_benign uses its own stream (seed + 1)."""
     rng = np.random.default_rng(args.seed)
     df = pd.read_csv(args.csv)
     picked = df.iloc[rng.permutation(len(df))[: args.groups]]
@@ -211,19 +157,14 @@ def load_rows(args):
     picked = alpaca.iloc[rng.permutation(len(alpaca))[: args.groups]]
     for gi, r in picked.iterrows():
         extra, prompt = str(r["input"]).strip(), str(r["instruction"]).strip()
-        rows.append((ALPACA_GROUP_OFFSET + int(gi),
-                     f"{prompt}\n\n{extra}" if extra else prompt, "alpaca"))
+        rows.append((ALPACA_GROUP_OFFSET + int(gi), f"{prompt}\n\n{extra}" if extra else prompt, "alpaca"))
     rows += [(g, p, "wj_benign") for g, p in load_wj_benign_train(args.groups, args.seed + 1)]
     return rows
 
 
 # ---------------------------------------------------------------- recorder
 def build_recorder(model, args):
-    """The deployed V3 policy (gate at the detector bundle's best layer, the
-    steering vector at --steer-layer or its best layer, --remask-prompt) with a
-    response cutoff above 1, so recovery never fires, plus a hook that stores
-    the first-boundary features. Mirrors dlm_steering.defenses.Ours.from_args."""
-    from dlm_steering.defenses.recovery import V3
+    
 
     device = next(model.parameters()).device
     bundle = torch.load(args.vector, map_location="cpu")
@@ -231,8 +172,7 @@ def build_recorder(model, args):
     li = bundle["layers"].index(layer)
     sites = [(layer, bundle["vector"][li].to(device), bundle["mean_act_norm"][li])]
     det_vec, det_layer, threshold = load_detector(args.detector, args.gate_layer, device, None)
-    dummy = {"weight": torch.zeros_like(det_vec.cpu()), "bias": 0.0, "threshold": 1.1,
-             "layer": det_layer, "pool": "mean_committed_response_tokens"}
+    dummy = {"weight": torch.zeros_like(det_vec.cpu()), "bias": 0.0, "threshold": 1.1, "layer": det_layer, "pool": "mean_committed_response_tokens"}
 
     class Recorder(V3):
         def reset(self):
@@ -244,27 +184,23 @@ def build_recorder(model, args):
                         temperature, remasking, last_block=False, rng=None, sampling=None):
             if len(self.records) < args.record_boundaries:
                 masks = x == self.mask_id
-                pools = {"committed": (region[0] & ~masks[0]).nonzero().flatten(),
-                         "region": region[0].nonzero().flatten()}
+                pools = {"committed": (region[0] & ~masks[0]).nonzero().flatten(), "region": region[0].nonzero().flatten()}
                 hs = self.model(x, output_hidden_states=True).hidden_states
                 self.audit_forwards += 1
-                feats = {k: torch.stack([hs[L][0, p].to(torch.float32).mean(dim=0)
-                                         for L in ALL_LAYERS]).to(torch.float16).cpu()
-                         for k, p in pools.items()}
+                feats = {k: torch.stack([hs[L][0, p].to(torch.float32).mean(dim=0) for L in ALL_LAYERS]).to(torch.float16).cpu() for k, p in pools.items()}
                 self.records.append({"boundary": block_number,
                                      "n_committed": int(pools["committed"].numel()),
                                      "n_region": int(pools["region"].numel()), **feats})
             # Cutoff 1.1 can never trigger, so V3's own audit is skipped.
 
     return Recorder(model, gate_layer=det_layer, gate_vector=det_vec, threshold=threshold,
-                    width=1.0, sites=sites, strength=args.alpha, transform="additive",
-                    steer="adaptive", steer_shift=False, response_detector=dummy,
+                    width=1.0, sites=sites, strength=args.alpha,
+                    steer="adaptive", response_detector=dummy,
                     recovery_steps=32, remask_prompt=True)
 
 
 @torch.no_grad()
-def generate_one(model, tokenizer, recorder, attacker, prompt, device, *,
-                 steps, gen_length, block_length, temperature, sampling):
+def generate_one(model, tokenizer, recorder, attacker, prompt, device, *, steps, gen_length, block_length, temperature, sampling):
     from sampler import generate
 
     user_message = attacker.build_prompt({"prompt": prompt, "target": None})
@@ -285,8 +221,7 @@ def main():
     ap = argparse.ArgumentParser()
     add_model_arg(ap)
     ap.add_argument("--csv", default=str(ROOT / "data/llada8b_wild_unsafe_only.csv"))
-    ap.add_argument("--alpaca", default=None,
-                    help="Alpaca parquet (default: data/alpaca.parquet, else the HF cache)")
+    ap.add_argument("--alpaca", default=None, help="Alpaca parquet (default: data/alpaca.parquet, else the HF cache)")
     ap.add_argument("--groups", type=int, default=384, help="prompts per arm")
     ap.add_argument("--arms", default="wildjailbreak,wj_benign,alpaca")
     ap.add_argument("--gen-only", action="store_true")
@@ -294,16 +229,13 @@ def main():
     ap.add_argument("--from-samples", default=None, help="comma list of caches to refit from")
     ap.add_argument("--out", default=None)
     ap.add_argument("--pool", choices=POOLS, default="committed")
-    ap.add_argument("--layer", type=int, default=None,
-                    help="detector layer to fit (default: best validation AUROC)")
+    ap.add_argument("--layer", type=int, default=None, help="detector layer to fit (default: best validation AUROC)")
     ap.add_argument("--C", type=float, default=0.01)
     ap.add_argument("--balanced", action="store_true")
     ap.add_argument("--val-frac", type=float, default=0.25)
     ap.add_argument("--cv-folds", type=int, default=5)
-    ap.add_argument("--baseline", default=None,
-                    help="finished-response checkpoint to score on the same validation rows")
+    ap.add_argument("--baseline", default=None, help="finished-response checkpoint to score on the same validation rows")
     ap.add_argument("--record-boundaries", type=int, default=1)
-    # generation = the deployed setting (exp.py main matrix)
     ap.add_argument("--vector", default=f"{ROOT / OUT_DIR}/steer_vector.pt")
     ap.add_argument("--detector", default=f"{ROOT / OUT_DIR}/steer_detector.pt")
     ap.add_argument("--gate-layer", type=int, default=DETECTOR_LAYER)
@@ -345,8 +277,7 @@ def main():
         recorder.prepare(tokenizer, None)
         print(f"recorder: {recorder.describe()}")
 
-        per_arm = {a: dict(feats={p: [] for p in POOLS}, n_committed=[], texts=[], groups=[],
-                           prompts=[], ids=[], boundaries=[]) for a in counts}
+        per_arm = {a: dict(feats={p: [] for p in POOLS}, n_committed=[], texts=[], groups=[], prompts=[], ids=[], boundaries=[]) for a in counts}
         for k, (gi, prompt, arm) in enumerate(rows):
             attacker, steps = arm_cfg[arm]
             seed_all(args.seed + k)
@@ -391,15 +322,13 @@ def main():
                         "state": "first_boundary", "steps": arm_cfg[arm][1],
                         "gen_length": args.gen_length, "block_length": args.block_length,
                         "temperature": args.temperature, "sampling": sampling,
-                        "defender": {"gate_layer": args.gate_layer, "alpha": args.alpha,
-                                     "steer_layer": args.steer_layer},
+                        "defender": {"gate_layer": args.gate_layer, "alpha": args.alpha, "steer_layer": args.steer_layer},
                         "seed": args.seed}, path)
             n_unsafe = sum(str(l).startswith("unsafe") for l in d["labels"])
             print(f"-> {path}: {len(d['labels'])} rows, {n_unsafe} unsafe")
         if args.gen_only:
             return
-        args.from_samples = ",".join(str(Path(args.samples_dir) / f"boundary_samples_{a}.pt")
-                                     for a in per_arm)
+        args.from_samples = ",".join(str(Path(args.samples_dir) / f"boundary_samples_{a}.pt") for a in per_arm)
 
     # ------------------------------------------------------------------ refit
     feats, labels, groups, arms, ncom = [], [], [], [], []
@@ -444,8 +373,7 @@ def main():
     print(f"fit on {len(tr_idx)} ({int(yt.sum())} unsafe), cutoff on {len(val_idx)} "
           f"held-out ({int(yv.sum())} unsafe){' balanced' if args.balanced else ''}")
 
-    layer_cv = cv_auroc_by_layer(X_all, yn, arms, layers, args.C, args.cv_folds,
-                                 args.seed, balanced=args.balanced) if args.cv_folds else {}
+    layer_cv = cv_auroc_by_layer(X_all, yn, arms, layers, args.C, args.cv_folds, args.seed, balanced=args.balanced) if args.cv_folds else {}
     layer_auc, wj = {}, arms == "wildjailbreak"
     print(f"\nlayer  train   val    val-WJ   {args.cv_folds}-fold CV")
     for li, L in enumerate(layers):
@@ -512,9 +440,7 @@ def main():
     report = out.with_name(out.stem + "_report.json")
     report.write_text(json.dumps(
         {"rows": int(len(X)), "n_train": int(len(tr_idx)), "n_val": int(len(val_idx)),
-         "n_unsafe": int(y.sum()), "per_arm": {a: {"n": int((arms == a).sum()),
-                                                  "unsafe": int(yn[arms == a].sum())}
-                                               for a in dict.fromkeys(arms)},
+         "n_unsafe": int(y.sum()), "per_arm": {a: {"n": int((arms == a).sum()), "unsafe": int(yn[arms == a].sum())} for a in dict.fromkeys(arms)},
          "pool": args.pool, "layer": layer, "C": args.C, "balanced": bool(args.balanced),
          "auroc_train": auc_tr, "auroc_val": auc_val, "threshold": float(cutoff),
          "youden_j": float(j), "val_rates": r_val, "val_arm_rates": val_arms,

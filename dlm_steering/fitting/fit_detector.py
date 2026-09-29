@@ -1,32 +1,5 @@
-"""Fit a prompt-side harmfulness detector and test whether it generalises.
-
-This is the *detection* half of a split design: one direction decides whether a
-request is harmful, a separate one (the plain refusal vector) drives the refusal.
-Blending the two into a single direction failed, because a direction that reads
-harmfulness out is not a direction that causes refusal.
-
-The detector is read with the answer region fully masked, which is the state the
-sampler is in at the first denoising step -- before any token is committed and
-before a response-conditioned contrast such as the DiD vector carries any signal
-at all (with everything masked, its two arms are byte-identical).
-
-    v_detect = mean(h | harmful prompt, answer all MASK)
-             - mean(h | benign prompt,  answer all MASK)
-
-The benign arm is the length- and style-matched `adv_benign` prompt, so roleplay
-wrapping and prompt length are already controlled by the pairing.
-
-The decisive number is not the held-out AUROC on WildJailbreak pairs -- it is the
-AUROC against the benign sets where steering actually over-refused. The detector
-is fitted on long roleplay prompts; XSTest and TruthfulQA are short plain
-questions, a different distribution entirely. If it cannot separate those, a gate
-built on it will stay open and over-refusal will not improve.
-
-Usage:
-    CUDA_VISIBLE_DEVICES=1 python -m dlm_steering.fitting.fit_detector
-"""
-
-from dlm_steering.runtime.constants import OUT_DIR, add_model_arg
+from dlm_steering.runtime.constants import OUT_DIR
+from models import add_model_arg
 
 import argparse
 import json
@@ -45,7 +18,6 @@ from dlm_steering.paths import REPO as ROOT
 
 @torch.no_grad()
 def prompt_state(model, tokenizer, prompt, gen_length, layers, device):
-    """Hidden states averaged over a fully masked answer region, per layer."""
     p_ids = prompt_token_ids(tokenizer, str(prompt))
     x = torch.full((1, len(p_ids) + gen_length), MASK_ID, dtype=torch.long, device=device)
     x[0, : len(p_ids)] = torch.tensor(p_ids, device=device)
@@ -104,9 +76,7 @@ def main():
     v = (H[tr_idx] - B[tr_idx]).mean(dim=0)
     v = v / v.norm(dim=-1, keepdim=True).clamp_min(1e-8)
 
-    in_dist = [round(float(auroc((H[val_idx, li] @ v[li]).numpy(),
-                                (B[val_idx, li] @ v[li]).numpy())), 4)
-               for li in range(len(layers))]
+    in_dist = [round(float(auroc((H[val_idx, li] @ v[li]).numpy(), (B[val_idx, li] @ v[li]).numpy())), 4) for li in range(len(layers))]
 
     # The prompts the gate must actually judge at inference time.
     df = pd.read_csv(args.csv)
@@ -118,12 +88,9 @@ def main():
     }
     print("\nprojecting held-out eval prompt sets ...")
     Eh = collect(model, tokenizer, eval_harmful, args.gen_length, layers, device, "eval-harm")
-    Eb = {k: collect(model, tokenizer, ps, args.gen_length, layers, device, k)
-          for k, ps in eval_sets.items()}
+    Eb = {k: collect(model, tokenizer, ps, args.gen_length, layers, device, k) for k, ps in eval_sets.items()}
 
-    ood = {k: [round(float(auroc((Eh[:, li] @ v[li]).numpy(),
-                                 (M[:, li] @ v[li]).numpy())), 4)
-               for li in range(len(layers))] for k, M in Eb.items()}
+    ood = {k: [round(float(auroc((Eh[:, li] @ v[li]).numpy(), (M[:, li] @ v[li]).numpy())), 4) for li in range(len(layers))] for k, M in Eb.items()}
 
     print("\n            in-dist |  held-out 20 harmful vs ...")
     print("layer   WJ pairs | XSTest  TruthQA  JBB-ben  | mean")

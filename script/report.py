@@ -1,32 +1,14 @@
-"""Print the headline metrics of scored output files as one aligned table.
-
-The script/run_*.sh drivers call this last; it also runs standalone over any
-grader payloads:
-
-    python script/report.py outputs/JBB-dija-ours-42_lg4.json outputs/*_sr.json
-
-With no arguments it reports every grader payload under outputs/ (*_lg4, *_sr,
-*_judged, *_acc). Every input is a payload written by eval_llamaguard.py,
-run_sr_eval.py, dlm_steering/fitting/judge_refusal.py or eval_utility.py; the
-grader is inferred from the keys of its "summary" block, so no naming
-convention is assumed. Missing or unrecognised files are listed rather than
-raised, so a partially finished pipeline still reports what it has.
-"""
-
 import json
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# With no arguments: every grader payload under outputs/, in reading order.
 DEFAULT_FILES = sorted(
     str(f.relative_to(ROOT))
     for suffix in ("_lg4", "_sr", "_judged", "_acc")
     for f in (ROOT / "outputs").rglob(f"*{suffix}.json"))
 
-# (grader, key that identifies it, [(column header, summary key)]). The first
-# grader whose marker key is present wins, so markers must be unique.
 GRADERS = [
     ("Llama Guard 4 (harmful)", "by_category",
      [("n", "total"), ("unsafe", "unsafe"), ("ASR", "asr"),
@@ -45,7 +27,7 @@ GRADERS = [
 
 
 def classify(summary):
-    """(grader name, columns) for a summary block, or None if unrecognised."""
+    # (grader name, columns) for a summary block, or None if unrecognised.
     if "grader_kind" in summary:
         return (f"{summary['grader_kind']} (attack rows)",
                 [("n", "total"), ("success", "successful"), ("ASR", "asr"),
@@ -66,7 +48,7 @@ def cell(value):
 
 
 def render(name, columns, rows):
-    """One grader's table: a label column plus that grader's metric columns."""
+    # One grader's table: a label column plus that grader's metric columns.
     headers = ["file", *(h for h, _ in columns)]
     table = [headers] + [[label, *(cell(s.get(k)) for _, k in columns)]
                          for label, s in rows]

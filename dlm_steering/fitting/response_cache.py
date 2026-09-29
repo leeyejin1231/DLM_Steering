@@ -1,23 +1,5 @@
-"""On-disk cache of the generate-then-judge step behind the response detector.
-
-Fitting the detector costs one LLaDA generation plus one Llama-Guard verdict per
-prompt -- about 90 minutes for 768 prompts, against seconds for the regression
-itself. Both steps are deterministic at temperature 0, so their output is worth
-keeping: the cache stores the generated token ids and the verdict, and a later
-fit replays them.
-
-Token ids rather than hidden states are stored on purpose. Features are read at
-one layer (`--layer`), and that layer is a tunable; recomputing them from the
-cached sequence costs a single forward pass instead of the 64 denoising steps
-the generation took, and keeps the cache valid when the layer changes.
-
-The cache key covers everything that changes the generated text: the model, the
-sampler settings and the judge. Prompts are keyed individually, so growing a run
-from 768 to 4000 prompts regenerates only the 3232 new ones.
-"""
 import hashlib
 import json
-from pathlib import Path
 
 from dlm_steering.paths import DATA_DIR
 
@@ -25,8 +7,7 @@ CACHE_DIR = DATA_DIR / "response_fit_cache"
 VERSION = 1
 
 
-def config_key(*, model_name, steps, gen_length, block_length, temperature,
-               attacker, judge):
+def config_key(*, model_name, steps, gen_length, block_length, temperature, attacker, judge):
     """Short digest of every setting that changes a cached row."""
     payload = json.dumps({"v": VERSION, "model": model_name, "steps": steps,
                           "gen_length": gen_length, "block_length": block_length,

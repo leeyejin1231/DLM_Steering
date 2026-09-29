@@ -1,4 +1,3 @@
-"""Defense registry used by the experiment CLI."""
 from .base import Defender, NullDefender
 from .steering import Ours
 from .recovery import V3

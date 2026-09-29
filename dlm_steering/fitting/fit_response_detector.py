@@ -1,46 +1,5 @@
-"""Fit the response-side detector consumed by ``--remask v3``.
-
-The prompt-side detector (``fit_detector.py``) reads fully masked answer
-slots at the first denoising step; this detector instead reads *committed*
-response tokens at a block boundary and asks whether the visible response is
-unsafe. The pipeline mirrors what the reference ``response_detector.pt``
-metadata describes:
-
-    feature  = hidden states at --layer, mean-pooled over the committed
-               template slots the model just filled
-    label    = Llama-Guard-4 verdict on the generated text
-               (unsafe -> 1, safe -> 0, parse errors dropped)
-    model    = logistic regression, L2 with C (--C)
-    prompts  = WildJailbreak adversarial prompts
-               (data/llada8b_wild_unsafe_only.csv -- the unsafe-verdict half
-               of the original generation set; we only need its prompts),
-               optionally mixed with ordinary instructions from Alpaca
-               (--alpaca-groups). WildJailbreak alone gives the negative class
-               only prompts that *look* adversarial, so ordinary Q&A, maths and
-               multiple-choice answers sit off-distribution and score high; the
-               Alpaca arm supplies benign responses as genuine negatives.
-
-Samples are produced by the same sampler used at inference: the plain prompt
-with no attack wrapper, so the committed slots the features pool over are
-the generated response suffix -- the same distribution the boundary audit
-reads. Both classes are judged, so the negative arm carries real GT labels
-rather than assumed-safe regenerations.
-
-Generation and judging dominate the cost and are deterministic at temperature
-0, so both are cached under data/response_fit_cache (see dlm_steering/fitting/response_cache
-.py). A rerun replays the cached token ids through one forward pass to rebuild
-features, which leaves --layer free to change and regenerates only prompts the
-cache has never seen. --refresh-cache forces a full rebuild.
-
-The split is by prompt group: each row is one group and train/validation
-group lists are stored in the checkpoint like the reference file.
-
-Usage:
-    CUDA_VISIBLE_DEVICES=1,2 python -m dlm_steering.fitting.fit_response_detector \
-        --groups 384 --guard-device cuda:2
-"""
-
-from dlm_steering.runtime.constants import OUT_DIR, DETECTOR_LAYER, MODEL_KEY, add_model_arg
+from dlm_steering.runtime.constants import OUT_DIR, DETECTOR_LAYER
+from models import MODEL_KEY, add_model_arg
 
 import argparse
 import json
@@ -72,24 +31,20 @@ def clean_text(tokenizer, x, slots):
 
 
 @torch.no_grad()
-def generate_sequence(model, tokenizer, attacker, prompt, device, *,
-                      steps, gen_length, block_length, temperature):
-    """Generate on one prompt; return (sequence, response slots, text)."""
+def generate_sequence(model, tokenizer, attacker, prompt, device, *, steps, gen_length, block_length, temperature):
     from sampler import generate
 
     user_message = attacker.build_prompt({"prompt": prompt, "target": None})
     x_in = encode_prompt(tokenizer, user_message, device)
     slots = (x_in == MASK_ID)[0].nonzero().flatten()
-    x = generate(model, x_in, None, steps=steps, gen_length=gen_length,
-                 block_length=block_length, temperature=temperature,
-                 decoder="dream" if MODEL_KEY == "dream" else "block")
+    x = generate(model, x_in, None, steps=steps, gen_length=gen_length, block_length=block_length, 
+                 temperature=temperature, decoder="dream" if MODEL_KEY == "dream" else "block")
     if slots.numel() == 0:  # no prompt masks: the generated suffix is the response
         slots = torch.arange(x_in.shape[1], x.shape[1], device=x.device)
     return x, slots, clean_text(tokenizer, x, slots)
 
 
 def fit_logistic(X, y, C, steps=400):
-    """L2-regularised logistic regression via LBFGS; returns (w, b)."""
     X = X.to(torch.float64)
     y = y.to(torch.float64)
     w = torch.zeros(X.shape[1], dtype=torch.float64, requires_grad=True)
@@ -123,9 +78,7 @@ def main():
     ap.add_argument("--alpaca-groups", type=int, default=0,
                     help="How many Alpaca prompts to add (0: WildJailbreak only)")
     ap.add_argument("--prompt-tail", type=int, default=0,
-                    help="Also pool the last N prompt text tokens with the response "
-                         "(the text right before the answer). V3 reads this from the "
-                         "checkpoint and pools the same way at inference.")
+                    help="Also pool the last N prompt text tokens with the response (the text right before the answer). V3 reads this from the checkpoint and pools the same way at inference.")
     ap.add_argument("--layer", type=int, default=DETECTOR_LAYER)
     ap.add_argument("--C", type=float, default=0.01)
     ap.add_argument("--threshold", type=float, default=0.5,
@@ -138,8 +91,7 @@ def main():
     ap.add_argument("--guard-device", default="cuda:1")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--refresh-cache", action="store_true",
-                    help="Regenerate and re-judge every prompt, ignoring "
-                         "data/response_fit_cache.")
+                    help="Regenerate and re-judge every prompt, ignoring data/response_fit_cache.")
     args = ap.parse_args()
 
     if args.layer is None:
@@ -149,8 +101,6 @@ def main():
     rng = np.random.default_rng(args.seed)
     df = pd.read_csv(args.csv)
     picked = df.iloc[rng.permutation(len(df))[: args.groups]]
-    # (group id, prompt, arm). Alpaca group ids are offset so the two arms stay
-    # distinguishable in the checkpoint's train_groups list.
     rows = [(int(gi), str(r["prompt"]), "wildjailbreak")
             for gi, r in picked.iterrows()]
     print(f"{len(rows)} prompt groups from {args.csv}")
@@ -160,8 +110,7 @@ def main():
         for gi, r in picked.iterrows():
             extra = str(r["input"]).strip()
             prompt = str(r["instruction"]).strip()
-            rows.append((ALPACA_GROUP_OFFSET + int(gi),
-                         f"{prompt}\n\n{extra}" if extra else prompt, "alpaca"))
+            rows.append((ALPACA_GROUP_OFFSET + int(gi), f"{prompt}\n\n{extra}" if extra else prompt, "alpaca"))
         print(f"{args.alpaca_groups} prompt groups from {args.alpaca}")
 
     from dlm_steering.attacks.base import NoAttack
@@ -174,19 +123,17 @@ def main():
                         gen_length=gen_length, block_length=args.block_length,
                         temperature=args.temperature, attacker="none",
                         judge="Llama-Guard-4-12B")
-    caches = {arm: ({} if args.refresh_cache else rc.load(arm, key))
-              for arm in dict.fromkeys(arm for _, _, arm in rows)}
+    caches = {arm: ({} if args.refresh_cache else rc.load(arm, key)) for arm in dict.fromkeys(arm for _, _, arm in rows)}
     missing = [r for r in rows if rc.prompt_key(r[1]) not in caches[r[2]]]
     for arm, cache in caches.items():
         have = sum(1 for _, p, a in rows if a == arm and rc.prompt_key(p) in cache)
-        print(f"캐시 {arm}: {have}/{sum(a == arm for _, _, a in rows)}행 재사용 "
-              f"({rc.cache_path(arm, key)})")
+        print(f"Cache {arm}: {have}/{sum(a == arm for _, _, a in rows)}row reuse " f"({rc.cache_path(arm, key)})")
 
     print(f"loading {MODEL_NAME} ...")
     tokenizer, model = load_llada(args.device)
 
     if missing:
-        print(f"{len(missing)}행을 새로 생성합니다 (캐시 미보유).")
+        print(f"{len(missing)}rows to generate (cache miss).")
         fresh = []
         for k, (gi, prompt, arm) in enumerate(missing):
             x, slots, filled = generate_sequence(
@@ -210,9 +157,8 @@ def main():
                                  "steps": args.steps, "gen_length": gen_length,
                                  "block_length": args.block_length,
                                  "temperature": args.temperature})
-            print(f"캐시 저장: {path} ({len(cache)}행)")
+            print(f"Cache saved: {path} ({len(cache)}rows)")
 
-    # Features come from the cached sequence: one forward instead of the 64
     # denoising steps the generation cost, so --layer stays free to change.
     print(f"replaying {len(rows)} cached sequences at layer {args.layer}"
           + (f", pooling the last {args.prompt_tail} prompt tokens too" if args.prompt_tail else "")
@@ -251,8 +197,7 @@ def main():
     X = torch.stack([feats[i] for i in keep])
     groups = np.array([groups[i] for i in keep])
     arms = np.array([arms[i] for i in keep])
-    print(f"labels: {int(y.sum())} unsafe / {int((~y.bool()).sum())} safe"
-          + (f" ({n_drop} unparsed dropped)" if n_drop else ""))
+    print(f"labels: {int(y.sum())} unsafe / {int((~y.bool()).sum())} safe" + (f" ({n_drop} unparsed dropped)" if n_drop else ""))
     for arm in dict.fromkeys(arms):
         sel = arms == arm
         print(f"  {arm}: {int(sel.sum())} rows, {int(y.numpy()[sel].sum())} unsafe")
@@ -263,8 +208,7 @@ def main():
     auc = auroc(pos, neg) if len(pos) and len(neg) else float("nan")
     threshold = float(args.threshold)
     t_logit = np.log(threshold / (1 - threshold))
-    bal_acc = float(((pos >= t_logit).mean()
-                     + (neg < t_logit).mean()) / 2)
+    bal_acc = float(((pos >= t_logit).mean() + (neg < t_logit).mean()) / 2)
     probs = 1 / (1 + np.exp(-logits))
     pos_p = probs[y.numpy() == 1]
     neg_p = probs[y.numpy() == 0]
@@ -285,19 +229,15 @@ def main():
     grid = [0.02, 0.05, 0.08, 0.10, 0.12, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50]
     print("\ncutoff " + " ".join(f"{a:>14s}" for a in dict.fromkeys(arms)))
     for t in grid:
-        print(f"{t:6.2f} " + " ".join(f"{float((probs[arms == a] >= t).mean()):14.4f}"
-                                     for a in dict.fromkeys(arms)))
+        print(f"{t:6.2f} " + " ".join(f"{float((probs[arms == a] >= t).mean()):14.4f}" for a in dict.fromkeys(arms)))
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     torch.save({"weight": w, "bias": b, "threshold": threshold,
                 "layer": args.layer, "model": MODEL_NAME,
-                "pool": ("mean_prompt_tail_and_committed_response_tokens"
-                         if args.prompt_tail else "mean_committed_response_tokens"),
+                "pool": ("mean_prompt_tail_and_committed_response_tokens" if args.prompt_tail else "mean_committed_response_tokens"),
                 "prompt_tail": int(args.prompt_tail),
                 "target": "visible_response_unsafe",
-                "source": ("wildjailbreak+alpaca_response_states"
-                           if args.alpaca_groups else
-                           "wildjailbreak_response_states"),
+                "source": ("wildjailbreak+alpaca_response_states" if args.alpaca_groups else "wildjailbreak_response_states"),
                 "alpaca_group_offset": ALPACA_GROUP_OFFSET,
                 "train_groups": [int(g) for g in groups],
                 "C": float(args.C)}, args.out)
