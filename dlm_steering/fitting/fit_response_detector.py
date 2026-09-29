@@ -11,7 +11,7 @@ import pandas as pd
 import torch
 
 from dlm_steering.runtime.constants import MODEL_NAME, MASK_ID
-from dlm_steering.runtime.utils import auroc
+from dlm_steering.runtime.utils import auroc, fit_logistic
 from dlm_steering.runtime.models import encode_prompt, load_llada
 
 from dlm_steering.paths import REPO as ROOT
@@ -42,25 +42,6 @@ def generate_sequence(model, tokenizer, attacker, prompt, device, *, steps, gen_
     if slots.numel() == 0:  # no prompt masks: the generated suffix is the response
         slots = torch.arange(x_in.shape[1], x.shape[1], device=x.device)
     return x, slots, clean_text(tokenizer, x, slots)
-
-
-def fit_logistic(X, y, C, steps=400):
-    X = X.to(torch.float64)
-    y = y.to(torch.float64)
-    w = torch.zeros(X.shape[1], dtype=torch.float64, requires_grad=True)
-    b = torch.zeros(1, dtype=torch.float64, requires_grad=True)
-    opt = torch.optim.LBFGS([w, b], max_iter=steps, line_search_fn="strong_wolfe")
-    lam = 1.0 / (C * len(X))
-
-    def closure():
-        opt.zero_grad()
-        loss = torch.nn.functional.binary_cross_entropy_with_logits(
-            X @ w + b, y) + 0.5 * lam * (w @ w)
-        loss.backward()
-        return loss
-
-    opt.step(closure)
-    return w.detach().to(torch.float32), float(b.detach())
 
 
 

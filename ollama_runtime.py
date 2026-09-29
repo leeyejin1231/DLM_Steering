@@ -40,6 +40,33 @@ def free_port():
         return sock.getsockname()[1]
 
 
+def ollama_up(host, timeout=3):
+    try:
+        with urllib.request.urlopen(f'{host}/api/tags', timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def start_ollama(port=50001, gpu=1, model=None, container=None, image='ollama/ollama', ready_timeout=90):
+    container = container or 'ollama'
+    host = f'http://localhost:{port}'
+    if ollama_up(host):
+        return False
+    subprocess.run(['podman', 'stop', container], capture_output=True)
+    subprocess.run(['podman', 'run', '--rm', '-d', '--init', '--security-opt=label=disable', '--mount=type=bind,src=.,dst=/mnt/workspace', f'--device=nvidia.com/gpu={gpu}', '--hooks-dir=/usr/share/containers/oci/hooks.d/', '-v', 'ollama:/root/.ollama', '-p', f'{port}:11434', '--name', container, image], check=True)
+    deadline = time.time() + ready_timeout
+    while time.time() < deadline:
+        if ollama_up(host):
+            break
+        time.sleep(1)
+    else:
+        raise RuntimeError(f'ollama did not come up on :{port} within {ready_timeout}s')
+    if model:
+        subprocess.run(['podman', 'exec', container, 'ollama', 'pull', model], check=True)
+    return True
+
+
 class OllamaStartupError(RuntimeError):
     pass
 
@@ -127,11 +154,10 @@ class OllamaServer:
                     raise StartupCancelled(f'GPU {self.gpu}: Server initialization cancelled')
                 if self.process.poll() is not None:
                     raise OllamaStartupError(f'Ollama startup failed: {log_path}')
-                try:
+                if ollama_up(f'http://127.0.0.1:{self.port}'):
                     tags = self.request('/api/tags')['models']
                     break
-                except (OSError, ValueError):
-                    time.sleep(1)
+                time.sleep(1)
             else:
                 raise OllamaStartupError(f'Ollama startup timeout: {log_path}')
             with log_path.open() as stream:

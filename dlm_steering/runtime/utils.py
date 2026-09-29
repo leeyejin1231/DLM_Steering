@@ -1,6 +1,7 @@
 import json
 import math
 import numpy as np
+import torch
 from pathlib import Path
 
 
@@ -41,3 +42,22 @@ def auroc(pos, neg):
     ranks = (sums / cnt)[inv]
     n_p, n_n = len(pos), len(neg)
     return (ranks[:n_p].sum() - n_p * (n_p + 1) / 2) / (n_p * n_n)
+
+
+def fit_logistic(X, y, C, steps=400, balanced=False):
+    X = X.to(torch.float64)
+    y = y.to(torch.float64)
+    w = torch.zeros(X.shape[1], dtype=torch.float64, requires_grad=True)
+    b = torch.zeros(1, dtype=torch.float64, requires_grad=True)
+    opt = torch.optim.LBFGS([w, b], max_iter=steps, line_search_fn="strong_wolfe")
+    lam = 1.0 / (C * len(X))
+    pos_weight = torch.tensor([(len(y) - y.sum()) / y.sum()], dtype=torch.float64) if balanced and y.sum() > 0 else None
+
+    def closure():
+        opt.zero_grad()
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(X @ w + b, y, pos_weight=pos_weight) + 0.5 * lam * (w @ w)
+        loss.backward()
+        return loss
+
+    opt.step(closure)
+    return w.detach().to(torch.float32), float(b.detach())

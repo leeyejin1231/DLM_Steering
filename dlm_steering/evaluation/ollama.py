@@ -2,49 +2,13 @@ import math
 import re
 import subprocess
 import time
-import urllib.request
 from dlm_steering.paths import REPO
 from dlm_steering.runtime.constants import ERROR_SENTINEL
 from .base import ASR
 from .streaming import _run_graded
+from ollama_runtime import start_ollama
 
 SR_PROMPT_PATH = REPO / "ollama_setting/strongreject_evaluator_prompt.txt"
-
-
-def _ollama_up(host, timeout=3):
-    try:
-        with urllib.request.urlopen(f"{host}/api/tags", timeout=timeout):
-            return True
-    except Exception:
-        return False
-
-
-def start_ollama(port=50001, gpu=1, model=None, container=None, image="ollama/ollama", ready_timeout=90):
-    container = container or "ollama"
-    host = f"http://localhost:{port}"
-    if _ollama_up(host):
-        return False
-    subprocess.run(["podman", "stop", container], capture_output=True)
-    subprocess.run([
-        "podman", "run", "--rm", "-d", "--init",
-        "--security-opt=label=disable",
-        "--mount=type=bind,src=.,dst=/mnt/workspace",
-        f"--device=nvidia.com/gpu={gpu}",
-        "--hooks-dir=/usr/share/containers/oci/hooks.d/",
-        "-v", "ollama:/root/.ollama",
-        "-p", f"{port}:11434",
-        "--name", container, image,
-    ], check=True)
-    deadline = time.time() + ready_timeout
-    while time.time() < deadline:
-        if _ollama_up(host):
-            break
-        time.sleep(1)
-    else:
-        raise RuntimeError(f"ollama did not come up on :{port} within {ready_timeout}s")
-    if model:
-        subprocess.run(["podman", "exec", container, "ollama", "pull", model], check=True)
-    return True
 
 
 _SR_RESPONSE_RE = re.compile(
@@ -75,34 +39,51 @@ def _parse_sr_output(model_output: str) -> dict:
 
 
 class Ollama:
-    def __init__(self, model, port=50001, gpu=1, reasoning_effort="low",
-                 num_predict=1000, temperature=0.0, workers=4,
-                 timeout_sec=120, start_container=True, stop_on_close=False,
-                 container=None, keep_alive="30m"):
-        self.model = model
+    MODEL = "gpt-oss:20b"
+    NUM_PREDICT = 1000
+    TIMEOUT_SEC = 120
+    DESC = "Ollama"
+    SEC_KEY = "judge_sec"
+
+    def __init__(self, model=None, port=50001, gpu=1, reasoning_effort="low", num_predict=None, temperature=0.0, workers=4, timeout_sec=None, start_container=True, stop_on_close=False, container=None, keep_alive="30m"):
+        self.model = model or self.MODEL
         self.port = port
         self.host = f"http://localhost:{port}"
         self.container = container or "ollama"
         self.reasoning_effort = reasoning_effort
-        self.num_predict = num_predict
+        self.num_predict = self.NUM_PREDICT if num_predict is None else num_predict
         self.temperature = temperature
         self.workers = workers
         self.keep_alive = keep_alive
         self.stop_on_close = stop_on_close
-        self._started = bool(start_container and start_ollama(port, gpu, model, self.container))
+        self._started = bool(start_container and start_ollama(port, gpu, self.model, self.container))
         from ollama import Client
-        self.client = Client(host=self.host, timeout=timeout_sec)
+        self.client = Client(host=self.host, timeout=self.TIMEOUT_SEC if timeout_sec is None else timeout_sec)
 
     def _chat(self, text):
-        """One user-turn call; returns the response 'message' dict."""
-        kw = {"model": self.model,
-              "messages": [{"role": "user", "content": text}],
-              "keep_alive": self.keep_alive,
-              "options": {"temperature": self.temperature,
-                          "num_predict": self.num_predict}}
+        kw = {"model": self.model, "messages": [{"role": "user", "content": text}], "keep_alive": self.keep_alive, "options": {"temperature": self.temperature, "num_predict": self.num_predict}}
         if self.reasoning_effort is not None:
             kw["think"] = self.reasoning_effort
         return self.client.chat(**kw)["message"]
+
+    def evaluate(self, items, output_path=None):
+        return _run_graded(items, output_path, self._grade, workers=self.workers, desc=f"{self.DESC} ({self.model})")
+
+    def _grade(self, chunk):
+        graded = []
+        for item in chunk:
+            skipped = self._skip(item)
+            if skipped is not None:
+                graded.append({**item, **skipped})
+                continue
+            msg = self._message(item)
+            t0 = time.time()
+            try:
+                fields = self._fields(self._chat(msg))
+            except Exception as e:
+                fields = self._failed(e)
+            graded.append({**item, **fields, self.SEC_KEY: round(time.time() - t0, 1)})
+        return graded
 
     def close(self):
         if self._started and self.stop_on_close:
@@ -110,44 +91,31 @@ class Ollama:
 
 
 class GptOss20b(Ollama, ASR):
-    """StrongREJECT grading by gpt-oss served over the podman ollama container."""
-
     name = "sr-gpt-oss-20b"
+    DESC = "SR-Ollama"
+    SEC_KEY = "sr_elapsed_sec"
+    NOT_GRADED = {"sr_score": math.nan, "sr_refusal": None, "sr_convincing": None, "sr_specific": None, "sr_thinking": ""}
 
     def __init__(self, model="gpt-oss:20b", **kw):
         super().__init__(model=model, **kw)
         self.grader_prompt = SR_PROMPT_PATH.read_text()
 
-    def evaluate(self, items, output_path=None):
-        return _run_graded(items, output_path, self._grade, workers=self.workers, desc=f"SR-Ollama ({self.model})")
+    def _skip(self, item):
+        if item.get("response") == ERROR_SENTINEL:
+            return {**self.NOT_GRADED, "sr_reasoning": "(generation failed upstream)", "sr_elapsed_sec": 0.0}
+        if not item.get("response", "").strip():
+            return {**self.NOT_GRADED, "sr_score": 0.0, "sr_refusal": 1, "sr_reasoning": "(empty generation)", "sr_elapsed_sec": 0.0}
+        return None
 
-    NOT_GRADED = {"sr_score": math.nan, "sr_refusal": None, "sr_convincing": None, "sr_specific": None, "sr_thinking": ""}
+    def _message(self, item):
+        return self.grader_prompt.format(prompt=item.get("prompt", ""), response=item.get("response", ""))
 
-    def _grade(self, chunk):
-        graded = []
-        for item in chunk:   # chunk=1: this grader scores one item per call
-            if item.get("response") == ERROR_SENTINEL:
-                graded.append({**item, **self.NOT_GRADED, "sr_reasoning": "(generation failed upstream)", "sr_elapsed_sec": 0.0})
-                continue
-            if not item.get("response", "").strip():
-                graded.append({**item, **self.NOT_GRADED, "sr_score": 0.0, "sr_refusal": 1, "sr_reasoning": "(empty generation)", "sr_elapsed_sec": 0.0})
-                continue
-            model_input = self.grader_prompt.format(
-                prompt=item.get("prompt", ""), response=item.get("response", ""))
-            result = dict(item)
-            t0 = time.time()
-            try:
-                message = self._chat(model_input)
-            except Exception as e:
-                result.update(self.NOT_GRADED, sr_reasoning=f"OLLAMA ERROR: {e}", sr_elapsed_sec=round(time.time() - t0, 1))
-                graded.append(result)
-                continue
-            result["sr_reasoning"] = message.get("content", "")
-            result["sr_thinking"] = message.get("thinking", "")
-            result.update(_parse_sr_output(result["sr_reasoning"]))
-            result["sr_elapsed_sec"] = round(time.time() - t0, 1)
-            graded.append(result)
-        return graded
+    def _fields(self, message):
+        content = message.get("content", "")
+        return {"sr_reasoning": content, "sr_thinking": message.get("thinking", ""), **_parse_sr_output(content)}
+
+    def _failed(self, exc):
+        return {**self.NOT_GRADED, "sr_reasoning": f"OLLAMA ERROR: {exc}"}
 
     @staticmethod
     def summarize(items):

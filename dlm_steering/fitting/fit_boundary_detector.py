@@ -10,7 +10,7 @@ import torch
 from dlm_steering.runtime.constants import (DETECTOR_LAYER, MODEL_NAME, MASK_ID, MASK_TOKEN,
                                             N_LAYERS, OUT_DIR)
 from models import MODEL_KEY, add_model_arg
-from dlm_steering.runtime.utils import auroc
+from dlm_steering.runtime.utils import auroc, fit_logistic
 from dlm_steering.runtime.models import encode_prompt, load_detector, seed_all
 from dlm_steering.runtime.data import hf_glob
 from dlm_steering.defenses.recovery import V3
@@ -26,28 +26,6 @@ POOLS = ("committed", "region")
 
 
 # ------------------------------------------------------------- fit helpers
-def fit_logistic(X, y, C, steps=400, balanced=False):
-    X = X.to(torch.float64)
-    y = y.to(torch.float64)
-    w = torch.zeros(X.shape[1], dtype=torch.float64, requires_grad=True)
-    b = torch.zeros(1, dtype=torch.float64, requires_grad=True)
-    opt = torch.optim.LBFGS([w, b], max_iter=steps, line_search_fn="strong_wolfe")
-    lam = 1.0 / (C * len(X))
-    pos_weight = None
-    if balanced and y.sum() > 0:
-        pos_weight = torch.tensor([(len(y) - y.sum()) / y.sum()], dtype=torch.float64)
-
-    def closure():
-        opt.zero_grad()
-        loss = torch.nn.functional.binary_cross_entropy_with_logits(
-            X @ w + b, y, pos_weight=pos_weight) + 0.5 * lam * (w @ w)
-        loss.backward()
-        return loss
-
-    opt.step(closure)
-    return w.detach().to(torch.float32), float(b.detach())
-
-
 def youden_cutoff(probs, y):
     order = np.argsort(-probs)
     best_j, best_t = -1.0, 0.5
