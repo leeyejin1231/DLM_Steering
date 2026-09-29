@@ -1,4 +1,3 @@
-"""One progress display per command tree; child processes keep their logs."""
 import os
 from tqdm import tqdm
 

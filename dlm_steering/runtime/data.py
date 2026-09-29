@@ -1,17 +1,18 @@
-"""Dataset discovery, loading, and prompt formatting."""
-import glob
 import os
+import glob
+import random
+import pyarrow as pa
+import pandas as pd
+import pandas as pd
 from pathlib import Path
 from dlm_steering.paths import DATA_DIR
 
 
-JBB_HARMFUL_GLOB = ("hub/datasets--JailbreakBench--JBB-Behaviors"
-                    "/snapshots/*/data/harmful-behaviors.csv")
+JBB_HARMFUL_GLOB = ("hub/datasets--JailbreakBench--JBB-Behaviors/snapshots/*/data/harmful-behaviors.csv")
 JBB_BENIGN_GLOB = JBB_HARMFUL_GLOB.replace("harmful-", "benign-")
 XSTEST_GLOB = "hub/datasets--walledai--XSTest/snapshots/*/**/*.parquet"
 WJ_EVAL_GLOB = "datasets/allenai___wildjailbreak/eval-*/0.0.0/*/*.arrow"
-TRUTHFULQA_GLOB = ("hub/datasets--domenicrosati--TruthfulQA"
-                   "/snapshots/*/**/*.csv")
+TRUTHFULQA_GLOB = ("hub/datasets--domenicrosati--TruthfulQA/snapshots/*/**/*.csv")
 GSM8K_GLOB = "datasets/gsm8k/main/*/*/gsm8k-test.arrow"
 MMLU_GLOB = "datasets/hails___mmlu_no_train/*/*/*/mmlu_no_train-test.arrow"
 WALLEDAI_GLOB = "hub/datasets--walledai--{}/snapshots/*/**/*.parquet"
@@ -19,15 +20,8 @@ LEGACY_HF_ROOT = Path("/mnt/shared/huggingface-cache")
 
 
 def _hf_roots():
-    """Hugging Face cache roots to search, most specific first.
-
-    A root is the directory holding both "hub/" and "datasets/". $HF_HOME is
-    that root; $HUGGINGFACE_HUB_CACHE points one level deeper at hub/, so its
-    parent is taken. Roots that do not exist simply match nothing.
-    """
     roots, seen = [], set()
-    for value in (os.environ.get("HF_HOME"),
-                  os.environ.get("HUGGINGFACE_HUB_CACHE")):
+    for value in (os.environ.get("HF_HOME"), os.environ.get("HUGGINGFACE_HUB_CACHE")):
         if value:
             path = Path(value)
             roots.append(path.parent if path.name == "hub" else path)
@@ -37,11 +31,6 @@ def _hf_roots():
 
 
 def hf_glob(pattern, required=True):
-    """Sorted cache files matching `pattern` under the first root that has any.
-
-    `pattern` is relative to a cache root, so one call works against $HF_HOME,
-    the default user cache, or the legacy shared mount.
-    """
     for root in _hf_roots():
         hits = sorted(glob.glob(str(root / pattern), recursive=True))
         if hits:
@@ -54,21 +43,17 @@ def hf_glob(pattern, required=True):
     return []
 
 
-HARMFUL_SOURCES = ("jbb_harmful", "advbench", "harmbench", "strongreject",
-                   "xstest_unsafe", "wj_unsafe")
+HARMFUL_SOURCES = ("jbb_harmful", "advbench", "harmbench", "strongreject", "xstest_unsafe", "wj_unsafe")
 BENIGN_SOURCES = ("truthfulqa", "xstest_safe", "jbb_benign", "wj_benign")
 UTILITY_SOURCES = ("mmlu", "gsm8k", "math500", "truthfulqa_mc")
 PROMPT_SOURCES = HARMFUL_SOURCES + BENIGN_SOURCES + UTILITY_SOURCES
 LETTERS = "ABCDEFGHIJKLMNOP"
 MC_INSTRUCTION = "Answer with the letter of the correct choice."
-GSM8K_INSTRUCTION = ("Solve the problem step by step, then give the final numeric "
-                     "answer on the last line in the form '#### <number>'.")
-MATH_INSTRUCTION = ("Solve the problem step by step, then put the final answer "
-                    "in \\boxed{}.")
+GSM8K_INSTRUCTION = ("Solve the problem step by step, then give the final numeric answer on the last line in the form '#### <number>'.")
+MATH_INSTRUCTION = ("Solve the problem step by step, then put the final answer in \\boxed{}.")
 
 
 def _read_arrow(path):
-    import pyarrow as pa
     with pa.memory_map(path) as src:
         try:
             return pa.ipc.open_stream(src).read_all().to_pandas()
@@ -77,7 +62,6 @@ def _read_arrow(path):
 
 
 def format_mc(question, choices, header=None):
-    """Zero-shot multiple-choice prompt: optional header, stem, lettered options."""
     lines = [header, "", question] if header else [question]
     lines += [f"{LETTERS[i]}. {c}" for i, c in enumerate(choices)]
     lines += ["", MC_INSTRUCTION]
@@ -90,18 +74,6 @@ def _truthfulqa_csv():
 
 
 def load_utility_prompts(source):
-    """Graded rows {"index", "prompt", "target": None, "task", "answer", ...}.
-
-    mmlu: all 57 subjects' test split (14042 items) in a fixed random order
-          (seed 0) so --n takes a subject-mixed slice. answer = letter A-D.
-    gsm8k: test split (1319) in file order. answer = number after '####'.
-    math500: HuggingFaceH4/MATH-500 (500) in file order. answer = the dataset's
-          final-answer string; eval_utility compares it to the last \\boxed{}.
-    truthfulqa_mc: MC1-style; best answer + incorrect answers shuffled per
-          item (seed = index). answer = letter.
-    """
-    import random
-    import pandas as pd
     rows = []
     if source == "mmlu":
         files = hf_glob(MMLU_GLOB)
@@ -112,8 +84,7 @@ def load_utility_prompts(source):
             r = df.iloc[j]
             subject = str(r["subject"]).replace("_", " ")
             rows.append({"index": i, "task": "mmlu", "subject": str(r["subject"]),
-                         "prompt": format_mc(str(r["question"]), list(r["choices"]),
-                                             f"The following is a multiple choice question about {subject}."),
+                         "prompt": format_mc(str(r["question"]), list(r["choices"]), f"The following is a multiple choice question about {subject}."),
                          "answer": LETTERS[int(r["answer"])], "target": None})
     elif source == "gsm8k":
         local = DATA_DIR / "gsm8k.parquet"
@@ -147,16 +118,6 @@ def load_utility_prompts(source):
 
 
 def load_prompts(source):
-    """Prompt sets as {"index", "prompt", "target"} rows.
-
-    Harmful: jbb_harmful (with Target), advbench, harmbench, strongreject, xstest_unsafe.
-    Benign (over-refusal): truthfulqa, xstest_safe, jbb_benign, wj_benign.
-    xstest_safe/xstest_unsafe are the XSTest contrast pair: safe prompts with
-    harmful-sounding words vs. their genuinely unsafe counterparts.
-    Utility (accuracy): mmlu, gsm8k, truthfulqa_mc; see load_utility_prompts.
-    Only jbb_harmful carries a target string; the rest use target=None.
-    """
-    import pandas as pd
     if source in UTILITY_SOURCES:
         return load_utility_prompts(source)
     if source == "jbb_harmful":
@@ -171,32 +132,18 @@ def load_prompts(source):
 
 
 def load_eval_prompts(source, limit):
-    """Benchmark prompt lists as plain strings.
-
-    Sources: xstest_safe/xstest_unsafe, jbb_benign/jbb_harmful, advbench,
-    harmbench, strongreject, truthfulqa, wj_benign.
-    """
-    import pandas as pd
     if source.startswith("xstest"):
         local = DATA_DIR / "xstest.parquet"
         df = pd.read_parquet(local if local.exists() else hf_glob(XSTEST_GLOB)[0])
-        # "xstest_unsafe".endswith("safe") is True, so match the suffix explicitly.
         want = "unsafe" if source.endswith("_unsafe") else "safe"
         df = df[df["label"] == want]
         prompts = df["prompt"].tolist()
     elif source in ("jbb_benign", "jbb_harmful"):
-        # Each benign behaviour is the index-matched counterpart of a harmful one
-        # ("fictional story about heroin use" vs "defamatory article claiming a
-        # president is addicted to heroin"), so topic is held roughly constant
-        # and only permissibility differs.
         local = DATA_DIR / f"{source}.csv"
         pattern = JBB_BENIGN_GLOB if source == "jbb_benign" else JBB_HARMFUL_GLOB
         df = pd.read_csv(local if local.exists() else hf_glob(pattern)[0])
         prompts = df["Goal"].tolist()
     elif source in ("advbench", "harmbench", "strongreject"):
-        # Out-of-distribution harmful benchmarks: bare requests in attack styles
-        # the steering and detector directions never saw. Shards are concatenated
-        # and de-duplicated because some of these ship several splits.
         local = DATA_DIR / f"{source}.parquet"
         if local.exists():
             df = pd.read_parquet(local)
@@ -207,19 +154,12 @@ def load_eval_prompts(source, limit):
             df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
         prompts = list(dict.fromkeys(df["prompt"].astype(str).tolist()))
     elif source == "truthfulqa":
-        # Plain harmless questions: nothing here should ever be refused, so the
-        # refusal rate is a direct read on utility damage rather than on
-        # sensitivity to harmful-sounding surface words.
         df = pd.read_csv(_truthfulqa_csv())
         prompts = df["Question"].tolist()
     elif source == "wj_unsafe":
-        # The WildJailbreak adversarial-harmful prompts the steering vector and
-        # detector were fitted on. Rows 0..19 are the held-out eval split the
-        # gated pipeline reports; the fits use rows 20+.
         df = pd.read_csv(DATA_DIR / "llada8b_wild_unsafe_only.csv")
         prompts = df["prompt"].tolist()
     elif source == "wj_benign":
-        import pyarrow as pa
         f = hf_glob(WJ_EVAL_GLOB)[0]
         with pa.memory_map(f) as src:
             ev = pa.ipc.open_stream(src).read_all().to_pandas()

@@ -1,15 +1,3 @@
-"""Verbatim prompt text and parsing helpers ported from the attack references.
-
-PAIR (Chao et al. 2023, patrickrchao/JailbreakingLLMs):
-  attacker system prompts are copied from system_prompts.py;
-  get_init_msg / process_target_response / extract_json come from JailbreakingLLMs' common.py.
-
-PAP (Zeng et al. 2024, CHATS-lab/persuasive_jailbreaker):
-  the five better in-context mutation templates in attacks/pap_better_templates.json
-  and extract_content come from PAP_Better_Incontext_Sample/mutation_utils.py.
-
-"""
-
 import ast
 import json
 import logging

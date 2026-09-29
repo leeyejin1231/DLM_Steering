@@ -1,12 +1,18 @@
+import os
+import subprocess
+import sys
 import argparse
 import json
 from pathlib import Path
 
+from attack_llms import HFChat
 from attack_prompts import load_better_templates, extract_content
 from dlm_steering.runtime.data import load_prompts
 from dlm_steering.runtime.models import enable_reproducibility, seed_all, force_math_attention
 from pap_common import (SAMPLING, assign_techniques, normalize_templates, identity, validate, save)
 from dlm_steering.runtime.progress import task_progress
+from dlm_steering.runtime.execution import parse_gpu_ids
+from dlm_steering.runtime.progress import CHILD_PROGRESS_ENV
 
 
 class PAPGenerator:
@@ -27,7 +33,6 @@ class PAPGenerator:
 
 def generate_shard(a):
     """Fill the rows of this shard that --reuse / --out do not already hold."""
-    from attack_llms import HFChat
     rows = load_prompts(a.source)
     data = identity(a.source, a.seed, a.reproduct, a.model)
     entries = {}
@@ -62,11 +67,7 @@ def generate_shard(a):
 
 
 def generate_sharded(a):
-    import os
-    import subprocess
-    import sys
-    from dlm_steering.runtime.execution import parse_gpu_ids
-    from dlm_steering.runtime.progress import CHILD_PROGRESS_ENV
+
     devices = parse_gpu_ids(a.gpus)
     rows = load_prompts(a.source)
     cache = Path(a.out).resolve()

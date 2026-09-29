@@ -45,7 +45,7 @@ part file.
 |---|---|---|
 | `none` | no defense | nothing |
 | `ours` | gate, steering and V3 remasking | the checkpoints below |
-| `diffuguard` | DiffuGuard | the generator code bundled in `third_party/` |
+| `diffuguard` | DiffuGuard | the generator code bundled in `diffuguard/` |
 | `selfreminder` | a safety reminder prepended to the prompt | nothing |
 
 The default paths of `ours` expect these files; they have to be prepared separately
@@ -321,7 +321,7 @@ dlm_steering/
 | `script/` | `common.sh` (environment, GPUs, deployed defense flags), `build_vectors.sh`, the `run_*.sh` drivers of section 6, `report.py` |
 | `data/` / `attacks/` | datasets / fixed attack prompt resources |
 | `outputs/` | generations, evaluations and defense checkpoints |
-| `third_party/` | the bundled DiffuGuard generator and its provenance (`diffuguard_origin.json`) |
+| `diffuguard/` | the bundled DiffuGuard generator and its provenance (`diffuguard_origin.json`) |
 
 The LG4 and GPT-OSS result JSON layout is shared in `evaluation/results.py` and JSONL
 resumption in `evaluation/streaming.py`. Atomic JSON writes for the PAP caches are in

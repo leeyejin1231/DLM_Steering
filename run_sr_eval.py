@@ -3,7 +3,10 @@ import os
 import argparse
 import json
 from pathlib import Path
-
+from ollama_runtime import OllamaServer
+from dlm_steering.evaluation.cache import matches
+from dlm_steering.evaluation.streaming import _resume_stream, _item_key, _run_graded
+from ollama_runtime import OllamaServerPool
 from dlm_steering.runtime.execution import plan_shards, run_eval_shards
 from dlm_steering.evaluation.ollama import GptOss20b
 from dlm_steering.evaluation.attacks import generation_items
@@ -45,7 +48,6 @@ def main():
 
     output = Path(args.out)
     if output.is_file():
-        from dlm_steering.evaluation.cache import matches
         try:
             saved = json.loads(output.read_text())
             if args.model == 'gpt-oss:20b' and matches(saved, items, 'gptoss'):
@@ -58,8 +60,6 @@ def main():
     devices = plan_shards(args.gpus) if args.gpus else []
     grader_name = (f"StrongREJECT / {args.model} (reasoning_effort={args.reasoning_effort})")
     if devices and args.auto_server:
-        from dlm_steering.evaluation.streaming import _resume_stream, _item_key, _run_graded
-        from ollama_runtime import OllamaServerPool
         jsonl = Path(args.jsonl or Path(args.out).with_suffix(".jsonl"))
         _, done, stream = _resume_stream(jsonl, items)
         stream.close()
@@ -81,7 +81,6 @@ def main():
     else:
         jsonl = args.jsonl or str(Path(args.out).with_suffix(".jsonl"))
         if args.auto_server:
-            from ollama_runtime import OllamaServer
             device = os.environ.get('CUDA_VISIBLE_DEVICES', str(args.gpu))
             server_context = OllamaServer(device, args.out, args.model, args.workers)
         else:

@@ -1,7 +1,8 @@
 import threading
-
 import torch
-
+from transformers import GenerationConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import LogitsProcessorList, TemperatureLogitsWarper
 from model_loading import load_pretrained
 
 
@@ -49,7 +50,7 @@ class HFChat:
         with self._load_lock:
             if self.model is not None:
                 return
-            from transformers import AutoModelForCausalLM, AutoTokenizer
+            
             device = self.device or ("cuda:1" if torch.cuda.device_count() > 1 else "cuda:0")
             print(f"loading attack/judge model {self.model_id} on {device} ...")
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
@@ -62,7 +63,7 @@ class HFChat:
             self.device = device
 
     def _locked_generate(self, ids, kw, seed):
-        from transformers import GenerationConfig
+        
         config = GenerationConfig(
             **{key: getattr(self.model.generation_config, key, None) for key in ("bos_token_id", "eos_token_id", "pad_token_id")},
             do_sample=kw.get("do_sample", True),
@@ -71,7 +72,7 @@ class HFChat:
         kw = dict(kw)
         if (torch.are_deterministic_algorithms_enabled()
                 and kw.get("do_sample") and 0 < kw.get("top_p", 1) < 1):
-            from transformers import LogitsProcessorList, TemperatureLogitsWarper
+            
             temperature = kw.pop("temperature", 1.0)
             processors = []
             if temperature != 1:

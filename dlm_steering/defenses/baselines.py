@@ -78,7 +78,7 @@ class DiffuGuard(NullDefender):
 
     @torch.no_grad()
     def defend(self, model, prompt_ids, rng=None, **gen_config):
-        from third_party import diffuguard as backend
+        from diffuguard import generate_function_llada as backend
         generate = backend.generate
         if self.vanilla_ids is None:
             raise ValueError("DiffuGuard hidden detection requires a clean reference")
