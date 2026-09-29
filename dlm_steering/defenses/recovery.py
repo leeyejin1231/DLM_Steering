@@ -25,7 +25,7 @@ class V3(Ours):
                  recovery_rounds=1, audit_all_boundaries=False,
                  audit_boundary=0, infill_checkpoint=0,
                  recovery_alpha_growth=1.0, remask_prompt=False,
-                 remask_prompt_tail=0, **kw):
+                 remask_prompt_tail=0, remask_prompt_frac=1.0, **kw):
         if recovery_steps != "auto" and recovery_steps <= 0:
             raise ValueError("recovery_steps must be positive")
         if recovery_rounds <= 0:
@@ -46,6 +46,11 @@ class V3(Ours):
         if remask_prompt_tail < 0:
             raise ValueError("remask_prompt_tail must be >= 0")
         self.remask_prompt_tail = int(remask_prompt_tail)
+        if not 0.0 < remask_prompt_frac <= 1.0:
+            raise ValueError("remask_prompt_frac must lie in (0, 1]")
+        if remask_prompt_tail and remask_prompt_frac != 1.0:
+            raise ValueError("remask_prompt_tail and remask_prompt_frac are exclusive")
+        self.remask_prompt_frac = float(remask_prompt_frac)
         self._prompt_text_slots = None
         self.recovery_steps = "auto" if recovery_steps == "auto" else int(recovery_steps)
         self.recovery_rounds = int(recovery_rounds)
@@ -201,7 +206,7 @@ class V3(Ours):
         span_slots = region[0] & (x[0] != self.mask_id)
         span_slots[prompt_length:] = False
         if self.remask_prompt:
-            span_slots[:prompt_length] |= self._prompt_slots_to_reopen()
+            span_slots[:prompt_length] |= self._prompt_slots_to_reopen(audit.rng)
         targets = audit.block_row | span_slots
         # Recovery may reopen fixed prompt text. Include it in recovery pools
         # only; subsequent ordinary audits still use the original answer region.
@@ -285,20 +290,33 @@ class V3(Ours):
             return [committed, *chunks]
         return [torch.cat([tail, committed]), *chunks]
 
-    def _prompt_slots_to_reopen(self):
+    def _prompt_slots_to_reopen(self, rng=None):
         """Prompt text slots recovery reopens.
 
         Reopening every slot leaves the model nothing but the chat headers to
         condition on, so it fills prompt and answer alike with end-of-text and
-        the response comes back empty. --remask-prompt-tail N reopens only the
-        last N text slots -- the block right before the response, where DIJA
-        templates and injected prefixes sit -- and keeps the request as context.
+        the response comes back empty. Two ways to keep context:
+
+        --remask-prompt-tail N  the last N text slots only -- the block right
+                                before the response, where DIJA templates and
+                                injected prefixes sit; the request stays.
+        --remask-prompt-frac r  a uniformly random fraction r of the text
+                                slots, drawn from the row's generator so
+                                --reproduct stays deterministic.
         """
         text = self._prompt_text_slots
-        if not self.remask_prompt_tail:
+        if self.remask_prompt_tail:
+            reopen = torch.zeros_like(text)
+            reopen[text.nonzero().flatten()[-self.remask_prompt_tail:]] = True
+            return reopen
+        if self.remask_prompt_frac >= 1.0:
             return text
+        idx = text.nonzero().flatten()
+        keys = torch.rand(idx.numel(), dtype=torch.float64, device=idx.device,
+                          generator=rng)
+        chosen = idx[keys.argsort()[:round(self.remask_prompt_frac * idx.numel())]]
         reopen = torch.zeros_like(text)
-        reopen[text.nonzero().flatten()[-self.remask_prompt_tail:]] = True
+        reopen[chosen] = True
         return reopen
 
     def _remasked(self):
@@ -346,6 +364,7 @@ class V3(Ours):
         d = super().describe()
         d.update(remask="v3", remask_prompt=self.remask_prompt,
                  remask_prompt_tail=self.remask_prompt_tail,
+                 remask_prompt_frac=self.remask_prompt_frac,
                  recovery_steps=self.recovery_steps,
                  recovery_rounds=self.recovery_rounds,
                  audit_all_boundaries=self.audit_all_boundaries,

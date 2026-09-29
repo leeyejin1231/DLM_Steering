@@ -1,11 +1,24 @@
+# DLM_Steering (code-share) LLaDA environment -- matches .venv created 2026-09-25.
+#
+# Python 3.12 (uv-managed CPython), torch 2.3.1 + CUDA 12.1 wheels.
+# Recreate (pinned, exact -- preferred):
+#   uv venv --python 3.12 .venv && uv pip sync -p .venv/bin/python requirements.lock
+# Or with pip from this file only:
+#   python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#
+# Do not use the anaconda base env (torch 2.0.1 breaks --reproduct) or the
+# kotox env (transformers 5.x cannot load LLaDA); kotox is only for eval_llamaguard.py.
+# After editing this file, regenerate the lock:
+#   uv pip compile requirements.txt -o requirements.lock
+
 torch==2.3.1
 transformers==4.55.4
 tokenizers==0.21.4
 huggingface-hub==0.36.2
 hf-xet==1.6.0
-accelerate
-numpy
-pandas
-pyarrow
-tqdm
-ollama
+accelerate==1.15.0
+numpy==2.5.3
+pandas==3.0.5
+pyarrow==25.0.1
+tqdm==4.70.1
+ollama==0.6.2

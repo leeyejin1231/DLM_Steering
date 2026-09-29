@@ -126,6 +126,12 @@ class Ours(Defender):
                                  "injections sit -- and keep the rest as context. "
                                  "0 reopens all of it, which leaves nothing to "
                                  "condition on and tends to return an empty answer.")
+        parser.add_argument("--remask-prompt-frac", type=float, default=1.0,
+                            help="v3 with --remask-prompt: reopen a uniformly random "
+                                 "fraction of the prompt text tokens (per-row rng, "
+                                 "so --reproduct stays deterministic); the rest stays "
+                                 "in place as context. 1.0 reopens all of it. "
+                                 "Exclusive with --remask-prompt-tail.")
         parser.add_argument("--recovery-steps", type=lambda s: "auto" if s == "auto" else int(s), default=32,
                             help="Steps spent regenerating a triggered block (v3).")
         parser.add_argument("--recovery-rounds", type=int, default=1,
@@ -161,6 +167,12 @@ class Ours(Defender):
             raise ValueError("--remask-prompt-tail must be >= 0")
         if args.remask_prompt_tail and not args.remask_prompt:
             raise ValueError("--remask-prompt-tail requires --remask-prompt")
+        if not 0.0 < args.remask_prompt_frac <= 1.0:
+            raise ValueError("--remask-prompt-frac must lie in (0, 1]")
+        if args.remask_prompt_frac != 1.0 and not args.remask_prompt:
+            raise ValueError("--remask-prompt-frac requires --remask-prompt")
+        if args.remask_prompt_tail and args.remask_prompt_frac != 1.0:
+            raise ValueError("--remask-prompt-tail and --remask-prompt-frac are exclusive")
         device = next(model.parameters()).device
         sites = []
         if args.steer != "none":
@@ -188,6 +200,7 @@ class Ours(Defender):
         return V3(**shared, response_detector=response_detector,
                   remask_prompt=args.remask_prompt,
                   remask_prompt_tail=args.remask_prompt_tail,
+                  remask_prompt_frac=args.remask_prompt_frac,
                   recovery_steps=args.recovery_steps,
                   recovery_rounds=args.recovery_rounds,
                   audit_all_boundaries=args.audit_all_boundaries,
