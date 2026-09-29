@@ -1,0 +1,16 @@
+{
+  "repository": "https://github.com/niez233/DiffuGuard",
+  "commit": "86aeb75203d07064c1ced650edaee74563647d36",
+  "original_path": "utility/generate_function_llada.py",
+  "upstream_sha256": "78cf8d7105aeaafa07ac37a77716114490243f0bdf74b9b93c3fb0694af5eff7",
+  "included_sha256": "962c53f722f224bcb4dd60d3e3a506cfbac9cb3dbfc7c9e1406f881571fb5f3b",
+  "local_changes": [
+    "Block scheduling: include prompt in first block; keep future answer blocks outside current block.",
+    "BLOCK_SCHEDULE_VERSION marker: prompt_then_answer_blocks_v1.",
+    "Remove trailing whitespace; Python AST unchanged."
+  ],
+  "dependencies": [
+    "torch",
+    "numpy"
+  ]
+}

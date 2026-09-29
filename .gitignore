@@ -3,6 +3,10 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# exclusive README
+*.md
+!README.md
+
 # C extensions
 *.so
 
@@ -25,13 +29,15 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+# Generations, judge results and fitted detectors stay out of git; copy them
+# between machines directly.
 outputs/
 strongreject/
 METHOD.md
 log/
 history/
 data/
-
+DIJA/
 
 # PyInstaller
 #   Usually these files are written by a python script from a template
@@ -225,3 +231,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Local regression checks (not published)
+/tests/

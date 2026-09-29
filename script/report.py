@@ -1,0 +1,96 @@
+import json
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+DEFAULT_FILES = sorted(
+    str(f.relative_to(ROOT))
+    for suffix in ("_lg4", "_sr", "_judged", "_acc")
+    for f in (ROOT / "outputs").rglob(f"*{suffix}.json"))
+
+GRADERS = [
+    ("Llama Guard 4 (harmful)", "by_category",
+     [("n", "total"), ("unsafe", "unsafe"), ("ASR", "asr"),
+      ("errors", "n_errors")]),
+    ("StrongREJECT (harmful)", "mean_sr_score",
+     [("n", "total"), ("refused", "refused"), ("ASR", "asr"),
+      ("mean score", "mean_sr_score"), ("errors", "n_errors")]),
+    ("XSTest refusal judge", "2_full_refusal",
+     [("n", "total"), ("refusal", "refusal_rate"),
+      ("full refusal", "full_refusal_rate"), ("parse err", "n_parse_error"),
+      ("gen err", "n_generation_error")]),
+    ("Accuracy", "accuracy",
+     [("n", "total"), ("accuracy", "accuracy"), ("unparsed", "unparsed"),
+      ("errors", "n_errors")]),
+]
+
+
+def classify(summary):
+    # (grader name, columns) for a summary block, or None if unrecognised.
+    if "grader_kind" in summary:
+        return (f"{summary['grader_kind']} (attack rows)",
+                [("n", "total"), ("success", "successful"), ("ASR", "asr"),
+                 ("ASR upper", "asr_upper_bound"), ("unresolved", "unresolved"),
+                 ("search errors", "n_search_errors")])
+    for name, marker, columns in GRADERS:
+        if marker in summary:
+            return name, columns
+    return None
+
+
+def cell(value):
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        return f"{value:.4f}".rstrip("0").rstrip(".")
+    return str(value)
+
+
+def render(name, columns, rows):
+    # One grader's table: a label column plus that grader's metric columns.
+    headers = ["file", *(h for h, _ in columns)]
+    table = [headers] + [[label, *(cell(s.get(k)) for _, k in columns)]
+                         for label, s in rows]
+    widths = [max(len(r[i]) for r in table) for i in range(len(headers))]
+    print(f"\n{name}")
+    for i, row in enumerate(table):
+        print("  " + "  ".join(v.ljust(w) for v, w in zip(row, widths)))
+        if i == 0:
+            print("  " + "  ".join("-" * w for w in widths))
+
+
+def main(argv):
+    paths = [Path(a) for a in argv] or [ROOT / f for f in DEFAULT_FILES]
+    grouped, missing, unknown = {}, [], []
+    for path in paths:
+        if not path.exists():
+            missing.append(path)
+            continue
+        summary = json.loads(path.read_text()).get("summary")
+        kind = classify(summary) if summary else None
+        if kind is None:
+            unknown.append(path)
+            continue
+        name, columns = kind
+        grouped.setdefault((name, tuple(columns)), []).append(
+            (path.name, summary))
+
+    for (name, columns), rows in grouped.items():
+        render(name, list(columns), rows)
+    if unknown:
+        print("\nno recognisable summary block:")
+        for path in unknown:
+            print(f"  {path}")
+    if missing:
+        print("\nnot scored yet:")
+        for path in missing:
+            print(f"  {path.relative_to(ROOT) if path.is_absolute() else path}")
+    if not grouped:
+        print("\nnothing to report.")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
