@@ -1,4 +1,3 @@
-"""Shared PAP technique assignment and cache format; no model generation."""
 import hashlib
 import json
 import random
@@ -6,7 +5,7 @@ import shlex
 from pathlib import Path
 
 from attack_prompts import PAP_BETTER_TEMPLATES_PATH
-from common import load_prompts
+from dlm_steering.runtime.data import load_prompts
 from dlm_steering.runtime.utils import atomic_write_json
 
 TOP5 = ("Logical Appeal", "Authority Endorsement", "Misrepresentation",
@@ -19,18 +18,16 @@ def default_cache_path(source, seed):
 
 
 def require_cache(path, source, seed, reproduct):
-    """Resolve the default cache before any target model is loaded."""
     path = Path(path) if path else default_cache_path(source, seed)
     if not path.is_file():
         root = Path(__file__).parent
-        command = [str(root / ".venv/bin/python"), str(root / "pap_generate.py"),
-                   "--source", source, "--seed", str(seed)]
+        command = [str(root / ".venv/bin/python"), str(root / "pap_generate.py"), "--source", source, "--seed", str(seed)]
         if reproduct:
             command.append("--reproduct")
         command += ["--out", str(path)]
         raise FileNotFoundError(
-            f"PAP 공격 프롬프트 파일이 없습니다: {path}\n"
-            f"먼저 아래 명령으로 생성한 뒤 다시 실행하세요:\n{shlex.join(command)}")
+            f"There is no PAP attack prompt file: {path}\n"
+            f"Please generate it first with the following command:\n{shlex.join(command)}")
     return path
 
 
@@ -45,7 +42,6 @@ def normalize_templates(templates):
 
 
 def assign_techniques(rows, seed):
-    """Balance techniques over full-source indices, independently of sharding."""
     indices = sorted(int(row["index"]) for row in rows)
     if len(indices) != len(set(indices)):
         raise ValueError("PAP technique assignment requires unique row indices")
@@ -68,9 +64,7 @@ def save(path, data):
 
 
 def identity(source, seed, reproduct, model):
-    return dict(source=source, seed=seed, reproduct=reproduct, model=model,
-                template_sha256=digest(PAP_BETTER_TEMPLATES_PATH),
-                sampling=dict(SAMPLING))
+    return dict(source=source, seed=seed, reproduct=reproduct, model=model, template_sha256=digest(PAP_BETTER_TEMPLATES_PATH), sampling=dict(SAMPLING))
 
 
 def validate(data, rows, source, seed, reproduct, complete=True):

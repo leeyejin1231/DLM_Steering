@@ -44,9 +44,11 @@ import numpy as np
 import pandas as pd
 import torch
 
-from common import (DETECTOR_LAYER, MODEL_KEY, MODEL_NAME, MASK_ID, MASK_TOKEN, N_LAYERS,
-                    OUT_DIR, add_model_arg, auroc, encode_prompt, hf_glob, load_detector,
-                    seed_all)
+from dlm_steering.runtime.constants import (DETECTOR_LAYER, MODEL_KEY, MODEL_NAME, MASK_ID,
+                                            MASK_TOKEN, N_LAYERS, OUT_DIR, add_model_arg)
+from dlm_steering.runtime.utils import auroc
+from dlm_steering.runtime.models import encode_prompt, load_detector, seed_all
+from dlm_steering.runtime.data import hf_glob
 
 from dlm_steering.paths import REPO as ROOT
 ALL_LAYERS = list(range(1, N_LAYERS))   # hidden_states[L] == output of block L-1
@@ -332,7 +334,7 @@ def main():
         counts = {a: sum(r[2] == a for r in rows) for a in dict.fromkeys(r[2] for r in rows)}
         print(f"{len(rows)} prompts: {counts}")
 
-        from common import load_model
+        from dlm_steering.runtime.models import load_model
         template = DIJATemplate(args.dija_steps, args.dija_span)
         arm_cfg = {"wildjailbreak": (template, args.template_steps),
                    "wj_benign": (template, args.template_steps),
@@ -370,7 +372,7 @@ def main():
         del model, recorder
         torch.cuda.empty_cache()
 
-        from Evaluator import LlamaGuard4
+        from dlm_steering.evaluation.llamaguard import LlamaGuard4
         print("judging finished texts with Llama Guard 4 ...")
         with LlamaGuard4(device=args.guard_device) as guard:
             for arm, d in per_arm.items():

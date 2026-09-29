@@ -40,7 +40,7 @@ Usage:
         --groups 384 --guard-device cuda:2
 """
 
-from common import OUT_DIR, DETECTOR_LAYER, MODEL_KEY, add_model_arg
+from dlm_steering.runtime.constants import OUT_DIR, DETECTOR_LAYER, MODEL_KEY, add_model_arg
 
 import argparse
 import json
@@ -51,7 +51,9 @@ import numpy as np
 import pandas as pd
 import torch
 
-from common import MODEL_NAME, MASK_ID, auroc, encode_prompt, load_llada
+from dlm_steering.runtime.constants import MODEL_NAME, MASK_ID
+from dlm_steering.runtime.utils import auroc
+from dlm_steering.runtime.models import encode_prompt, load_llada
 
 from dlm_steering.paths import REPO as ROOT
 ALPACA_GROUP_OFFSET = 1_000_000
@@ -162,8 +164,8 @@ def main():
                          f"{prompt}\n\n{extra}" if extra else prompt, "alpaca"))
         print(f"{args.alpaca_groups} prompt groups from {args.alpaca}")
 
-    from Attacker import NoAttack
-    from Evaluator import LlamaGuard4
+    from dlm_steering.attacks.base import NoAttack
+    from dlm_steering.evaluation.llamaguard import LlamaGuard4
     from dlm_steering.fitting import response_cache as rc
     attacker = NoAttack()
     gen_length = args.gen_length

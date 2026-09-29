@@ -1,16 +1,16 @@
 """Print the headline metrics of scored output files as one aligned table.
 
-script/evaluate.sh calls this last; it also runs standalone over any grader
-payloads:
+The script/run_*.sh drivers call this last; it also runs standalone over any
+grader payloads:
 
-    python script/report.py outputs/JBB-dija-v3-42_lg4.json outputs/*_sr.json
+    python script/report.py outputs/JBB-dija-ours-42_lg4.json outputs/*_sr.json
 
-With no arguments it reports the files evaluate.sh produces. Every input is a
-payload written by eval_llamaguard.py, run_sr_eval.py, dlm_steering/fitting/judge_refusal.py
-or eval_utility.py; the grader is inferred from the keys of its "summary"
-block, so no naming convention is assumed. Missing or unrecognised files are
-listed rather than raised, so a partially finished pipeline still reports what
-it has.
+With no arguments it reports every grader payload under outputs/ (*_lg4, *_sr,
+*_judged, *_acc). Every input is a payload written by eval_llamaguard.py,
+run_sr_eval.py, dlm_steering/fitting/judge_refusal.py or eval_utility.py; the
+grader is inferred from the keys of its "summary" block, so no naming
+convention is assumed. Missing or unrecognised files are listed rather than
+raised, so a partially finished pipeline still reports what it has.
 """
 
 import json
@@ -19,12 +19,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# What script/evaluate.sh writes, in reading order.
-DEFAULT_FILES = [
-    *(f"outputs/gated_lg4_len{n}.json" for n in (128, 256)),
-    *(f"outputs/gated_sr_len{n}.json" for n in (128, 256)),
-    *(f"outputs/gated_or30_{s}_judged.json" for s in ("xstest", "jbb", "tqa")),
-]
+# With no arguments: every grader payload under outputs/, in reading order.
+DEFAULT_FILES = sorted(
+    str(f.relative_to(ROOT))
+    for suffix in ("_lg4", "_sr", "_judged", "_acc")
+    for f in (ROOT / "outputs").rglob(f"*{suffix}.json"))
 
 # (grader, key that identifies it, [(column header, summary key)]). The first
 # grader whose marker key is present wins, so markers must be unique.

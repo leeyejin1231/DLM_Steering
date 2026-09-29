@@ -10,7 +10,8 @@ from pathlib import Path
 import re
 
 import pandas as pd
-from common import MODEL_KEY, encode_prompt, load_llada, seed_all
+from dlm_steering.runtime.constants import MODEL_KEY
+from dlm_steering.runtime.models import encode_prompt, load_llada, seed_all
 from models import add_model_arg
 from sampler import generate
 
@@ -49,7 +50,7 @@ def main():
         with out.open() as stream:
             done = {int(json.loads(line)["index"]) for line in stream if line.strip()}
 
-    from Evaluator import LlamaGuard4
+    from dlm_steering.evaluation.llamaguard import LlamaGuard4
     tokenizer, model = load_llada(args.device)
     with LlamaGuard4(device=args.guard_device) as guard, out.open("a") as stream:
         for index in range(args.start, end):

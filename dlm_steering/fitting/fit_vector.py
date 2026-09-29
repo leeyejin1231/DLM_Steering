@@ -18,7 +18,7 @@ Usage:
     CUDA_VISIBLE_DEVICES=1 python -m dlm_steering.fitting.fit_vector
 """
 
-from common import OUT_DIR, DETECTOR_LAYER, MODEL_KEY, add_model_arg
+from dlm_steering.runtime.constants import OUT_DIR, add_model_arg
 
 import argparse
 import json
@@ -27,8 +27,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from common import (
-    FIT_LAYERS, MODEL_NAME, MASK_ID, auroc, load_llada, prompt_token_ids)
+from dlm_steering.runtime.constants import FIT_LAYERS, MODEL_NAME, MASK_ID
+from dlm_steering.runtime.utils import auroc
+from dlm_steering.runtime.models import load_llada, prompt_token_ids
 
 from dlm_steering.paths import REPO as ROOT
 

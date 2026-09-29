@@ -1,11 +1,11 @@
-"""Aggregate the Dream over-refusal runs over seeds.
+"""Aggregate the over-refusal runs of one model and tag over seeds.
 
 Reads <out-dir>/{XSTest-safe-none,TQA-none}-<tag>-<seed>.json (generation:
 gate/detector/remask rates) and the matching *_judged.json (XSTest 3-way
 refusal judge) and writes <out-dir>/OR-summary-<tag>.{json,md}.
 
 Usage:
-    python -m dlm_steering.fitting.aggregate_dream_overrefusal --out-dir outputs/dream --tag v3rp80
+    python -m dlm_steering.fitting.aggregate_overrefusal --out-dir outputs/dream --tag v3rp80
 """
 import argparse
 import json

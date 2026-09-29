@@ -1,21 +1,3 @@
-"""eval_broken_sentence.py
-
-Rule-based broken-sentence ratio over results.jsonl produced by eval_gsm8k.py.
-
-Response-level rule:
-  empty    : the whole response (after cutting at the first EOS) is blank
-
-Sentence-level rules (a sentence is broken if ANY applies):
-  repeat   : the same token appears >= 3 times consecutively
-  script   : contains non-Latin script characters (CJK, Hangul, Cyrillic, ...)
-  special  : residual special tokens (<|...|>, <mask>, [MASK], U+FFFD, ...)
-
-Separator lines (---, ===, ***, ___) are not counted as sentences.
-
-Usage:
-  python eval_broken_sentence.py results/*/results.jsonl
-  python eval_broken_sentence.py results.jsonl --dump broken.jsonl
-"""
 import argparse
 import json
 import re
@@ -162,8 +144,7 @@ def main():
     if dump:
         dump.close()
 
-    header = (f"{'mode':<40} {'resp':>6} {'empty':>6} {'resp_brk%':>9} "
-              f"{'sent':>7} {'sent_brk%':>9}  rules")
+    header = (f"{'mode':<40} {'resp':>6} {'empty':>6} {'resp_brk%':>9} {'sent':>7} {'sent_brk%':>9}  rules")
     print(header)
     print("-" * len(header))
     for g in sorted(agg):
@@ -171,8 +152,7 @@ def main():
         rp = 100 * a["responses_broken"] / max(a["responses"], 1)
         sp = 100 * a["sentences_broken"] / max(a["sentences"], 1)
         rules = ",".join(f"{k}={v}" for k, v in sorted(a["rules"].items()))
-        print(f"{g:<40} {a['responses']:>6} {a['responses_empty']:>6} {rp:>8.2f}% "
-              f"{a['sentences']:>7} {sp:>8.2f}%  {rules}")
+        print(f"{g:<40} {a['responses']:>6} {a['responses_empty']:>6} {rp:>8.2f}% {a['sentences']:>7} {sp:>8.2f}%  {rules}")
 
     summary = {
         g: {**a, "rules": dict(a["rules"]),

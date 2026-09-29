@@ -366,7 +366,7 @@ class Ours(Defender):
 
         Returns (model output, captured audit features). Forward hooks are
         module-global, so MODEL_LOCK spans the whole register/call/remove
-        window -- see common.MODEL_LOCK.
+        window -- see runtime.constants.MODEL_LOCK.
         """
         handles, feats = [], []
         with MODEL_LOCK:

@@ -35,10 +35,9 @@ by the StrongREJECT rubric with `gpt-oss:20b` served by Ollama. The evaluation s
 the Ollama container themselves; `ollama_setting/` holds the podman image and model pull
 scripts.
 
-`interface.py` is an interactive launcher over the same commands (experiments, evaluation,
-PAP preparation, response-detector fitting). It shows one tqdm bar per task, hides the
-progress bars of child processes and keeps their full output in per-task logs. `exp.py` and
-`pap_generate.py` show tqdm bars when run directly as well.
+`exp.py`, `pap_generate.py` and the graders show one tqdm bar per task; when a run is
+sharded over several GPUs, each child process writes its full output to a log next to its
+part file.
 
 ### Defenses
 
@@ -67,6 +66,10 @@ outputs/response_detector.pt
 ```bash
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python pap_generate.py \
   --source jbb_harmful --seed 42 --reproduct \
+  --out data/attacks/pap_better/jbb_harmful/seed42.json
+
+# several GPUs: one worker per GPU, shards validated and merged into --out
+.venv/bin/python pap_generate.py --source jbb_harmful --seed 42 --reproduct --gpus 0,1,2,3 \
   --out data/attacks/pap_better/jbb_harmful/seed42.json
 ```
 
@@ -188,8 +191,8 @@ too. `--workers` is the per-server grading concurrency once the servers are up.
 
 | Purpose | `--source` at generation | Evaluation |
 |---|---|---|
-| Over-refusal | `truthfulqa`, `xstest_safe`, ... | `python eval_refusal.py --in <generations.json> --out <judged.json> --auto-server --gpus 0,1` (the Over-refusal entry of the `interface.py` evaluation menu) |
-| Utility | `mmlu`, `gsm8k`, `math500`, `truthfulqa_mc` | `python eval_utility.py --in <generations.json> --out <scored.json>` (the utility entry of the same menu) |
+| Over-refusal | `truthfulqa`, `xstest_safe`, ... | `python -m dlm_steering.fitting.judge_refusal --in <generations.json> --out <judged.json> --auto-server --gpus 0,1` |
+| Utility | `mmlu`, `gsm8k`, `math500`, `truthfulqa_mc` | `python eval_utility.py --in <generations.json> --out <scored.json>` |
 
 Fetch `gsm8k`, `math500` and `truthfulqa` into `data/` with
 `python data_downloader.py gsm8k math500 truthfulqa`. For `math500` the last `\boxed{}` is
@@ -204,7 +207,7 @@ The same method (gated steering + V3 remasking) runs unchanged on
 `Dream-org/Dream-v0-Instruct-7B`. With `--model dream` the registry in `models.py` supplies
 the model constants (mask token `<|mask|>` = 151666, block path `model.model.layers`,
 28 layers, `<|im_end|>`) and the default vector/detector paths move to `outputs/dream/`.
-`--model` is read before `common.py` is imported, so it must be given on the command line
+`--model` is read from the command line when `models.py` is imported, so it must be given there
 (`--gpus` shard children receive it automatically). The environment is the same `.venv` as
 for LLaDA.
 
@@ -234,17 +237,15 @@ When the two layers coincide, as for LLaDA, the audit piggybacks as before. The 
 
 ### Experiment scripts
 
-The shared settings live in `script/dream_common.sh` and are overridden through environment
-variables (`TAG`=v3rp80, `SEEDS`="42 43 44", `STEER_LAYER`=20, `PROMPT_FRAC`=0.8,
-`RESPONSE_DETECTOR`, `GEN`/`STEPS`/`BLOCK`; `GPUS`/`PROCS_PER_GPU` come from `common.sh`).
-Outputs are `outputs/dream/<SET>-<attack>-<TAG>-<seed>.json`; finished files are skipped.
+The drivers of section 6 take `MODEL=dream`; the deployed Dream flags above come from
+`ours_args dream` in `script/common.sh`. The runs behind the Dream results were tagged
+`v3rp80`, so `TAG=v3rp80` resumes them:
 
-| Script | What it runs | Follow-up |
-|---|---|---|
-| `script/run_dream_overrefusal.sh` | XSTest-safe (250) + TruthfulQA (817) generations | `script/judge_dream_overrefusal.sh` (XSTest three-way judge, then `OR-summary-<TAG>.{json,md}`), `script/judge_dream_truthfulqa.sh` (truthful/informative, `*_tqa.json`) |
-| `script/run_dream_pap.sh` | the cached PAP attack, temperature 0.2; JBB by default, `SOURCES="jbb_harmful harmbench strongreject"` for all three | `script/eval_dream_pap.sh` (LG4 + StrongREJECT + `script/report.py`) |
-| `script/run_dream_math500.sh` | MATH-500 accuracy, defense vs `--defense none` (`DEFS`) | runs `eval_utility.py` itself |
-| `script/run_dream_truthfulqa_mc.sh` | TruthfulQA MC1 accuracy | runs `eval_utility.py` itself |
+```bash
+MODEL=dream TAG=v3rp80 ATTACK=pap SOURCES=jbb_harmful script/run_benchmark.sh
+MODEL=dream TAG=v3rp80 TQA_JUDGE=1 script/run_overrefusal.sh
+MODEL=dream TAG=v3rp80 script/run_utility.sh
+```
 
 To refit the response detector (generate per arm, label with Llama Guard 4, refit on CPU):
 
@@ -261,11 +262,41 @@ The vector, the gate detector and its threshold are built with the same
 `--detector-layer` / `--layer` falls back to each bundle's `best_layer`, so pass `--layer 20`
 for the vector explicitly.
 
+## 6. Scripts
+
+`script/` holds the end-to-end drivers. Each one sources `script/common.sh`, which picks the
+interpreter (`PY`, default `.venv/bin/python`), the GPUs (`GPUS`, default: every visible card;
+`PROCS_PER_GPU` workers per card) and the deployed `ours` flags per model (`ours_args`).
+Every driver skips output files that are already complete, so an interrupted run resumes.
+
+| Script | Runs | Main variables |
+|---|---|---|
+| `build_vectors.sh` | contrast pairs, steering vector, gate detector, gate threshold (`MODEL=dream` for Dream) | `--force` rebuilds |
+| `run_benchmark.sh` | one attack under one defense on the harmful sets and seeds, then Llama Guard 4 + StrongREJECT + report (gen 128, 128 steps, block 32, temperature 0.2, `--reproduct`) | `MODEL`, `ATTACK` (pap/dija/pair), `DEFENSE` (ours/diffuguard/none/selfreminder), `SOURCES`, `SEEDS`, `TAG`, `DEFENSE_ARGS`, `GEN`/`STEPS`/`BLOCK`/`TEMPERATURE` |
+| `run_overrefusal.sh` | benign sets under the defense, XSTest three-way refusal judge, per-seed summary `OR-summary-<TAG>.{json,md}`; `TQA_JUDGE=1` adds the TruthfulQA truthful/informative judge | `MODEL`, `DEFENSE`, `SOURCES` (xstest_safe truthfulqa), `SEEDS`, `TAG` |
+| `run_utility.sh` | graded sets with and without the defense, scored by `eval_utility.py` | `MODEL`, `SOURCES` (math500 truthfulqa_mc, also mmlu gsm8k), `DEFS`, `SEEDS`, `TAG` |
+| `run_ablation_dija_jbb.sh` | the four LLaDA ablation conditions on DIJA/JBB plus grading (`CONDS="allbnd bnd1 bnd2 bnd3"` for the boundary analysis) | `SEED` |
+| `report.py` | one table over grader payloads (`*_lg4`, `*_sr`, `*_judged`, `*_acc`) | file arguments, or none for everything under `outputs/` |
+
+```bash
+# main table, LLaDA: PAP and DIJA under ours and DiffuGuard, three seeds each
+for A in pap dija; do for D in ours diffuguard; do ATTACK=$A DEFENSE=$D script/run_benchmark.sh; done; done
+# DiffuGuard in its authors' infilling setting (DIJA spans only, 200 steps)
+ATTACK=dija DEFENSE=diffuguard TAG=diffuguard-infill GEN=0 STEPS=200 BLOCK=200 script/run_benchmark.sh
+# over-refusal and utility for the deployed LLaDA defense
+script/run_overrefusal.sh
+script/run_utility.sh
+```
+
+The deployed LLaDA flags are steering layer 25, gate detector layer 18 with threshold 7.0,
+the response detector `outputs/response_detector.pt` with cutoff 0.12, alpha 1, adaptive
+steering and V3 remasking with an 80% random prompt remask; pass `DEFENSE_ARGS="..."` to run
+anything else.
+
 ## Code layout
 
-The attack, defense, evaluation and launcher code is organised by role under `dlm_steering/`.
-The existing CLI commands and the import paths `Attacker`, `Defender`, `Evaluator`, `common`
-and `interface` are kept as compatibility modules; edit the implementation in the package.
+The attack, defense, evaluation and fitting code is organised by role under `dlm_steering/`;
+the top-level scripts are the CLI entry points, the samplers and the model registry.
 
 ```text
 dlm_steering/
@@ -274,27 +305,24 @@ dlm_steering/
 ├── defenses/         # defense interface, steering, V3 recovery, baselines
 ├── evaluation/       # graders, JSONL resume, per-attack aggregation, cache, result format
 ├── runtime/          # model loading, data, reproducibility, GPU sharding, JSON writing
-├── fitting/          # vector / detector / threshold fitting and the refusal and TruthfulQA judges (python -m dlm_steering.fitting.<module>)
-└── launcher/         # interactive prompts, run plans, process execution, progress and results
+└── fitting/          # vector / detector / threshold fitting and the refusal and TruthfulQA judges (python -m dlm_steering.fitting.<module>)
 ```
 
 | File / directory | Role |
 |---|---|
-| `interface.py` | interactive experiment and evaluation launcher |
 | `exp.py` / `experiment_row.py` | experiment runner / per-row generation and result record |
 | `eval_llamaguard.py` / `run_sr_eval.py` | LG4 / GPT-OSS grading entry points |
 | `pap_generate.py` / `pap_common.py` | PAP attack generation / technique assignment and cache validation |
 | `sampler.py` / `dream_sampler.py` | LLaDA / Dream diffusion samplers |
 | `models.py` / `model_loading.py` | target model registry / pretrained weight loading |
 | `ollama_runtime.py` | start and stop of the dedicated Ollama servers |
-| `dlm_steering/fitting/` | vector, detector and threshold fitting plus the refusal and TruthfulQA judges; run as `python -m dlm_steering.fitting.<module>` |
-| `dlm_steering/fitting/fit_boundary_detector.py` / `judge_truthfulqa.py` / `aggregate_dream_overrefusal.py` | Dream first-boundary response detector / TruthfulQA truthful-informative judge / Dream over-refusal aggregation over seeds |
-| `script/` | experiment and pipeline shell scripts |
-| `script/dream_common.sh`, `script/run_dream_*.sh`, `script/judge_dream_*.sh`, `script/eval_dream_pap.sh` | Dream deployed settings and the over-refusal, PAP, MATH-500 and TruthfulQA MC runs and judges |
+| `dlm_steering/fitting/` | vector, detector and threshold fitting, the refusal and TruthfulQA judges and the over-refusal summary; run as `python -m dlm_steering.fitting.<module>` |
+| `dlm_steering/fitting/fit_boundary_detector.py` / `judge_truthfulqa.py` / `aggregate_overrefusal.py` | first-boundary response detector (Dream) / TruthfulQA truthful-informative judge / over-refusal aggregation over seeds |
+| `script/` | `common.sh` (environment, GPUs, deployed defense flags), `build_vectors.sh`, the `run_*.sh` drivers of section 6, `report.py` |
 | `data/` / `attacks/` | datasets / fixed attack prompt resources |
 | `outputs/` | generations, evaluations and defense checkpoints |
 | `third_party/` | the bundled DiffuGuard generator and its provenance (`diffuguard_origin.json`) |
 
 The LG4 and GPT-OSS result JSON layout is shared in `evaluation/results.py` and JSONL
-resumption in `evaluation/streaming.py`. Atomic JSON writes for run plans and PAP caches are
-in `runtime/utils.py`; worker-thread environment setup is in `launcher/storage.py`.
+resumption in `evaluation/streaming.py`. Atomic JSON writes for the PAP caches are in
+`runtime/utils.py`.

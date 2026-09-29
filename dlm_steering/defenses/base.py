@@ -150,7 +150,7 @@ class Defender(ABC):
         """Called once after each block's denoising loop completes.
 
         block_number: which block just finished, 0-based (not to be confused
-        with common.block_index, which maps a layer to a transformer block).
+        with runtime.constants.block_index, which maps a layer to a transformer block).
         block_positions: answer slots of the just-finished block. prompt_length
         marks the prompt/generation boundary; committed answer slots before it
         (e.g. filled DIJA spans) are also remaskable. last_block marks the

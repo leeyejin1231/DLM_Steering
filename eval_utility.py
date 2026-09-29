@@ -1,32 +1,16 @@
-"""Score exp.py generations on the graded sources (mmlu, gsm8k, math500, truthfulqa_mc).
-
-Each result row carries "task" and "answer" from common.load_utility_prompts;
-this extracts the model's answer from "generation" and reports accuracy, plus
-a per-subject (mmlu) or per-category (truthfulqa_mc) breakdown. Unparseable
-generations count as wrong and are tallied separately, since a defense that
-turns answers into refusals shows up there first. Rows whose generation failed
-upstream (common.ERROR_SENTINEL) leave the denominator and are counted in
-"n_errors", as in the ASR and refusal graders.
-
-Usage:
-    python eval_utility.py --in outputs/MMLU-none-v3-42.json --out outputs/MMLU-none-v3-42_acc.json
-"""
-
 import argparse
 import collections
 import json
 import re
 from pathlib import Path
 
-from common import ERROR_SENTINEL, LETTERS
+from dlm_steering.runtime.constants import ERROR_SENTINEL
+from dlm_steering.runtime.data import LETTERS
 
 NUMBER = r"-?\d[\d,]*(?:\.\d+)?"
 
 
 def extract_letter(text, n_choices):
-    """Predicted option letter, or None. Tries explicit answer phrasings first,
-    then a bare option letter at the start of a line, then the first option
-    letter that appears on its own anywhere."""
     valid = LETTERS[:n_choices]
     patterns = [
         rf"answer(?:\s+is|:)?\s*(?:\(|\*\*)?\s*([{valid}])(?![a-zA-Z])",
@@ -42,7 +26,6 @@ def extract_letter(text, n_choices):
 
 
 def extract_number(text):
-    """Number after '####' if present, else the last number in the text."""
     m = re.search(rf"####\s*\$?\s*({NUMBER})", text)
     if not m:
         nums = re.findall(NUMBER, text)
@@ -60,7 +43,6 @@ def same_number(pred, gold):
 
 
 def last_boxed(text):
-    """Contents of the last \\boxed{...} (or \\fbox{...}), braces balanced; None if absent."""
     start = max(text.rfind("\\boxed"), text.rfind("\\fbox"))
     if start < 0:
         return None
@@ -72,7 +54,7 @@ def last_boxed(text):
         depth += {"{": 1, "}": -1}.get(text[j], 0)
         if depth == 0:
             return text[i + 1:j]
-    return None   # unbalanced: the answer was cut off by gen_length
+    return None
 
 
 def _fix_fracs(s):
@@ -90,8 +72,6 @@ def _fix_fracs(s):
 
 
 def normalize_math(s):
-    """The MATH repository's is_equiv normalization (Hendrycks et al. 2021):
-    strip spacing/units/formatting so equal answers compare as equal strings."""
     s = s.strip().replace("\n", "").replace("\\!", "")
     s = s.replace("\\\\", "\\").replace("tfrac", "frac").replace("dfrac", "frac")
     s = s.replace("\\left", "").replace("\\right", "")
@@ -128,8 +108,6 @@ def same_math(pred, gold):
 def score_row(row):
     task, gold, gen = row["task"], row["answer"], row.get("generation", "")
     if gen == ERROR_SENTINEL:
-        # Nothing was generated: an infrastructure failure, not a wrong answer.
-        # "gen_error", not "error": exp.py already puts the traceback there.
         return {"pred": None, "correct": False, "parsed": False,
                 "gen_error": True}
     if task == "gsm8k":
@@ -147,26 +125,22 @@ def score_row(row):
 
 
 def summarize(all_rows):
-    # Rows whose generation failed upstream leave the denominator, matching how
-    # the ASR and refusal graders treat them.
     n_errors = sum(r["gen_error"] for r in all_rows)
     rows = [r for r in all_rows if not r["gen_error"]]
     total = len(rows)
     correct = sum(r["correct"] for r in rows)
     unparsed = sum(not r["parsed"] for r in rows)
     summary = {"task": all_rows[0]["task"] if all_rows else None, "total": total,
-               "correct": correct, "accuracy": round(correct / total, 4) if total else 0.0,
-               "unparsed": unparsed, "n_errors": n_errors}
-    group_key = {"mmlu": "subject", "math500": "subject",
-                 "truthfulqa_mc": "category"}.get(summary["task"])
+                "correct": correct, "accuracy": round(correct / total, 4) if total else 0.0,
+                "unparsed": unparsed, "n_errors": n_errors}
+    group_key = {"mmlu": "subject", "math500": "subject", "truthfulqa_mc": "category"}.get(summary["task"])
     if group_key:
         groups = collections.defaultdict(lambda: [0, 0])
         for r in rows:
             g = groups[r.get(group_key, "?")]
             g[0] += r["correct"]
             g[1] += 1
-        summary[f"by_{group_key}"] = {k: {"correct": c, "total": t, "accuracy": round(c / t, 4)}
-                                      for k, (c, t) in sorted(groups.items())}
+        summary[f"by_{group_key}"] = {k: {"correct": c, "total": t, "accuracy": round(c / t, 4)} for k, (c, t) in sorted(groups.items())}
     return summary
 
 
@@ -180,12 +154,10 @@ def main():
     rows = data["results"]
     missing = [r["index"] for r in rows if "task" not in r or "answer" not in r]
     if missing:
-        raise SystemExit(f"{len(missing)} rows lack task/answer fields; was --source a "
-                         f"utility set (mmlu, gsm8k, math500, truthfulqa_mc)? e.g. index {missing[:5]}")
+        raise SystemExit(f"{len(missing)} rows lack task/answer fields; was --source a utility set (mmlu, gsm8k, math500, truthfulqa_mc)? e.g. index {missing[:5]}")
     scored = [{**r, **score_row(r)} for r in rows]
     summary = summarize(scored)
-    payload = {"source": args.inp, "config": data.get("config"), "attack": data.get("attack"),
-               "defense": data.get("defense"), "summary": summary, "results": scored}
+    payload = {"source": args.inp, "config": data.get("config"), "attack": data.get("attack"), "defense": data.get("defense"), "summary": summary, "results": scored}
     Path(args.out).write_text(json.dumps(payload, ensure_ascii=False, indent=2))
     print(json.dumps({k: v for k, v in summary.items() if not k.startswith("by_")}, indent=2))
     print(f"-> {args.out}")

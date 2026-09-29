@@ -2,7 +2,7 @@
 
 PAIR (Chao et al. 2023, patrickrchao/JailbreakingLLMs):
   attacker system prompts are copied from system_prompts.py;
-  get_init_msg / process_target_response / extract_json come from common.py.
+  get_init_msg / process_target_response / extract_json come from JailbreakingLLMs' common.py.
 
 PAP (Zeng et al. 2024, CHATS-lab/persuasive_jailbreaker):
   the five better in-context mutation templates in attacks/pap_better_templates.json
@@ -26,18 +26,6 @@ PAP_BETTER_TEMPLATES_PATH = ATTACKS_DIR / "pap_better_templates.json"
 # ---------------------------------------------------------------------------
 
 def extract_json(s):
-    """
-    Given an output from the attacker LLM, this function extracts the values
-    for `improvement` and `adversarial prompt` and returns them as a dictionary.
-
-    Args:
-        s (str): The string containing the potential JSON structure.
-
-    Returns:
-        dict: A dictionary containing the extracted values.
-        str: The cleaned JSON string.
-    """
-    # Extract the string that looks like a JSON
     start_pos = s.find("{")
     end_pos = s.find("}") + 1  # +1 to include the closing brace
     if end_pos == -1:

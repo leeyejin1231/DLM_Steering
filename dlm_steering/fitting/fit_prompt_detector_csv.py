@@ -13,7 +13,9 @@ import numpy as np
 import pandas as pd
 import torch
 
-from common import MODEL_NAME, OUT_DIR, auroc, load_llada
+from dlm_steering.runtime.constants import MODEL_NAME, OUT_DIR
+from dlm_steering.runtime.utils import auroc
+from dlm_steering.runtime.models import load_llada
 from models import add_model_arg
 from dlm_steering.fitting.fit_detector import collect
 

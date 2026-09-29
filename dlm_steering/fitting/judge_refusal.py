@@ -20,8 +20,8 @@ import json
 import time
 from pathlib import Path
 
-from common import plan_shards, run_eval_shards
-from Evaluator import LocalRefusal, Refusal
+from dlm_steering.runtime.execution import plan_shards, run_eval_shards
+from dlm_steering.evaluation.refusal import LocalRefusal, Refusal
 
 def main():
     ap = argparse.ArgumentParser()
@@ -66,7 +66,7 @@ def main():
     devices = plan_shards(args.gpus) if args.gpus else []
     if args.auto_server and args.judge == "ollama":
         # Private servers and one work queue over every GPU, as in run_sr_eval.py.
-        from Evaluator import _resume_stream, _item_key, _run_graded
+        from dlm_steering.evaluation.streaming import _resume_stream, _item_key, _run_graded
         from ollama_runtime import OllamaServerPool
         items = items[args.start:
                       args.start + args.n if args.n is not None else None]
@@ -96,8 +96,8 @@ def main():
             port = args.port + i
             return ["--port", port, "--gpu", gpu,
                     "--container", f"ollama-{port}"]
-        # A shard child must re-enter as a module: steering/ is a package, so
-        # running this file by path would not find common.py.
+        # A shard child must re-enter as a module: running this file by path
+        # would put dlm_steering/fitting, not the repository root, on sys.path.
         judged, _ = run_eval_shards("dlm_steering.fitting.judge_refusal", args, len(items),
                                     extra_args=extra, devices=devices)
         summary = Refusal.summarize(judged)

@@ -1,18 +1,15 @@
-"""Prepare reusable PAP prompts without loading a target or a grader."""
 import argparse
 import json
 from pathlib import Path
 
 from attack_prompts import load_better_templates, extract_content
-from common import load_prompts, enable_reproducibility, seed_all, force_math_attention
-from pap_common import (SAMPLING, assign_techniques, normalize_templates,
-                        identity, validate, save)
+from dlm_steering.runtime.data import load_prompts
+from dlm_steering.runtime.models import enable_reproducibility, seed_all, force_math_attention
+from pap_common import (SAMPLING, assign_techniques, normalize_templates, identity, validate, save)
 from dlm_steering.runtime.progress import task_progress
 
 
 class PAPGenerator:
-    """Generate one attack prompt using the assigned author template."""
-
     def __init__(self, llm, templates):
         self.llm = llm
         self.templates = normalize_templates(templates)
@@ -28,19 +25,8 @@ class PAPGenerator:
         return mutation
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--source', required=True)
-    p.add_argument('--seed', type=int, default=42)
-    p.add_argument('--model', default='Qwen/Qwen3-14B')
-    p.add_argument('--reproduct', action='store_true')
-    p.add_argument('--out', required=True)
-    p.add_argument('--reuse', help='Existing partial prompt cache with matching provenance')
-    p.add_argument('--shard-index', type=int, default=0)
-    p.add_argument('--shard-count', type=int, default=1)
-    a = p.parse_args()
-    if a.shard_count < 1 or not 0 <= a.shard_index < a.shard_count:
-        raise ValueError('Invalid shard index/count')
+def generate_shard(a):
+    """Fill the rows of this shard that --reuse / --out do not already hold."""
     from attack_llms import HFChat
     rows = load_prompts(a.source)
     data = identity(a.source, a.seed, a.reproduct, a.model)
@@ -64,8 +50,7 @@ def main():
         generator = PAPGenerator(llm, load_better_templates())
         assignments = assign_techniques(rows, a.seed)
         data['backend'] = llm.describe()
-        for row in task_progress(missing, total=len(selected), initial=len(entries),
-                                 desc=f'PAP seed={a.seed}', unit='건'):
+        for row in task_progress(missing, total=len(selected), initial=len(entries), desc=f'PAP seed={a.seed}', unit='row'):
             i = int(row['index'])
             technique = assignments[i]
             text = generator.generate(row['prompt'], technique, a.seed + i * 1048576)
@@ -74,6 +59,97 @@ def main():
             save(a.out, data)
     data['results'] = [entries[i] for i in sorted(entries)]
     save(a.out, data)
+
+
+def generate_sharded(a):
+    import os
+    import subprocess
+    import sys
+    from dlm_steering.runtime.execution import parse_gpu_ids
+    from dlm_steering.runtime.progress import CHILD_PROGRESS_ENV
+    devices = parse_gpu_ids(a.gpus)
+    rows = load_prompts(a.source)
+    cache = Path(a.out).resolve()
+    if cache.is_file():
+        current = json.loads(cache.read_text())
+        if current.get('model') != a.model:
+            raise ValueError(f'PAP cache model mismatch: {cache}')
+        done = validate(current, rows, a.source, a.seed, a.reproduct, complete=False)
+        if len(done) == len(rows):
+            print(f'PAP cache complete: {cache} ({len(rows)} rows)', flush=True)
+            return
+    shard_dir = cache.parent / '.shards' / f'seed{a.seed}'
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    running = []
+    for index, gpu in enumerate(devices):
+        part = shard_dir / f'gpu{index}.json'
+        log = shard_dir / f'gpu{index}.log'
+        cmd = [sys.executable, '-u', str(Path(__file__).resolve()), '--source', a.source,
+                '--seed', str(a.seed), '--model', a.model, '--out', str(part),
+                '--shard-index', str(index), '--shard-count', str(len(devices))]
+        if a.reproduct:
+            cmd.append('--reproduct')
+        if cache.is_file():
+            cmd += ['--reuse', str(cache)]
+        env = {**os.environ, 'CUDA_VISIBLE_DEVICES': gpu, **CHILD_PROGRESS_ENV}
+        with log.open('w') as handle:
+            proc = subprocess.Popen(cmd, cwd=Path(__file__).parent, env=env,
+                                    stdout=handle, stderr=subprocess.STDOUT)
+        running.append((proc, part, log))
+        print(f'shard {index}: gpu={gpu} -> {part} (log {log})', flush=True)
+    try:
+        with task_progress(running, desc=f'PAP seed={a.seed}', unit='shard') as progress:
+            codes = [proc.wait() for proc, _, _ in progress]
+    except BaseException:
+        for proc, _, _ in running:
+            if proc.poll() is None:
+                proc.terminate()
+        for proc, _, _ in running:
+            proc.wait()
+        raise
+    failed = [f'shard {i} rc={code} ({log})' for i, (code, (_, _, log)) in enumerate(zip(codes, running)) if code]
+    if failed:
+        raise SystemExit('PAP shards failed; shard files are kept: ' + ', '.join(failed))
+    merged = identity(a.source, a.seed, a.reproduct, a.model)
+    entries = {}
+    for path in [cache, *(part for _, part, _ in running)]:
+        if not path.is_file():
+            continue
+        data = json.loads(path.read_text())
+        if data.get('model') != a.model:
+            raise ValueError(f'PAP shard model mismatch: {path}')
+        for i, entry in validate(data, rows, a.source, a.seed, a.reproduct, complete=False).items():
+            if entries.get(i, entry) != entry:
+                raise ValueError(f'PAP row {i} differs between {path} and an earlier file')
+            entries[i] = entry
+        if 'backend' in data:
+            merged['backend'] = data['backend']
+    merged['results'] = [entries[i] for i in sorted(entries)]
+    validate(merged, rows, a.source, a.seed, a.reproduct, complete=True)
+    save(cache, merged)
+    print(f'PAP cache complete: {cache} ({len(entries)}/{len(rows)} rows)', flush=True)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('--source', required=True)
+    p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--model', default='Qwen/Qwen3-14B')
+    p.add_argument('--reproduct', action='store_true')
+    p.add_argument('--out', required=True)
+    p.add_argument('--gpus', help='Comma-separated GPU ids: one worker per GPU, shards merged into --out')
+    p.add_argument('--reuse', help='Existing partial prompt cache with matching provenance')
+    p.add_argument('--shard-index', type=int, default=0)
+    p.add_argument('--shard-count', type=int, default=1)
+    a = p.parse_args()
+    if a.shard_count < 1 or not 0 <= a.shard_index < a.shard_count:
+        raise ValueError('Invalid shard index/count')
+    if a.gpus:
+        if a.shard_count != 1 or a.reuse:
+            raise ValueError('--gpus drives the shards itself; do not combine it with --shard-count or --reuse')
+        generate_sharded(a)
+    else:
+        generate_shard(a)
 
 
 if __name__ == '__main__':

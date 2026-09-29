@@ -14,7 +14,7 @@ Usage:
     CUDA_VISIBLE_DEVICES=1 python -m dlm_steering.fitting.pick_threshold --layer 18
 """
 
-from common import OUT_DIR, DETECTOR_LAYER, MODEL_KEY, add_model_arg
+from dlm_steering.runtime.constants import OUT_DIR, DETECTOR_LAYER, add_model_arg
 
 import argparse
 import json
@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from common import load_detector_bundle, load_llada
+from dlm_steering.runtime.models import load_detector_bundle, load_llada
 from dlm_steering.fitting.fit_detector import collect
 
 from dlm_steering.paths import REPO as ROOT

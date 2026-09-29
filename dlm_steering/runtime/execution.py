@@ -113,8 +113,9 @@ def child_launcher(entry):
     """The `python ...` prefix a shard child is invoked with.
 
     A path ending in .py is run directly; anything else is a dotted module
-    name run with -m, which is what members of the steering package need for
-    their absolute imports of common.py / Evaluator.py to resolve.
+    name run with -m, which keeps the repository root on sys.path for the
+    members of dlm_steering.fitting (they import dlm_steering and the
+    top-level sampler.py / models.py).
     """
     import sys
     if str(entry).endswith(".py"):

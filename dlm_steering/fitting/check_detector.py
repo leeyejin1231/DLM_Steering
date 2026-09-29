@@ -16,7 +16,7 @@ Usage:
     CUDA_VISIBLE_DEVICES=1 python -m dlm_steering.fitting.check_detector
 """
 
-from common import OUT_DIR, DETECTOR_LAYER, MODEL_KEY, add_model_arg
+from dlm_steering.runtime.constants import OUT_DIR, add_model_arg
 
 import argparse
 import json
@@ -25,8 +25,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from common import (
-    auroc, load_detector_bundle, load_eval_prompts, load_llada)
+from dlm_steering.runtime.utils import auroc
+from dlm_steering.runtime.models import load_detector_bundle, load_llada
+from dlm_steering.runtime.data import load_eval_prompts
 from dlm_steering.fitting.fit_detector import collect
 
 from dlm_steering.paths import REPO as ROOT

@@ -12,7 +12,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from common import MODEL_NAME, auroc, load_llada
+from dlm_steering.runtime.constants import MODEL_NAME
+from dlm_steering.runtime.utils import auroc
+from dlm_steering.runtime.models import load_llada
 from models import add_model_arg
 from dlm_steering.fitting.fit_detector import collect
 
