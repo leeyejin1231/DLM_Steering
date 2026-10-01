@@ -1,9 +1,113 @@
-# DLM_Steering
+# Adaptive Steering and Remasking for Safe Generation in Diffusion Language Models
+
+> **Adaptive Steering and Remasking** is an inference-time defense for diffusion language models (DLMs). It adapts the strength of safety steering to the current denoising state and, when a lightweight detector flags the first generated block as unsafe, remasks that block together with part of the prompt and regenerates it under steering.
+
+## 🛡️ Overview
+
+![overview](./assets/overview.png)
+
+DLMs generate text by iteratively denoising a fully masked sequence, so harmful content can emerge at arbitrary positions and persist across later denoising steps. Existing defenses rely on fixed interventions or aggressive remasking, which limits control over the denoising trajectory and can degrade generation quality.
+
+Our framework combines three lightweight components that operate directly on intermediate hidden representations:
+
+- **Adaptive safety steering.** A *gating direction* scores the current denoising state at every step and converts the score into a continuous steering strength. A *steering direction* is then added to the hidden states of the currently masked positions, guiding the next predictions toward a safe trajectory.
+- **Response detection.** After the first generation block is committed, a logistic-regression *response detector* (4k parameters) reads the mean hidden state of the block and estimates the probability that the trajectory is unsafe.
+- **Safety-aware remasking.** When the detector triggers, the first response block and a random fraction of the prompt tokens are returned to `[MASK]`, and the region is regenerated under adaptive safety steering.
+
+Steering prevents unsafe semantic trajectories, while remasking corrects harmful content that has already entered the generation state. Outside detected unsafe trajectories the original denoising procedure is preserved, which limits unnecessary intervention on benign prompts.
+
+## Preliminary Analysis
+
+### Localized and Persistent Harmful Signals
+
+<p align="center">
+  <img src="./assets/motivation.png" alt="motivation" width="800"/>
+</p>
+
+We track token-level harmfulness, the cosine similarity between hidden states and the harmful direction, on LLaDA with JBB-Behaviors prompts during the first generation block.
+
+- **(a) Harmful signals are step-dependent.** The signal is weak at the early denoising stage, becomes stronger in the middle stage, and reaches high intensity in the later stages. A fixed steering strength therefore under-intervenes at high-risk steps or over-intervenes at low-risk steps.
+- **(b) Risk persists after commitment.** Successful jailbreak trajectories retain 80% of their risky tokens after 32 steps and 72% after 96 steps; failed trajectories still retain 64% and 60%. Vanilla denoising does not reliably eliminate risky representations once a token is committed.
+
+> Steering strength should follow the denoising-stage risk, and committed risky tokens have to be reopened explicitly.
+
+
+### Motivation
+
+Instead of a fixed intervention, we control the trajectory with:
+
+- **adaptive steering** whose strength is recomputed from the generation state at every denoising step
+- **targeted remasking** of the first generated block and part of the prompt, triggered only when the trajectory is detected as unsafe
+
+## Method
+
+### 1. Safety Representation Directions
+
+Two directions are built from different contrastive pairs because they serve different roles at inference.
+
+- **Gating direction** $v_{gate}$: paired harmful and benign inputs with a fully masked generation region. The direction is the normalized difference of the mean hidden states over the masked positions at the gating layer $\ell_g$. It captures the representation shift of a harmful generation context and controls the steering strength.
+- **Steering direction** $v_{steer}$: the input is fixed and a safe refusal response is contrasted with an unsafe compliance response under the same random mask pattern. Hidden states are taken from the masked positions only at the steering layer $\ell_s$, and the per-ratio directions are averaged over the masking ratios {0.3, 0.5, 0.7, 0.8}. This keeps the shifts that consistently separate safe refusal from unsafe compliance across masking levels.
+
+### 2. Adaptive Safety Steering
+
+At each denoising step $t$, the mean hidden state of the committed positions (the masked positions at the very first step) is projected onto the gating direction and turned into a gate
+
+$$s_t = \bar h^{(t)\top}_{\ell_g} v_{gate}, \qquad g_t = \mathrm{clip}\left(\frac{s_t - \tau}{\delta}, 0, 1\right),$$
+
+where $\tau$ is the gating threshold and $\delta$ the transition width. Steering is applied only to the currently masked positions $\mathcal{M}_t$:
+
+$$h^{(t)}_{\ell_s, j} \leftarrow h^{(t)}_{\ell_s, j} + g_t\,\alpha\,r_{\ell_s}\,v_{steer}, \qquad j \in \mathcal{M}_t .$$
+
+**Key Idea**
+> high gating score → stronger steering
+> low gating score → no intervention
+
+The gating layer precedes the steering layer, so the gate and the intervention are computed within the same forward pass. Committed positions are never modified, and the intervention weakens naturally as the trajectory moves away from the gated direction.
+
+### 3. Safety-Aware Remasking
+
+Detection runs once, right after the first generation block, where the trajectory is still cheap to redirect.
+
+1. Average the hidden states of the committed positions of the first block at the detector layer $\ell_r$.
+2. A logistic-regression detector estimates the unsafe probability $p = \sigma(w^\top \bar h_{\ell_r} + b)$.
+3. If $p \ge \tau_r$, remask the first block together with a fraction $\gamma_p$ of the prompt tokens (80% in our experiments).
+4. Regenerate the remasked region through the original denoising process under adaptive safety steering.
+
+Remasking the prompt disrupts the adversarial context that would otherwise keep anchoring the denoising trajectory, while benign intent survives partial prompt corruption.
+
+## Experimental Results
+
+Settings: maximum sequence length 128, block size 32, 128 denoising steps, temperature 0.2, prompt remasking ratio 80%. Attacks are Prefix (HarmBench prefix template), PAP (Qwen3-14B paraphrasing, Expert Endorsement) and DIJA. ASR is averaged over `Llama-Guard-4-12B` and `gpt-oss-20b` (StrongREJECT rubric) and over three runs.
+
+### Jailbreak Defense
+
+<p align="center">
+  <img src="./assets/results.png" alt="results" width="700"/>
+</p>
+
+- On LLaDA-8B the average ASR drops from 41.4 to 22.7 (JBB), 50.4 to 24.9 (HarmBench) and 47.5 to 25.6 (StrongReject), and ASR against Prefix attacks falls below 3% on every dataset.
+- Our method improves on the vanilla model in all nine model-dataset combinations and achieves the best or second-best average ASR in every setting. Self-reminder is strong on Dream-7B but does not transfer to LLaDA, where it raises the JBB average from 41.4 to 50.7.
+- DiffuGuard produces more than 80% broken sentences on Dream-7B, whereas our method keeps the broken-sentence ratio at the vanilla level.
+
+### Over-Refusal and Capability Preservation
+
+![vanilla_vs_ours](./assets/vanilla_vs_ours.png)
+
+Over-refusal is judged by gpt-oss on XSTest and TruthfulQA; capability is accuracy on MATH-500 and GSM8K and exact match on TruthfulQA.
+
+- MATH-500 and TruthfulQA remain nearly unchanged on all three models; most of the degradation is concentrated on GSM8K for LLaDA-8B (82 → 73).
+- LLaDA-8B and LLaDA-1.5 show only small increases in refusal on benign prompts, while Dream-7B *reduces* over-refusal on XSTest from 33% to 24% even though it has the highest baseline over-refusal.
+
+
+
+
+## 🛠️ Repository
 
 Gated activation steering with response-detector remasking (the `ours` defense) for
 masked-diffusion language models, evaluated against jailbreak attacks (PAP, DIJA)
 next to the DiffuGuard and Self-Reminder baselines. Target models are
 `GSAI-ML/LLaDA-8B-Instruct` (default) and `Dream-org/Dream-v0-Instruct-7B` (`--model dream`).
+The deployed hyperparameters of each model are listed in sections 5 and 6.
 
 ## 1. Environment and data
 
